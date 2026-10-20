@@ -45,7 +45,10 @@ kk_image_adopt_texture(struct kk_device *dev, struct kk_image *image,
    struct kk_image_plane *plane = &image->planes[0];
    struct mtl_texture_mismatch mm;
    mtl_texture_check_layout(texture, dev->mtl_handle, &plane->layout, &mm);
-   uint32_t missing = mm.missing_usage & ~MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW;
+   uint32_t tolerated = MTL_TEXTURE_USAGE_PIXEL_FORMAT_VIEW;
+   if (!(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT))
+      tolerated |= MTL_TEXTURE_USAGE_SHADER_WRITE;
+   uint32_t missing = mm.missing_usage & ~tolerated;
    if (mm.device || mm.type || mm.format || mm.extent || mm.levels ||
        mm.samples || mm.layers || missing) {
       mesa_loge("kk: VkImportMetalTextureInfoEXT rejected: device=%d type=%d "
@@ -56,7 +59,8 @@ kk_image_adopt_texture(struct kk_device *dev, struct kk_image *image,
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
    if (mm.missing_usage)
-      mesa_logw("kk: imported texture lacks MTLTextureUsagePixelFormatView");
+      mesa_logw("kk: imported texture lacks MTLTextureUsage 0x%x",
+                mm.missing_usage);
 
    plane->mtl_handle = mtl_retain(texture);
    return VK_SUCCESS;
