@@ -181,6 +181,9 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_depth_clip_enable = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
+#ifdef VK_USE_PLATFORM_METAL_EXT
+      .EXT_metal_objects = true,
+#endif
       .EXT_external_memory_host = true,
       .EXT_hdr_metadata = true,
       .EXT_image_2d_view_of_3d = true,

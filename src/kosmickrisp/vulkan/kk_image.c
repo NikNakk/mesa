@@ -642,6 +642,9 @@ static void
 kk_image_finish(struct kk_device *dev, struct kk_image *image,
                 const VkAllocationCallbacks *pAllocator)
 {
+#ifdef VK_USE_PLATFORM_METAL_EXT
+   kk_image_release_metal_import(dev, image);
+#endif
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       kk_image_plane_finish(dev, &image->planes[plane], image->vk.create_flags,
                             pAllocator);
@@ -673,6 +676,15 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
    }
+
+#ifdef VK_USE_PLATFORM_METAL_EXT
+   result = kk_image_import_metal(dev, image, pCreateInfo);
+   if (result != VK_SUCCESS) {
+      kk_image_finish(dev, image, pAllocator);
+      vk_free2(&dev->vk.alloc, pAllocator, image);
+      return result;
+   }
+#endif
 
    *pImage = kk_image_to_handle(image);
 
@@ -947,6 +959,9 @@ kk_bind_image_memory(struct kk_device *dev, const VkBindImageMemoryInfo *info)
    VK_FROM_HANDLE(kk_device_memory, mem, info->memory);
    VK_FROM_HANDLE(kk_image, image, info->image);
    VkResult result;
+
+   if (image->metal_imported)
+      return VK_SUCCESS;
 
    /* Ignore this struct on Android, we cannot access swapchain structures
     * there. */
