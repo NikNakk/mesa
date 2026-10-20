@@ -53,6 +53,8 @@ struct kk_image {
    /* Forces alpha value to be one when creating views. Needed for WSI */
    bool wsi_opaque_alpha;
 
+   bool metal_imported;
+
    uint8_t plane_count;
    struct kk_image_plane planes[3];
 };
@@ -139,5 +141,12 @@ mtl_texture *kk_image_plane_create_texture(struct kk_image_plane *plane,
                                            uint64_t offset_B);
 
 void kk_image_set_label(struct kk_image *image, const char *label);
+
+#ifdef VK_USE_PLATFORM_METAL_EXT
+VkResult kk_image_import_metal(struct kk_device *dev, struct kk_image *image,
+                               const VkImageCreateInfo *info);
+void kk_image_release_metal_import(struct kk_device *dev,
+                                   struct kk_image *image);
+#endif
 
 #endif
