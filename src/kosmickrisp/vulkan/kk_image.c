@@ -683,6 +683,8 @@ kk_get_image_memory_requirements(struct kk_device *dev, struct kk_image *image,
 {
    struct kk_physical_device *pdev = kk_device_physical(dev);
    uint32_t memory_types = (1 << pdev->mem_type_count) - 1;
+   if (!(image->vk.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT))
+      memory_types &= kk_non_lazy_memory_types(pdev);
 
    /* Remove non host visible heaps from the types for host image copy in case
     * of potential issues. This should be removed when we get ReBAR.

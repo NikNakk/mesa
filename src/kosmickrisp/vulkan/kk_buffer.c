@@ -82,7 +82,7 @@ kk_GetDeviceBufferMemoryRequirements(
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
       .size = align64(pInfo->pCreateInfo->size, alignment),
       .alignment = alignment,
-      .memoryTypeBits = BITFIELD_MASK(pdev->mem_type_count),
+      .memoryTypeBits = kk_non_lazy_memory_types(pdev),
    };
 
    vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {

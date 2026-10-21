@@ -57,7 +57,7 @@ kk_GetMemoryMetalHandlePropertiesEXT(
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
    pMemoryMetalHandleProperties->memoryTypeBits =
-      BITFIELD_MASK(pdev->mem_type_count);
+      kk_non_lazy_memory_types(pdev);
 
    return VK_SUCCESS;
 }
@@ -80,7 +80,7 @@ kk_GetMemoryHostPointerPropertiesEXT(
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    }
    pMemoryHostPointerProperties->memoryTypeBits =
-      BITFIELD_MASK(pdev->mem_type_count);
+      kk_non_lazy_memory_types(pdev);
 
    return VK_SUCCESS;
 }
