@@ -500,6 +500,26 @@ lower_subpass_dim(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
    return true;
 }
 
+static bool
+kk_lower_full_rate_fdm(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   const uint32_t *invocations = data;
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_frag_size:
+      b->cursor = nir_before_instr(&intrin->instr);
+      nir_def_replace(&intrin->def,
+                      nir_imm_ivec2(b, 1, 1));
+      return true;
+   case nir_intrinsic_load_frag_invocation_count:
+      b->cursor = nir_before_instr(&intrin->instr);
+      nir_def_replace(&intrin->def, nir_imm_int(b, *invocations));
+      return true;
+   default:
+      return false;
+   }
+}
+
 static void
 kk_lower_fs(struct kk_device *dev, nir_shader *nir,
             const struct vk_graphics_pipeline_state *state)
@@ -508,6 +528,13 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
 
    nir->info.fs.uses_sample_shading |=
       state->ms && state->ms->sample_shading_enable;
+
+   uint32_t fdm_invocations = 1;
+   if (nir->info.fs.uses_sample_shading && state->ms &&
+       state->ms->rasterization_samples > 1)
+      fdm_invocations = state->ms->rasterization_samples;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, kk_lower_full_rate_fdm,
+            nir_metadata_control_flow, &fdm_invocations);
 
    /* Must be lowered before blending */
    if (state->ms) {

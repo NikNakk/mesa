@@ -181,6 +181,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_depth_clip_enable = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
+      .EXT_fragment_density_map = KK_EXPERIMENTAL(FDM),
 #ifdef VK_USE_PLATFORM_METAL_EXT
       .EXT_metal_objects = true,
 #endif
@@ -454,6 +455,12 @@ kk_get_device_features(
 
       /* VK_EXT_custom_resolve */
       .customResolve = true,
+
+      /* VK_EXT_fragment_density_map */
+      .fragmentDensityMap = supported_extensions->EXT_fragment_density_map,
+      .fragmentDensityMapDynamic = false,
+      .fragmentDensityMapNonSubsampledImages =
+         supported_extensions->EXT_fragment_density_map,
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
@@ -844,6 +851,11 @@ kk_get_device_properties(
 
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT32_MAX,
+
+      /* VK_EXT_fragment_density_map */
+      .minFragmentDensityTexelSize = {32, 32},
+      .maxFragmentDensityTexelSize = {1024, 1024},
+      .fragmentDensityInvocations = false,
 
       /* VK_EXT_nested_command_buffer */
       .maxCommandBufferNestingLevel = UINT32_MAX,

@@ -86,6 +86,10 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
    if (va_format->atomic)
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
 
+   if (vk_format == VK_FORMAT_R8G8_UNORM && tiling == VK_IMAGE_TILING_OPTIMAL &&
+       pdev->vk.supported_extensions.EXT_fragment_density_map)
+      features |= VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT;
+
    if (features != 0) {
       features |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT;
       features |= VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
@@ -189,6 +193,8 @@ vk_image_usage_to_format_features(VkImageUsageFlagBits usage_flag)
              VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
    case VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR:
       return VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+   case VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT:
+      return VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT;
    default:
       return 0;
    }
