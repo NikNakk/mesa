@@ -572,9 +572,9 @@ kk_custom_resolve_debug_log(const struct kk_rendering_state *render)
                 "samples=%u usage=0x%x -> resolve fmt=%d %ux%u layers=%u usage=0x%x",
                 i, a->resolve_mode, a->load_op, a->store_op, a->vk_format,
                 im->extent.width, im->extent.height, im->array_layers,
-                im->samples, im->usage, rim ? rim->format : 0,
+                im->samples, (unsigned)im->usage, rim ? rim->format : 0,
                 rim ? rim->extent.width : 0, rim ? rim->extent.height : 0,
-                rim ? rim->array_layers : 0, rim ? rim->usage : 0);
+                rim ? rim->array_layers : 0, rim ? (unsigned)rim->usage : 0);
    }
    mesa_logi("kk-cr: depth mode=0x%x stencil mode=0x%x whole=%d force_store=%d",
              render->depth_att.resolve_mode, render->stencil_att.resolve_mode,
