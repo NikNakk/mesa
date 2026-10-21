@@ -6,6 +6,7 @@
  */
 
 #include "kk_queue.h"
+#include "util/log.h"
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
@@ -44,6 +45,9 @@ static void
 check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
 {
    if (data->error != MTL_COMMAND_QUEUE_ERROR_NONE) {
+      mesa_loge("kk: command queue error %s: %s",
+                mtl_command_queue_error_to_string(data->error),
+                data->error_message ? data->error_message : "(no message)");
       vk_device_set_lost(
          &dev->vk, "Command queue error: %s, with message \"%s\"",
          mtl_command_queue_error_to_string(data->error), data->error_message);
