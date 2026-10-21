@@ -18,6 +18,8 @@
 #include "kk_sampler.h"
 
 #include "util/format/u_format.h"
+#include "util/log.h"
+#include "util/u_debug.h"
 #include "util/half_float.h"
 
 static inline uint32_t
@@ -71,6 +73,16 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
             assert(view->planes[plane].input_gpu_resource_id);
             desc[plane].image_gpu_resource_id =
                view->planes[plane].input_gpu_resource_id;
+            if (!strcmp(debug_get_option("KK_CUSTOM_RESOLVE_DEBUG", ""), "log")) {
+               static uint32_t logged;
+               if (logged++ < 64)
+                  mesa_logi("kk-cr-desc: input view=%p samples=%u type=%d "
+                            "input=%llx sampled=%llx",
+                            (void *)view, view->vk.image->samples,
+                            view->vk.view_type,
+                            (unsigned long long)view->planes[plane].input_gpu_resource_id,
+                            (unsigned long long)view->planes[plane].sampled_gpu_resource_id);
+            }
          } else {
             assert(view->planes[plane].sampled_gpu_resource_id);
             desc[plane].image_gpu_resource_id =

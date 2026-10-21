@@ -128,6 +128,9 @@ struct kk_fs_key {
    bool dynamic_input_attachment_map;
    uint8_t depth_input_att;
    uint8_t stencil_input_att;
+   bool custom_resolve;
+   uint8_t input_color_count;
+   uint8_t input_color_map[MESA_VK_MAX_COLOR_ATTACHMENTS];
 };
 
 static void
@@ -166,6 +169,13 @@ kk_populate_fs_key(struct kk_fs_key *key,
       state->ial ? state->ial->stencil_att : MESA_VK_ATTACHMENT_NO_INDEX;
    key->dynamic_input_attachment_map =
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP);
+
+   key->custom_resolve = state->rp->custom_resolve;
+   if (key->custom_resolve && state->ial) {
+      key->input_color_count = state->ial->color_attachment_count;
+      memcpy(key->input_color_map, state->ial->color_map,
+             sizeof(key->input_color_map));
+   }
 }
 
 enum kk_feature_key {
@@ -681,6 +691,73 @@ kk_fs_needs_forced_depth_write(const nir_shader *nir,
                                           indices_known);
 }
 
+static int
+kk_custom_resolve_input_slot(
+   const struct vk_input_attachment_location_state *ial, uint32_t ia_index)
+{
+   if (ial == NULL)
+      return ia_index < KK_MAX_RTS ? (int)ia_index : -1;
+
+   if (ial->depth_att == ia_index)
+      return KK_MAX_RTS;
+   if (ial->stencil_att == ia_index)
+      return KK_MAX_RTS + 1;
+
+   if (ial->color_attachment_count == MESA_VK_COLOR_ATTACHMENT_COUNT_UNKNOWN)
+      return ia_index < KK_MAX_RTS ? (int)ia_index : -1;
+
+   for (uint32_t i = 0; i < ial->color_attachment_count && i < KK_MAX_RTS; i++) {
+      if (ial->color_map[i] == ia_index)
+         return i;
+   }
+   return -1;
+}
+
+static bool
+kk_lower_custom_resolve_input(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct vk_input_attachment_location_state *ial = data;
+
+   int src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (src < 0)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(tex->src[src].src);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (var == NULL)
+      return false;
+
+   enum glsl_sampler_dim dim =
+      glsl_get_sampler_dim(glsl_without_array(var->type));
+   if (dim != GLSL_SAMPLER_DIM_SUBPASS && dim != GLSL_SAMPLER_DIM_SUBPASS_MS)
+      return false;
+
+   uint32_t ia_index = var->data.index;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return false;
+      ia_index += nir_src_as_uint(deref->arr.index);
+   }
+
+   int slot = kk_custom_resolve_input_slot(ial, ia_index);
+   if (slot < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
+   nir_def *addr = nir_iadd_imm(
+      b, root,
+      offsetof(struct kk_root_descriptor_table, custom_resolve_inputs) +
+         slot * sizeof(uint64_t));
+   nir_def *handle = nir_load_texture_handle_kk(
+      b, 1, 64, addr, .dest_type = tex->dest_type,
+      .image_dim = tex->sampler_dim, .image_array = tex->is_array);
+
+   nir_tex_instr_remove_src(tex, src);
+   nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+   return true;
+}
+
 static void
 kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
              const struct vk_pipeline_robustness_state *rs,
@@ -807,6 +884,11 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
     * generate a nir_intrinsic_load_blend_const_color_rgba which gets lowered by
     * the lower descriptor pass
     */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && state && state->rp &&
+       state->rp->custom_resolve)
+      NIR_PASS(_, nir, nir_shader_tex_pass, kk_lower_custom_resolve_input,
+               nir_metadata_control_flow, (void *)state->ial);
+
    NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts);
 

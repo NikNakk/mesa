@@ -786,6 +786,19 @@ kk_CmdBeginCustomResolveEXT(
       .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,
    };
 
+   uint64_t resolve_inputs[KK_MAX_RTS + 2] = {0};
+   for (uint32_t i = 0; i < render->color_att_count && i < KK_MAX_RTS; i++) {
+      if (render->color_att[i].iview)
+         resolve_inputs[i] =
+            render->color_att[i].iview->planes[0].input_gpu_resource_id;
+   }
+   if (render->depth_att.iview)
+      resolve_inputs[KK_MAX_RTS] =
+         render->depth_att.iview->planes[0].input_gpu_resource_id;
+   if (render->stencil_att.iview)
+      resolve_inputs[KK_MAX_RTS + 1] =
+         render->stencil_att.iview->planes[0].input_gpu_resource_id;
+
    enum kk_custom_resolve_debug_mode debug = kk_custom_resolve_debug_mode();
    if (debug != KK_CR_DEBUG_NONE)
       kk_custom_resolve_debug_log(render);
@@ -800,6 +813,11 @@ kk_CmdBeginCustomResolveEXT(
 
    kk_CmdEndRendering2KHR(commandBuffer, &end_info);
    kk_CmdBeginRendering(commandBuffer, &rendering_info);
+
+   struct kk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   memcpy(desc->root.custom_resolve_inputs, resolve_inputs,
+          sizeof(resolve_inputs));
+   desc->root_dirty = true;
 
    if (debug == KK_CR_DEBUG_MAGENTA && debug_resolve) {
       const VkClearAttachment clear = {
