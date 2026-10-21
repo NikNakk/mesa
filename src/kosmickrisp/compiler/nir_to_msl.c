@@ -1331,6 +1331,20 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_per_draw_ptr_kk:
       P(ctx, "(ulong)&per_draw.contents[0];\n");
       break;
+   case nir_intrinsic_rate_map_physical_to_screen_kk:
+   case nir_intrinsic_rate_map_screen_to_physical_kk:
+      P(ctx, "rasterization_rate_map_decoder(*(constant "
+             "rasterization_rate_map_data*)(");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ")).map_%s_coordinates(",
+        instr->intrinsic == nir_intrinsic_rate_map_physical_to_screen_kk
+           ? "physical_to_screen"
+           : "screen_to_physical");
+      src_to_msl(ctx, &instr->src[1]);
+      P(ctx, ", ");
+      src_to_msl(ctx, &instr->src[2]);
+      P(ctx, ");\n");
+      break;
    case nir_intrinsic_load_global: {
       enum gl_access_qualifier access = nir_intrinsic_access(instr);
       const char *type = msl_type_for_def(ctx->types, &instr->def);

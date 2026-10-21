@@ -12,6 +12,7 @@
 #include "kk_buffer_view.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_device.h"
+#include "kk_image.h"
 #include "kk_entrypoints.h"
 #include "kk_image_view.h"
 #include "kk_physical_device.h"
@@ -88,6 +89,11 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
             desc[plane].image_gpu_resource_id =
                view->planes[plane].sampled_gpu_resource_id;
          }
+
+         const struct kk_image *image =
+            container_of(view->vk.image, struct kk_image, vk);
+         desc[plane].rate_params =
+            image->rate_params ? image->rate_params->gpu : 0;
 
          float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
          desc[plane].image_min_lod_fp16 = _mesa_float_to_half(min_lod);
