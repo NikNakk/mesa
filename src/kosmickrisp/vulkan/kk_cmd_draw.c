@@ -27,6 +27,9 @@
 #include "vulkan/runtime/vk_render_pass.h"
 #include "vulkan/util/vk_format.h"
 
+#include "util/log.h"
+#include "util/u_debug.h"
+
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
 {
@@ -526,6 +529,59 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    }
 }
 
+
+enum kk_custom_resolve_debug_mode {
+   KK_CR_DEBUG_NONE,
+   KK_CR_DEBUG_LOG,
+   KK_CR_DEBUG_MAGENTA,
+   KK_CR_DEBUG_AVERAGE,
+};
+
+static enum kk_custom_resolve_debug_mode
+kk_custom_resolve_debug_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *s = debug_get_option("KK_CUSTOM_RESOLVE_DEBUG", "");
+      mode = !strcmp(s, "log")       ? KK_CR_DEBUG_LOG
+             : !strcmp(s, "magenta") ? KK_CR_DEBUG_MAGENTA
+             : !strcmp(s, "average") ? KK_CR_DEBUG_AVERAGE
+                                     : KK_CR_DEBUG_NONE;
+   }
+   return mode;
+}
+
+static void
+kk_custom_resolve_debug_log(const struct kk_rendering_state *render)
+{
+   static uint32_t logged;
+   if (logged >= 8)
+      return;
+   logged++;
+   mesa_logi("kk-cr: flags=0x%x area=%d,%d/%ux%u layers=%u view_mask=0x%x colors=%u",
+             render->flags, render->area.offset.x, render->area.offset.y,
+             render->area.extent.width, render->area.extent.height,
+             render->layer_count, render->view_mask, render->color_att_count);
+   for (uint32_t i = 0; i < render->color_att_count; i++) {
+      const struct kk_attachment *a = &render->color_att[i];
+      if (!a->iview)
+         continue;
+      const struct vk_image *im = a->iview->vk.image;
+      const struct vk_image *rim = a->resolve_iview ? a->resolve_iview->vk.image : NULL;
+      mesa_logi("kk-cr: color%u mode=0x%x load=%d store=%d fmt=%d %ux%u layers=%u "
+                "samples=%u usage=0x%x -> resolve fmt=%d %ux%u layers=%u usage=0x%x",
+                i, a->resolve_mode, a->load_op, a->store_op, a->vk_format,
+                im->extent.width, im->extent.height, im->array_layers,
+                im->samples, im->usage, rim ? rim->format : 0,
+                rim ? rim->extent.width : 0, rim ? rim->extent.height : 0,
+                rim ? rim->array_layers : 0, rim ? rim->usage : 0);
+   }
+   mesa_logi("kk-cr: depth mode=0x%x stencil mode=0x%x whole=%d force_store=%d",
+             render->depth_att.resolve_mode, render->stencil_att.resolve_mode,
+             render->rendering_to_whole_framebuffer,
+             render->force_attachment_store);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
                        UNUSED const VkRenderingEndInfoKHR *pRenderingEndInfo)
@@ -644,6 +700,31 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    if (need_meta_resolve) {
       kk_meta_resolve_rendering(cmd, &vk_render);
    }
+
+   if (cmd->state.gfx.custom_resolve_debug.active) {
+      cmd->state.gfx.custom_resolve_debug.active = false;
+      const VkRenderingAttachmentInfo avg_att = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .imageView =
+            kk_image_view_to_handle(cmd->state.gfx.custom_resolve_debug.ms_iview),
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+         .resolveImageView = kk_image_view_to_handle(
+            cmd->state.gfx.custom_resolve_debug.resolve_iview),
+         .resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      };
+      const VkRenderingInfo avg_render = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+         .renderArea = cmd->state.gfx.custom_resolve_debug.area,
+         .layerCount = cmd->state.gfx.custom_resolve_debug.layer_count,
+         .viewMask = cmd->state.gfx.custom_resolve_debug.view_mask,
+         .colorAttachmentCount = 1,
+         .pColorAttachments = &avg_att,
+      };
+      kk_meta_resolve_rendering(cmd, &avg_render);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -705,8 +786,41 @@ kk_CmdBeginCustomResolveEXT(
       .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,
    };
 
+   enum kk_custom_resolve_debug_mode debug = kk_custom_resolve_debug_mode();
+   if (debug != KK_CR_DEBUG_NONE)
+      kk_custom_resolve_debug_log(render);
+   struct kk_image_view *debug_ms = NULL, *debug_resolve = NULL;
+   for (uint32_t i = 0; i < render->color_att_count; i++) {
+      if (render->color_att[i].resolve_mode == VK_RESOLVE_MODE_CUSTOM_BIT_EXT) {
+         debug_ms = render->color_att[i].iview;
+         debug_resolve = render->color_att[i].resolve_iview;
+         break;
+      }
+   }
+
    kk_CmdEndRendering2KHR(commandBuffer, &end_info);
    kk_CmdBeginRendering(commandBuffer, &rendering_info);
+
+   if (debug == KK_CR_DEBUG_MAGENTA && debug_resolve) {
+      const VkClearAttachment clear = {
+         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .colorAttachment = 0,
+         .clearValue = {.color = {.float32 = {1.0f, 0.0f, 1.0f, 1.0f}}},
+      };
+      const VkClearRect rect = {
+         .rect = rendering_info.renderArea,
+         .baseArrayLayer = 0,
+         .layerCount = rendering_info.viewMask ? 1 : rendering_info.layerCount,
+      };
+      kk_CmdClearAttachments(commandBuffer, 1, &clear, 1, &rect);
+   } else if (debug == KK_CR_DEBUG_AVERAGE && debug_ms && debug_resolve) {
+      cmd->state.gfx.custom_resolve_debug.ms_iview = debug_ms;
+      cmd->state.gfx.custom_resolve_debug.resolve_iview = debug_resolve;
+      cmd->state.gfx.custom_resolve_debug.area = rendering_info.renderArea;
+      cmd->state.gfx.custom_resolve_debug.layer_count = rendering_info.layerCount;
+      cmd->state.gfx.custom_resolve_debug.view_mask = rendering_info.viewMask;
+      cmd->state.gfx.custom_resolve_debug.active = true;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

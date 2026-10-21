@@ -158,6 +158,15 @@ struct kk_graphics_state {
    uint32_t pipeline_sample_count;
 
    struct {
+      struct kk_image_view *ms_iview;
+      struct kk_image_view *resolve_iview;
+      VkRect2D area;
+      uint32_t layer_count;
+      uint32_t view_mask;
+      bool active;
+   } custom_resolve_debug;
+
+   struct {
       enum mtl_visibility_result_mode mode;
 
       /* If enabled, index of the current occlusion query in the occlusion heap.
