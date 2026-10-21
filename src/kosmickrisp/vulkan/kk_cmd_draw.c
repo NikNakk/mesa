@@ -8,6 +8,7 @@
  */
 
 #include "kk_entrypoints.h"
+#include "kk_fdm.h"
 
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
@@ -439,6 +440,9 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    // TODO_KOSMICKRISP Fragment shading rate support goes here if Metal supports
    // it
 
+   kk_fdm_setup_rendering(cmd, pRenderingInfo, pass_descriptor,
+                          framebuffer_extent);
+
    /* Rendering with no attachments requires pushing the start of the render
     * pass to first pipeline binding to know sample count. */
    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
@@ -812,6 +816,7 @@ kk_CmdBeginCustomResolveEXT(
    }
 
    kk_CmdEndRendering2KHR(commandBuffer, &end_info);
+   kk_fdm_carry_to_next_rendering(cmd);
    kk_CmdBeginRendering(commandBuffer, &rendering_info);
 
    struct kk_descriptor_state *desc = &cmd->state.gfx.descriptors;

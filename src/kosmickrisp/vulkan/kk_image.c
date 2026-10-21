@@ -651,6 +651,7 @@ kk_image_finish(struct kk_device *dev, struct kk_image *image,
 #ifdef VK_USE_PLATFORM_METAL_EXT
    kk_image_release_metal_import(dev, image);
 #endif
+   kk_fdm_image_finish(dev, image);
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       kk_image_plane_finish(dev, &image->planes[plane], image->vk.create_flags,
                             pAllocator);
@@ -679,6 +680,13 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    result = kk_image_init(dev, image, pCreateInfo);
    if (result != VK_SUCCESS) {
+      vk_free2(&dev->vk.alloc, pAllocator, image);
+      return result;
+   }
+
+   result = kk_fdm_image_init(dev, image);
+   if (result != VK_SUCCESS) {
+      kk_image_finish(dev, image, pAllocator);
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
    }
@@ -1156,6 +1164,9 @@ kk_CopyMemoryToImage(UNUSED VkDevice device,
          vk_memory_to_image_copy_to_mtl_texture_memory_copy(region, plane);
 
       const uint8_t *host_ptr = region->pHostPointer;
+      kk_fdm_capture(image, host_ptr, region->memoryRowLength,
+                     region->memoryImageHeight, &region->imageSubresource,
+                     region->imageOffset, region->imageExtent);
       kk_foreach_slice(slice, image, imageSubresource)
       {
          info.mtl_data.image_slice = slice;

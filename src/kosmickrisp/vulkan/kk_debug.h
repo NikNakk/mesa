@@ -27,6 +27,7 @@ enum kk_experimental {
     * vkCmdCopyImage() tests in CTS to fail, but it is otherwise usable */
    KK_EXPERIMENTAL_OPTIMIZE_E5B9G9R9 = 1ull << 2,
    KK_EXPERIMENTAL_FDM = 1ull << 3,
+   KK_EXPERIMENTAL_FDM_RATE = 1ull << 4,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;
