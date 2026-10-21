@@ -381,6 +381,13 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_buffer_ptr_kk:
       set_type(types, &instr->def, TYPE_UINT);
       break;
+   case nir_intrinsic_rate_map_physical_to_screen_kk:
+   case nir_intrinsic_rate_map_screen_to_physical_kk:
+      set_type(types, &instr->src[0], TYPE_UINT);
+      set_type(types, &instr->src[1], TYPE_FLOAT);
+      set_type(types, &instr->src[2], TYPE_UINT);
+      set_type(types, &instr->def, TYPE_FLOAT);
+      break;
    // The defs of these instructions don't participate in type inference
    // but their sources are pointers (i.e. uints).
    case nir_intrinsic_load_texture_handle_kk:

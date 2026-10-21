@@ -7,9 +7,12 @@
  * SPDX-License-Identifier: MIT
  */
 #include "kk_cmd_buffer.h"
+#include "kk_debug.h"
 #include "kk_descriptor_set.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_shader.h"
+#include "kk_image.h"
+#include "kk_sampler.h"
 
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
@@ -469,6 +472,87 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 static bool
+kk_sampler_deref_is_subsampled(nir_builder *b, nir_deref_instr *deref,
+                               const struct lower_descriptors_ctx *ctx)
+{
+   uint32_t set, binding;
+   nir_def *index;
+   get_resource_deref_binding(b, deref, &set, &binding, &index);
+   const struct kk_descriptor_set_binding_layout *binding_layout =
+      get_binding_layout(set, binding, ctx);
+   return binding_layout->immutable_samplers != NULL &&
+          binding_layout->immutable_samplers[0] != NULL &&
+          (binding_layout->immutable_samplers[0]->vk.flags &
+           VK_SAMPLER_CREATE_SUBSAMPLED_BIT_EXT);
+}
+
+static nir_def *
+kk_load_rate_u32(nir_builder *b, nir_def *addr, unsigned offset,
+                 unsigned components)
+{
+   return nir_build_load_global_constant(b, components, 32,
+                                         nir_iadd_imm(b, addr, offset),
+                                         .align_mul = 4);
+}
+
+static void
+kk_lower_subsampled_coord(nir_builder *b, nir_tex_instr *tex,
+                          nir_deref_instr *texture, uint64_t plane_offset_B,
+                          const struct lower_descriptors_ctx *ctx)
+{
+   int ci = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (ci < 0)
+      return;
+   nir_def *coord = tex->src[ci].src.ssa;
+   if (coord->num_components < 2 || coord->bit_size != 32)
+      return;
+
+   nir_def *addr = load_resource_deref_desc(
+      b, 1, 64, texture,
+      plane_offset_B + offsetof(struct kk_sampled_image_descriptor, rate_params),
+      ctx);
+
+   nir_push_if(b, nir_ine_imm(b, addr, 0));
+   nir_def *valid =
+      kk_load_rate_u32(b, addr, offsetof(struct kk_rate_params_header, valid), 1);
+   nir_push_if(b, nir_ine_imm(b, valid, 0));
+
+   nir_def *screen = nir_u2f32(
+      b, kk_load_rate_u32(b, addr, offsetof(struct kk_rate_params_header, screen), 2));
+   nir_def *layer = nir_imm_int(b, 0);
+   if (tex->is_array) {
+      nir_def *layers = kk_load_rate_u32(
+         b, addr, offsetof(struct kk_rate_params_header, layers), 1);
+      nir_def *l = nir_f2u32(
+         b, nir_fround_even(b, nir_channel(b, coord, coord->num_components - 1)));
+      layer = nir_umin(b, l, nir_iadd_imm(b, layers, -1));
+   }
+   nir_def *phys_addr = nir_iadd(
+      b, nir_iadd_imm(b, addr, offsetof(struct kk_rate_params_header, physical)),
+      nir_u2u64(b, nir_imul_imm(b, layer, 8)));
+   nir_def *phys_size = nir_u2f32(
+      b, nir_build_load_global_constant(b, 2, 32, phys_addr, .align_mul = 4));
+
+   nir_def *xy = nir_fmul(b, nir_channels(b, coord, 0x3), screen);
+   nir_def *ph = nir_rate_map_screen_to_physical_kk(
+      b, nir_iadd_imm(b, addr, KK_RATE_PARAMS_HEADER_B), xy, layer);
+   ph = nir_fmax(b, ph, nir_imm_float(b, 0.5f));
+   ph = nir_fmin(b, ph, nir_fadd_imm(b, phys_size, -0.5f));
+   nir_def *uv = nir_fdiv(b, ph, screen);
+
+   nir_def *comps[4];
+   for (unsigned i = 0; i < coord->num_components; i++)
+      comps[i] = i < 2 ? nir_channel(b, uv, i) : nir_channel(b, coord, i);
+   nir_def *mapped = nir_vec(b, comps, coord->num_components);
+   nir_pop_if(b, NULL);
+   nir_def *inner = nir_if_phi(b, mapped, coord);
+   nir_pop_if(b, NULL);
+   nir_def *result = nir_if_phi(b, inner, coord);
+
+   nir_src_rewrite(&tex->src[ci].src, result);
+}
+
+static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
 {
@@ -486,6 +570,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       plane_ssa ? nir_src_as_uint(nir_src_for_ssa(plane_ssa)) : 0;
    const uint64_t plane_offset_B =
       plane * sizeof(struct kk_sampled_image_descriptor);
+
+   if (KK_EXPERIMENTAL(FDM_RATE) && sampler != NULL &&
+       !tex->is_shadow &&
+       (tex->op == nir_texop_tex || tex->op == nir_texop_txb ||
+        tex->op == nir_texop_txl || tex->op == nir_texop_txd) &&
+       kk_sampler_deref_is_subsampled(
+          b, nir_src_as_deref(nir_src_for_ssa(sampler)), ctx))
+      kk_lower_subsampled_coord(b, tex,
+                                nir_src_as_deref(nir_src_for_ssa(texture)),
+                                plane_offset_B, ctx);
 
    /* LOD bias is passed in the descriptor set, rather than embedded into
     * the sampler descriptor. There's no spot in the hardware descriptor,

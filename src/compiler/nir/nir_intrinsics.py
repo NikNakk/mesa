@@ -3346,6 +3346,10 @@ load("per_draw_ptr_kk", [], [], [CAN_ELIMINATE, CAN_REORDER])
 load("texture_handle_kk", [1], [DEST_TYPE, IMAGE_DIM, IMAGE_ARRAY, ACCESS, FLAGS], [CAN_ELIMINATE])
 # Same as above but for depth<T> textures, T is always float
 load("depth_texture_kk", [1], [IMAGE_DIM, IMAGE_ARRAY], [CAN_ELIMINATE])
+intrinsic("rate_map_physical_to_screen_kk", src_comp=[1, 2, 1], dest_comp=2,
+          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
+intrinsic("rate_map_screen_to_physical_kk", src_comp=[1, 2, 1], dest_comp=2,
+          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
 # Load a bindless sampler handle mapping a binding table sampler.
 intrinsic("load_sampler_handle_kk", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],

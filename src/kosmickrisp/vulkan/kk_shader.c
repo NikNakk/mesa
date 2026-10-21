@@ -12,6 +12,7 @@
 #include "kk_descriptor_set_layout.h"
 #include "kk_device.h"
 #include "kk_format.h"
+#include "kk_image.h"
 #include "kk_nir_lower_vbo.h"
 #include "kk_physical_device.h"
 #include "kk_sampler.h"
@@ -129,6 +130,7 @@ struct kk_fs_key {
    uint8_t depth_input_att;
    uint8_t stencil_input_att;
    bool custom_resolve;
+   bool fdm_frag_coord;
    uint8_t input_color_count;
    uint8_t input_color_map[MESA_VK_MAX_COLOR_ATTACHMENTS];
 };
@@ -171,6 +173,10 @@ kk_populate_fs_key(struct kk_fs_key *key,
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP);
 
    key->custom_resolve = state->rp->custom_resolve;
+   key->fdm_frag_coord =
+      KK_EXPERIMENTAL(FDM_RATE) &&
+      (state->pipeline_flags &
+       VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT);
    if (key->custom_resolve && state->ial) {
       key->input_color_count = state->ial->color_attachment_count;
       memcpy(key->input_color_map, state->ial->color_map,
@@ -785,6 +791,36 @@ kk_lower_custom_resolve_input(nir_builder *b, nir_tex_instr *tex, void *data)
    return true;
 }
 
+static bool
+kk_is_frag_coord(const nir_instr *instr, UNUSED const void *data)
+{
+   return instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_load_frag_coord;
+}
+
+static nir_def *
+kk_lower_fdm_frag_coord(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   nir_def *phys = &nir_instr_as_intrinsic(instr)->def;
+   nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
+   nir_def *addr = nir_build_load_global_constant(
+      b, 1, 64,
+      nir_iadd_imm(b, root,
+                   offsetof(struct kk_root_descriptor_table, fdm_rate_params)),
+      .align_mul = 8);
+
+   nir_push_if(b, nir_ine_imm(b, addr, 0));
+   nir_def *screen = nir_rate_map_physical_to_screen_kk(
+      b, nir_iadd_imm(b, addr, KK_RATE_PARAMS_HEADER_B),
+      nir_channels(b, phys, 0x3), nir_load_layer_id(b));
+   nir_def *mapped = nir_vec4(b, nir_channel(b, screen, 0),
+                              nir_channel(b, screen, 1), nir_channel(b, phys, 2),
+                              nir_channel(b, phys, 3));
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, mapped, phys);
+}
+
 static void
 kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
              const struct vk_pipeline_robustness_state *rs,
@@ -818,6 +854,12 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
                glsl_get_natural_size_align_bytes);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, kk_nir_lower_fs_multiview, state->mv->view_mask);
+
+      if (KK_EXPERIMENTAL(FDM_RATE) && state && state->rp &&
+          (state->pipeline_flags &
+           VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT))
+         NIR_PASS(_, nir, nir_shader_lower_instructions, kk_is_frag_coord,
+                  kk_lower_fdm_frag_coord, NULL);
 
       /* Run before nir_lower_input_attachments() below, which rewrites the
        * subpass loads it looks for. */
