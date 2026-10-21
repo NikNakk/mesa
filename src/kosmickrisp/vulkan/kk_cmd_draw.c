@@ -444,6 +444,15 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    kk_fdm_setup_rendering(cmd, pRenderingInfo, pass_descriptor,
                           framebuffer_extent);
+   kk_seq_log(cmd, "begin rendering%s flags 0x%x samples %u area %ux%u colors %u "
+                   "resolve %d/%d depth %s resolve %d stencil resolve %d views 0x%x",
+              cmd->state.gfx.in_custom_resolve ? " (custom resolve stage)" : "",
+              render->flags, render->samples, render->area.extent.width,
+              render->area.extent.height, render->color_att_count,
+              render->color_att_count ? (int)render->color_att[0].resolve_mode : -1,
+              render->color_att_count > 1 ? (int)render->color_att[1].resolve_mode : -1,
+              render->depth_att.iview ? "yes" : "no", (int)render->depth_att.resolve_mode,
+              (int)render->stencil_att.resolve_mode, render->view_mask);
 
    /* Rendering with no attachments requires pushing the start of the render
     * pass to first pipeline binding to know sample count. */
@@ -595,6 +604,8 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_rendering_state *render = &cmd->state.gfx.render;
    bool need_meta_resolve = false;
+   kk_seq_log(cmd, "end rendering");
+   cmd->state.gfx.in_custom_resolve = false;
 
    /* Translate render state back to VK for meta */
    VkRenderingAttachmentInfo vk_color_att[KK_MAX_RTS];
@@ -817,7 +828,9 @@ kk_CmdBeginCustomResolveEXT(
       }
    }
 
+   kk_seq_log(cmd, "begin custom resolve");
    kk_CmdEndRendering2KHR(commandBuffer, &end_info);
+   cmd->state.gfx.in_custom_resolve = true;
    kk_fdm_carry_to_next_rendering(cmd);
    cmd->state.gfx.restart_barrier = true;
    kk_CmdBeginRendering(commandBuffer, &rendering_info);
@@ -2237,6 +2250,18 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
    }
 }
 
+static void
+kk_seq_draw(struct kk_cmd_buffer *cmd, const char *what, uint32_t count,
+            uint32_t instances)
+{
+   if (!cmd->state.gfx.seq_log)
+      return;
+   const struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   kk_seq_log(cmd, "%s %u x%u fs %p outputs 0x%llx", what, count, instances,
+              (const void *)fs,
+              fs ? (unsigned long long)fs->info.fs.outputs_written : 0ull);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
            uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
@@ -2246,6 +2271,7 @@ kk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "draw", vertexCount, instanceCount);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2280,6 +2306,7 @@ kk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "DrawMultiEXT", 0, 0);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2334,6 +2361,7 @@ kk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "draw indexed", indexCount, instanceCount);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2374,6 +2402,7 @@ kk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "DrawMultiIndexedEXT", 0, 0);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2431,6 +2460,7 @@ kk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "DrawIndirect2KHR", 0, 0);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2460,6 +2490,7 @@ kk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "DrawIndexedIndirect2KHR", 0, 0);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2492,6 +2523,7 @@ kk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "DrawIndirectCount2KHR", 0, 0);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2523,6 +2555,7 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
       return;
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_seq_draw(cmd, "DrawIndexedIndirectCount2KHR", 0, 0);
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;

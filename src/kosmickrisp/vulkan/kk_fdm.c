@@ -21,6 +21,8 @@
 #include "util/u_debug.h"
 #include "vk_util.h"
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -425,6 +427,22 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    }
    gfx->fdm.carry = false;
 
+   if (!gfx->in_custom_resolve)
+      gfx->seq_log = false;
+   if (density && render->samples > 1 && !gfx->in_custom_resolve) {
+      static int enabled = -1;
+      static uint32_t ms_passes;
+      if (enabled < 0)
+         enabled = debug_get_bool_option("KK_SEQ_LOG", false);
+      gfx->seq_log = false;
+      if (enabled) {
+         simple_mtx_lock(&kk_fdm_lock);
+         uint32_t n = ms_passes++;
+         simple_mtx_unlock(&kk_fdm_lock);
+         gfx->seq_log = n >= 3000 && n < 3003;
+      }
+   }
+
    simple_mtx_lock(&kk_fdm_lock);
    void *map = density ? kk_fdm_get_map(dev, density, screen) : NULL;
    if (map && !kk_fdm_all_subsampled(render)) {
@@ -498,6 +516,19 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
       desc->root.fdm_rate_params = params;
       desc->root_dirty = true;
    }
+}
+
+void
+kk_seq_log(struct kk_cmd_buffer *cmd, const char *fmt, ...)
+{
+   if (!cmd->state.gfx.seq_log)
+      return;
+   char buf[256];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   mesa_logi("kk-seq %p: %s", (void *)cmd, buf);
 }
 
 void

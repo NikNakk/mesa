@@ -99,6 +99,8 @@ struct kk_shader_info {
 
       struct {
          bool uses_flat_varyings;
+         bool custom_resolve;
+         uint64_t outputs_written;
       } fs;
 
       struct {

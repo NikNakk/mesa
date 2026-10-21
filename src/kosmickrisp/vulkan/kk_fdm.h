@@ -19,6 +19,8 @@ void kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
 
 void kk_fdm_carry_to_next_rendering(struct kk_cmd_buffer *cmd);
 
+void kk_seq_log(struct kk_cmd_buffer *cmd, const char *fmt, ...);
+
 struct vk_image;
 void kk_fdm_note_use(const struct vk_image *image, const char *what);
 struct vk_image_view;

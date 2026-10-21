@@ -10,6 +10,7 @@
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
 #include "kk_debug.h"
+#include "kk_fdm.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_entrypoints.h"
 #include "kk_format.h"
@@ -708,6 +709,29 @@ kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
        * break the render pass. See comment in kk_barrier_requires_encoder_split
        */
       const bool required = kk_barrier_requires_encoder_split(cmd, dep);
+      if (cmd->state.gfx.seq_log) {
+         VkPipelineStageFlags2 ss = 0, ds = 0;
+         VkAccessFlags2 sa = 0, da = 0;
+         for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
+            ss |= dep->pMemoryBarriers[i].srcStageMask;
+            ds |= dep->pMemoryBarriers[i].dstStageMask;
+            sa |= dep->pMemoryBarriers[i].srcAccessMask;
+            da |= dep->pMemoryBarriers[i].dstAccessMask;
+         }
+         for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
+            ss |= dep->pImageMemoryBarriers[i].srcStageMask;
+            ds |= dep->pImageMemoryBarriers[i].dstStageMask;
+            sa |= dep->pImageMemoryBarriers[i].srcAccessMask;
+            da |= dep->pImageMemoryBarriers[i].dstAccessMask;
+         }
+         kk_seq_log(cmd, "barrier in pass: %u memory %u buffer %u image, flags 0x%x, "
+                         "src 0x%llx/0x%llx dst 0x%llx/0x%llx, %s",
+                    dep->memoryBarrierCount, dep->bufferMemoryBarrierCount,
+                    dep->imageMemoryBarrierCount, dep->dependencyFlags,
+                    (unsigned long long)ss, (unsigned long long)sa,
+                    (unsigned long long)ds, (unsigned long long)da,
+                    required ? "split required" : "split for msaa");
+      }
       if (cmd->state.gfx.render.samples > 1 || required) {
          kk_encoder_stat(required ? "barrier split, required"
                                   : "barrier split, msaa only",
