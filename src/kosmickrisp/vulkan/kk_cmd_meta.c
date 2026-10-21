@@ -8,6 +8,7 @@
  */
 
 #include "kk_private.h"
+#include "kk_fdm.h"
 
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
@@ -240,6 +241,8 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_fdm_note_use(vk_image_from_handle(pBlitImageInfo->srcImage), "blit source");
+   kk_fdm_note_use(vk_image_from_handle(pBlitImageInfo->dstImage), "blit destination");
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdBlitImage2");
    vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
@@ -254,6 +257,8 @@ kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_fdm_note_use(vk_image_from_handle(pResolveImageInfo->srcImage), "resolve source");
+   kk_fdm_note_use(vk_image_from_handle(pResolveImageInfo->dstImage), "resolve destination");
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdResolveImage2");
    vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);

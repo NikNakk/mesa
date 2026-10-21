@@ -29,7 +29,9 @@ struct kk_sampled_image_descriptor {
    uint16_t pad_to_64_bits;
    uint32_t border[4];
    uint64_t rate_params;
-   uint64_t pad_to_power_2[2];
+   uint32_t rate_base_layer;
+   uint32_t rate_image_size[2];
+   uint32_t pad_to_power_2;
 };
 
 static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,

@@ -506,6 +506,7 @@ kk_lower_subsampled_coord(nir_builder *b, nir_tex_instr *tex,
    nir_def *coord = tex->src[ci].src.ssa;
    if (coord->num_components < 2 || coord->bit_size != 32)
       return;
+   const bool fetch = tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms;
 
    nir_def *addr = load_resource_deref_desc(
       b, 1, 64, texture,
@@ -518,27 +519,38 @@ kk_lower_subsampled_coord(nir_builder *b, nir_tex_instr *tex,
    nir_push_if(b, nir_ine_imm(b, valid, 0));
 
    nir_def *screen = nir_u2f32(
-      b, kk_load_rate_u32(b, addr, offsetof(struct kk_rate_params_header, screen), 2));
-   nir_def *layer = nir_imm_int(b, 0);
+      b, load_resource_deref_desc(
+            b, 2, 32, texture,
+            plane_offset_B +
+               offsetof(struct kk_sampled_image_descriptor, rate_image_size),
+            ctx));
+   nir_def *layer = load_resource_deref_desc(
+      b, 1, 32, texture,
+      plane_offset_B +
+         offsetof(struct kk_sampled_image_descriptor, rate_base_layer),
+      ctx);
    if (tex->is_array) {
-      nir_def *layers = kk_load_rate_u32(
-         b, addr, offsetof(struct kk_rate_params_header, layers), 1);
-      nir_def *l = nir_f2u32(
-         b, nir_fround_even(b, nir_channel(b, coord, coord->num_components - 1)));
-      layer = nir_umin(b, l, nir_iadd_imm(b, layers, -1));
+      nir_def *l = nir_channel(b, coord, coord->num_components - 1);
+      if (!fetch)
+         l = nir_f2u32(b, nir_fround_even(b, l));
+      layer = nir_iadd(b, layer, l);
    }
+   nir_def *layers =
+      kk_load_rate_u32(b, addr, offsetof(struct kk_rate_params_header, layers), 1);
+   layer = nir_umin(b, layer, nir_iadd_imm(b, layers, -1));
    nir_def *phys_addr = nir_iadd(
       b, nir_iadd_imm(b, addr, offsetof(struct kk_rate_params_header, physical)),
       nir_u2u64(b, nir_imul_imm(b, layer, 8)));
    nir_def *phys_size = nir_u2f32(
       b, nir_build_load_global_constant(b, 2, 32, phys_addr, .align_mul = 4));
 
-   nir_def *xy = nir_fmul(b, nir_channels(b, coord, 0x3), screen);
+   nir_def *xy = fetch ? nir_fadd_imm(b, nir_i2f32(b, nir_channels(b, coord, 0x3)), 0.5f)
+                       : nir_fmul(b, nir_channels(b, coord, 0x3), screen);
    nir_def *ph = nir_rate_map_screen_to_physical_kk(
       b, nir_iadd_imm(b, addr, KK_RATE_PARAMS_HEADER_B), xy, layer);
    ph = nir_fmax(b, ph, nir_imm_float(b, 0.5f));
    ph = nir_fmin(b, ph, nir_fadd_imm(b, phys_size, -0.5f));
-   nir_def *uv = nir_fdiv(b, ph, screen);
+   nir_def *uv = fetch ? nir_f2i32(b, nir_ffloor(b, ph)) : nir_fdiv(b, ph, screen);
 
    nir_def *comps[4];
    for (unsigned i = 0; i < coord->num_components; i++)
@@ -577,6 +589,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
         tex->op == nir_texop_txl || tex->op == nir_texop_txd) &&
        kk_sampler_deref_is_subsampled(
           b, nir_src_as_deref(nir_src_for_ssa(sampler)), ctx))
+      kk_lower_subsampled_coord(b, tex,
+                                nir_src_as_deref(nir_src_for_ssa(texture)),
+                                plane_offset_B, ctx);
+   else if (KK_EXPERIMENTAL(FDM_RATE) &&
+            (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms) &&
+            (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
+             tex->sampler_dim == GLSL_SAMPLER_DIM_MS))
       kk_lower_subsampled_coord(b, tex,
                                 nir_src_as_deref(nir_src_for_ssa(texture)),
                                 plane_offset_B, ctx);
