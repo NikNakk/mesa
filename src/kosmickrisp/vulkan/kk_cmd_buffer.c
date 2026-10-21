@@ -9,6 +9,7 @@
 
 #include "kk_buffer.h"
 #include "kk_cmd_pool.h"
+#include "kk_debug.h"
 #include "kk_descriptor_set_layout.h"
 #include "kk_entrypoints.h"
 #include "kk_format.h"
@@ -227,6 +228,8 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
          goto fail_allocator;
    }
    mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
+   cmd->state.gfx.pending_barrier_src = MTL_STAGE_ALL;
+   cmd->state.gfx.pending_barrier_dst = MTL_STAGE_ALL;
 
    return VK_SUCCESS;
 
@@ -316,6 +319,16 @@ cs_start_render(struct kk_cmd_buffer *cmd)
 
    cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
       cmd->metal.cmd_buf, state->render_pass_descriptor);
+   if (KK_EXPERIMENTAL(LIGHT_BARRIERS)) {
+      uint32_t src = state->pending_barrier_src, dst = state->pending_barrier_dst;
+      if (state->restart_barrier)
+         src = dst = MTL_STAGE_ALL;
+      if (src && dst)
+         mtl_barrier_after_queue_stages(cmd->metal.render, src, dst);
+      state->pending_barrier_src = 0;
+      state->pending_barrier_dst = 0;
+      state->restart_barrier = false;
+   }
    kk_encoder_stat(state->need_to_start_render_pass ? "render restart" : "render", false);
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
@@ -405,10 +418,17 @@ cs_get_compute_from(struct kk_cmd_buffer *cmd, const char *caller)
       cs_end(cmd);
       kk_cmd_buffer_dirty_all_gfx(cmd);
       cmd->state.gfx.need_to_start_render_pass = true;
+      cmd->state.gfx.restart_barrier = true;
    }
 
    if (cmd->metal.compute == NULL) {
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
+      if (KK_EXPERIMENTAL(LIGHT_BARRIERS)) {
+         mtl_barrier_after_queue_stages(cmd->metal.compute, MTL_STAGE_ALL,
+                                        MTL_STAGE_ALL);
+         cmd->state.gfx.pending_barrier_src = 0;
+         cmd->state.gfx.pending_barrier_dst = 0;
+      }
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
       if (kk_label_passes())
@@ -422,7 +442,8 @@ static void
 end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
 {
    /* TODO_KOSMICKRISP This is probably overkill */
-   mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   if (!KK_EXPERIMENTAL(LIGHT_BARRIERS))
+      mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
    mtl_end_encoding(encoder);
    mtl_release(encoder);
 
@@ -469,6 +490,8 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.compute) {
       end_encoder(cmd, cmd->metal.compute);
       cmd->metal.compute = NULL;
+      cmd->state.gfx.pending_barrier_src = MTL_STAGE_ALL;
+      cmd->state.gfx.pending_barrier_dst = MTL_STAGE_ALL;
    }
 }
 
@@ -543,28 +566,161 @@ kk_barrier_requires_encoder_split(struct kk_cmd_buffer *cmd,
           (dst & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT);
 }
 
-VKAPI_ATTR void VKAPI_CALL
-kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
-                       const VkDependencyInfo *pDependencyInfo)
+static void
+kk_barrier_histogram(const VkDependencyInfo *dep)
 {
-   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("KK_BARRIER_STATS", false);
+   if (!enabled)
+      return;
+   uint64_t ss = 0, ds = 0, sa = 0, da = 0;
+   uint32_t layouts = 0;
+   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
+      ss |= dep->pMemoryBarriers[i].srcStageMask;
+      ds |= dep->pMemoryBarriers[i].dstStageMask;
+      sa |= dep->pMemoryBarriers[i].srcAccessMask;
+      da |= dep->pMemoryBarriers[i].dstAccessMask;
+   }
+   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++) {
+      ss |= dep->pBufferMemoryBarriers[i].srcStageMask;
+      ds |= dep->pBufferMemoryBarriers[i].dstStageMask;
+      sa |= dep->pBufferMemoryBarriers[i].srcAccessMask;
+      da |= dep->pBufferMemoryBarriers[i].dstAccessMask;
+   }
+   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
+      ss |= dep->pImageMemoryBarriers[i].srcStageMask;
+      ds |= dep->pImageMemoryBarriers[i].dstStageMask;
+      sa |= dep->pImageMemoryBarriers[i].srcAccessMask;
+      da |= dep->pImageMemoryBarriers[i].dstAccessMask;
+      layouts += dep->pImageMemoryBarriers[i].oldLayout !=
+                 dep->pImageMemoryBarriers[i].newLayout;
+   }
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+   static struct {
+      uint64_t ss, ds, sa, da, count;
+   } h[64];
+   static uint32_t n, total;
+   simple_mtx_lock(&lock);
+   uint32_t i;
+   for (i = 0; i < n; i++)
+      if (h[i].ss == ss && h[i].ds == ds && h[i].sa == sa && h[i].da == da)
+         break;
+   if (i == n && n < ARRAY_SIZE(h)) {
+      h[n].ss = ss;
+      h[n].ds = ds;
+      h[n].sa = sa;
+      h[n].da = da;
+      n++;
+   }
+   if (i < n)
+      h[i].count++;
+   if ((++total % 200000) == 0)
+      for (uint32_t j = 0; j < n; j++)
+         if (h[j].count * 100 >= total)
+            mesa_logi("kk-barriers: %llu: src stage 0x%llx access 0x%llx -> dst stage "
+                      "0x%llx access 0x%llx",
+                      (unsigned long long)h[j].count, (unsigned long long)h[j].ss,
+                      (unsigned long long)h[j].sa, (unsigned long long)h[j].ds,
+                      (unsigned long long)h[j].da);
+   simple_mtx_unlock(&lock);
+   (void)layouts;
+}
 
-   /* TODO_KOSMICKRISP Lighten barriers according to the actual requested
-    * barrier. To take advantage of this we need to remove the chaining of
-    * encoders. */
+static uint32_t
+kk_vk_stages_to_mtl(VkPipelineStageFlags2 stages, bool src)
+{
+   const VkPipelineStageFlags2 vertex =
+      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+      VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+      VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT |
+      VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
+   const VkPipelineStageFlags2 fragment =
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_2_FRAGMENT_DENSITY_PROCESS_BIT_EXT |
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+   const VkPipelineStageFlags2 transfer =
+      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
+      VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
+      VK_PIPELINE_STAGE_2_CLEAR_BIT;
+   const VkPipelineStageFlags2 known =
+      vertex | fragment | transfer | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
+      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+
+   if ((stages & (VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
+                  VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT)) ||
+       (stages & ~known) ||
+       (src && (stages & VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT)) ||
+       (!src && (stages & VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT)))
+      return MTL_STAGE_ALL;
+
+   uint32_t mtl = 0;
+   if (stages & vertex)
+      mtl |= MTL_STAGE_VERTEX;
+   if (stages & fragment)
+      mtl |= MTL_STAGE_FRAGMENT;
+   if (stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+      mtl |= MTL_STAGE_DISPATCH;
+   if (stages & transfer)
+      mtl |= MTL_STAGE_VERTEX | MTL_STAGE_FRAGMENT | MTL_STAGE_DISPATCH |
+             MTL_STAGE_BLIT;
+   return mtl;
+}
+
+static void
+kk_accumulate_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
+{
+   VkPipelineStageFlags2 src = 0, dst = 0;
+   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
+      src |= dep->pMemoryBarriers[i].srcStageMask;
+      dst |= dep->pMemoryBarriers[i].dstStageMask;
+   }
+   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++) {
+      src |= dep->pBufferMemoryBarriers[i].srcStageMask;
+      dst |= dep->pBufferMemoryBarriers[i].dstStageMask;
+   }
+   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
+      src |= dep->pImageMemoryBarriers[i].srcStageMask;
+      dst |= dep->pImageMemoryBarriers[i].dstStageMask;
+   }
+   uint32_t msrc = kk_vk_stages_to_mtl(src, true);
+   uint32_t mdst = kk_vk_stages_to_mtl(dst, false);
+   if (msrc && mdst) {
+      cmd->state.gfx.pending_barrier_src |= msrc;
+      cmd->state.gfx.pending_barrier_dst |= mdst;
+   }
+}
+
+void
+kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
+{
    if (cmd->metal.render) {
       /* Multisample attachments require render pass split always. Then based on
        * the barrier and if we are using depth/stencil or not, we may have to
        * break the render pass. See comment in kk_barrier_requires_encoder_split
        */
-      if (cmd->state.gfx.render.samples > 1 ||
-          kk_barrier_requires_encoder_split(cmd, pDependencyInfo)) {
+      const bool required = kk_barrier_requires_encoder_split(cmd, dep);
+      if (cmd->state.gfx.render.samples > 1 || required) {
+         kk_encoder_stat(required ? "barrier split, required"
+                                  : "barrier split, msaa only",
+                         true);
          kk_apply_attachment_store_ops(cmd, true);
          cs_end(cmd);
+         cmd->state.gfx.restart_barrier = true;
          cs_start_render(cmd);
-      } else
+      } else {
+         kk_encoder_stat("barrier in render pass", false);
          mtl_barrier_after_encoder_stages(cmd->metal.render, MTL_STAGE_VERTEX,
                                           MTL_STAGE_FRAGMENT);
+      }
    } else if (cmd->metal.compute) {
       /* We chain encoders, so an intra-encoder barrier is enough here:
        * no need to tear down and recreate the encoder.
@@ -572,7 +728,20 @@ kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       mtl_barrier_after_encoder_stages(cmd->metal.compute,
                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+   } else {
+      kk_encoder_stat("barrier with no encoder open", false);
+      kk_barrier_histogram(dep);
+      if (KK_EXPERIMENTAL(LIGHT_BARRIERS))
+         kk_accumulate_barrier(cmd, dep);
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+                       const VkDependencyInfo *pDependencyInfo)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   kk_cmd_barrier(cmd, pDependencyInfo);
 }
 
 static void

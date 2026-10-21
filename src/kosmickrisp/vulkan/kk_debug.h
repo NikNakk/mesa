@@ -28,6 +28,7 @@ enum kk_experimental {
    KK_EXPERIMENTAL_M5_OPTIMIZE_E5B9G9R9 = 1ull << 2,
    KK_EXPERIMENTAL_FDM = 1ull << 3,
    KK_EXPERIMENTAL_FDM_RATE = 1ull << 4,
+   KK_EXPERIMENTAL_LIGHT_BARRIERS = 1ull << 5,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

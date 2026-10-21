@@ -151,6 +151,9 @@ struct kk_graphics_state {
    bool is_depth_stencil_dynamic;
    bool is_cull_front_and_back;
    bool need_to_start_render_pass;
+   bool restart_barrier;
+   uint32_t pending_barrier_src;
+   uint32_t pending_barrier_dst;
 
    enum kk_dirty dirty;
    uint32_t pipeline_sample_count;
@@ -321,6 +324,7 @@ void cs_start_render(struct kk_cmd_buffer *cmd);
 mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *cs_get_compute_from(struct kk_cmd_buffer *cmd, const char *caller);
 #define cs_get_compute(cmd) cs_get_compute_from(cmd, __func__)
+void kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep);
 void cs_end(struct kk_cmd_buffer *cmd);
 void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
                                         uint64_t addr);

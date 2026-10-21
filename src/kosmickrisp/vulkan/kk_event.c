@@ -6,6 +6,7 @@
  */
 
 #include "kk_event.h"
+#include "kk_debug.h"
 
 #include "kk_bo.h"
 #include "kk_cmd_buffer.h"
@@ -113,4 +114,9 @@ kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                   const VkDependencyInfo *pDependencyInfos)
 {
    /* We do nothing, event should already be set by the time we are here. */
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (KK_EXPERIMENTAL(LIGHT_BARRIERS)) {
+      for (uint32_t i = 0; i < eventCount; i++)
+         kk_cmd_barrier(cmd, &pDependencyInfos[i]);
+   }
 }
