@@ -10,6 +10,8 @@
 
 #include "kk_private.h"
 
+struct kk_bo;
+
 #include "kk_device_memory.h"
 #include "kk_image_layout.h"
 
@@ -54,6 +56,19 @@ struct kk_image {
    bool wsi_opaque_alpha;
 
    bool metal_imported;
+
+   struct {
+      uint8_t *cpu;
+      uint32_t width, height, layers;
+      uint32_t version;
+      void *map;
+      uint32_t map_version, map_width, map_height, map_layers;
+      struct kk_bo *params;
+   } fdm;
+
+   struct kk_bo *rate_params;
+   const void *rate_params_owner;
+   uint32_t rate_params_version;
 
    uint8_t plane_count;
    struct kk_image_plane planes[3];
@@ -141,6 +156,24 @@ mtl_texture *kk_image_plane_create_texture(struct kk_image_plane *plane,
                                            uint64_t offset_B);
 
 void kk_image_set_label(struct kk_image *image, const char *label);
+
+#define KK_RATE_PARAMS_HEADER_B 256
+#define KK_RATE_PARAMS_SIZE_B   (64 * 1024)
+#define KK_RATE_PARAMS_MAX_LAYERS 8
+
+struct kk_rate_params_header {
+   uint32_t valid;
+   uint32_t layers;
+   uint32_t screen[2];
+   uint32_t physical[KK_RATE_PARAMS_MAX_LAYERS][2];
+};
+
+void kk_fdm_capture(struct kk_image *image, const uint8_t *src,
+                    uint32_t row_length, uint32_t image_height,
+                    const VkImageSubresourceLayers *subresource,
+                    VkOffset3D offset, VkExtent3D extent);
+VkResult kk_fdm_image_init(struct kk_device *dev, struct kk_image *image);
+void kk_fdm_image_finish(struct kk_device *dev, struct kk_image *image);
 
 #ifdef VK_USE_PLATFORM_METAL_EXT
 VkResult kk_image_import_metal(struct kk_device *dev, struct kk_image *image,

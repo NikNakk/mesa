@@ -103,6 +103,13 @@ kk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
       info.mtl_data.image = plane->mtl_handle;
       size_t buffer_offset = kk_buffer_mtl_offset(buffer, region->bufferOffset);
 
+      kk_fdm_capture(image,
+                     (const uint8_t *)mtl_get_contents(buffer->metal.handle) +
+                        buffer_offset,
+                     region->bufferRowLength, region->bufferImageHeight,
+                     &region->imageSubresource, region->imageOffset,
+                     region->imageExtent);
+
       kk_foreach_slice(slice, image, imageSubresource)
       {
          info.mtl_data.image_slice = slice;

@@ -62,6 +62,8 @@ struct kk_root_descriptor_table {
    uint8_t set_dynamic_buffer_start[KK_MAX_SETS];
 
    uint64_t custom_resolve_inputs[KK_MAX_RTS + 2];
+
+   uint64_t fdm_rate_params;
 };
 
 struct kk_descriptor_state {
@@ -152,6 +154,11 @@ struct kk_graphics_state {
 
    enum kk_dirty dirty;
    uint32_t pipeline_sample_count;
+
+   struct {
+      struct kk_image *density;
+      bool carry;
+   } fdm;
 
    struct {
       struct kk_image_view *ms_iview;
