@@ -89,6 +89,18 @@ kk_min_cbuf_alignment()
    return 16;
 }
 
+static inline uint32_t
+kk_non_lazy_memory_types(const struct kk_physical_device *pdev)
+{
+   uint32_t types = 0;
+   for (uint32_t i = 0; i < pdev->mem_type_count; i++) {
+      if (!(pdev->mem_types[i].propertyFlags &
+            VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT))
+         types |= BITFIELD_BIT(i);
+   }
+   return types;
+}
+
 VK_DEFINE_HANDLE_CASTS(kk_physical_device, vk.base, VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
