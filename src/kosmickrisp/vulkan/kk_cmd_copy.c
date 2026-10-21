@@ -6,6 +6,7 @@
  */
 
 #include "kk_cmd_buffer.h"
+#include "kk_fdm.h"
 
 #include "kk_bo.h"
 #include "kk_buffer.h"
@@ -127,6 +128,7 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, image, pCopyImageToBufferInfo->srcImage);
    VK_FROM_HANDLE(kk_buffer, buffer, pCopyImageToBufferInfo->dstBuffer);
+   kk_fdm_note_use(&image->vk, "copy to buffer source");
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    for (unsigned r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
@@ -362,6 +364,8 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);
+   kk_fdm_note_use(&src->vk, "copy source");
+   kk_fdm_note_use(&dst->vk, "copy destination");
 
    size_t buffer_size = 0u;
 

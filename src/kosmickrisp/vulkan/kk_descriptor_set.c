@@ -13,6 +13,7 @@
 #include "kk_descriptor_set_layout.h"
 #include "kk_device.h"
 #include "kk_image.h"
+#include "kk_fdm.h"
 #include "kk_entrypoints.h"
 #include "kk_image_view.h"
 #include "kk_physical_device.h"
@@ -93,7 +94,25 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          const struct kk_image *image =
             container_of(view->vk.image, struct kk_image, vk);
          desc[plane].rate_params =
-            image->rate_params ? image->rate_params->gpu : 0;
+            image->rate_params && !is_input_attachment ? image->rate_params->gpu
+                                                       : 0;
+         desc[plane].rate_base_layer = view->vk.base_array_layer;
+         desc[plane].rate_image_size[0] =
+            u_minify(view->vk.image->extent.width, view->vk.base_mip_level);
+         desc[plane].rate_image_size[1] =
+            u_minify(view->vk.image->extent.height, view->vk.base_mip_level);
+         kk_fdm_note_view(&view->vk, is_input_attachment ? "input" : "sampled");
+         if (is_input_attachment)
+            kk_fdm_note_use(&image->vk, "input attachment");
+         else if (descriptor_type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            kk_fdm_note_use(&image->vk, "sampled image, separate sampler");
+         else if (info->sampler == VK_NULL_HANDLE)
+            kk_fdm_note_use(&image->vk, "combined, no sampler in write");
+         else if (vk_sampler_from_handle(info->sampler)->flags &
+                  VK_SAMPLER_CREATE_SUBSAMPLED_BIT_EXT)
+            kk_fdm_note_use(&image->vk, "combined, subsampled sampler");
+         else
+            kk_fdm_note_use(&image->vk, "combined, ordinary sampler");
 
          float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
          desc[plane].image_min_lod_fp16 = _mesa_float_to_half(min_lod);
@@ -181,6 +200,7 @@ get_storage_image_view_desc(
 
       /* Storage images are always single plane */
       assert(view->plane_count == 1);
+      kk_fdm_note_use(view->vk.image, "storage image");
       uint8_t plane = 0;
 
       assert(view->planes[plane].storage_gpu_resource_id);
