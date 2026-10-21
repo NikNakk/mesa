@@ -177,6 +177,8 @@ struct kk_graphics_state {
       uint32_t view_mask;
       bool active;
    } custom_resolve_debug;
+   bool seq_log;
+   bool in_custom_resolve;
 
    struct {
       enum mtl_visibility_result_mode mode;

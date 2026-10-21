@@ -1075,6 +1075,7 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
       if (nir->info.fs.depth_layout == FRAG_DEPTH_LAYOUT_NONE)
          nir->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_ANY;
       shader->info.fs.uses_flat_varyings = fs_uses_flat_varying(nir);
+      shader->info.fs.outputs_written = nir->info.outputs_written;
    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
