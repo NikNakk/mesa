@@ -201,7 +201,8 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
       }
 
       if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) {
          bool requires_type_change =
             view_layout.view_type != VK_IMAGE_VIEW_TYPE_3D &&
             view_layout.view_type != VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -225,13 +226,17 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                view->planes[view_plane].mtl_handle_input);
 
          /* Handle mutable formats */
-         view->planes[view_plane].render_is_view = requires_format_change;
-         if (requires_format_change) {
-            view_layout.view_type = original_type;
-            view->planes[view_plane].mtl_handle_render =
-               mtl_new_texture_view_with_no_swizzle(mtl_handle, &view_layout);
-         } else /* Subresource indices will be set in attachment descriptor */
-            view->planes[view_plane].mtl_handle_render = mtl_retain(mtl_handle);
+         if (view->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+            view->planes[view_plane].render_is_view = requires_format_change;
+            if (requires_format_change) {
+               view_layout.view_type = original_type;
+               view->planes[view_plane].mtl_handle_render =
+                  mtl_new_texture_view_with_no_swizzle(mtl_handle, &view_layout);
+            } else /* Subresource indices will be set in attachment descriptor */
+               view->planes[view_plane].mtl_handle_render =
+                  mtl_retain(mtl_handle);
+         }
       }
    }
 
