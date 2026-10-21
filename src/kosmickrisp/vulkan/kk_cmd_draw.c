@@ -265,6 +265,8 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    memset(render, 0, sizeof(*render));
 
    render->flags = pRenderingInfo->flags;
+   if (render->flags & VK_RENDERING_RESUMING_BIT)
+      cmd->state.gfx.restart_barrier = true;
    render->area = pRenderingInfo->renderArea;
    render->view_mask = pRenderingInfo->viewMask;
    render->layer_count = pRenderingInfo->layerCount;
@@ -817,6 +819,7 @@ kk_CmdBeginCustomResolveEXT(
 
    kk_CmdEndRendering2KHR(commandBuffer, &end_info);
    kk_fdm_carry_to_next_rendering(cmd);
+   cmd->state.gfx.restart_barrier = true;
    kk_CmdBeginRendering(commandBuffer, &rendering_info);
 
    struct kk_descriptor_state *desc = &cmd->state.gfx.descriptors;
@@ -1109,6 +1112,7 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
       cs_end(cmd);
       kk_cmd_buffer_dirty_all_gfx(cmd);
       cmd->state.gfx.need_to_start_render_pass = true;
+      cmd->state.gfx.restart_barrier = true;
    }
 }
 

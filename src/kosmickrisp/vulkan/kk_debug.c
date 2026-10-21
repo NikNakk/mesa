@@ -25,6 +25,7 @@ const struct debug_named_value experimental_flags[] = {
    {"optimize_e5b9g9r9", KK_EXPERIMENTAL_OPTIMIZE_E5B9G9R9},
    {"fdm", KK_EXPERIMENTAL_FDM},
    {"fdm_rate", KK_EXPERIMENTAL_FDM_RATE},
+   {"light_barriers", KK_EXPERIMENTAL_LIGHT_BARRIERS},
    {NULL, 0},
 };
 
