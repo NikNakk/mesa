@@ -18,6 +18,9 @@
 
 #include "vk_format.h"
 
+#include "util/log.h"
+#include "util/u_debug.h"
+
 static enum pipe_swizzle
 vk_swizzle_to_pipe(VkComponentSwizzle swizzle)
 {
@@ -238,6 +241,23 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
                   mtl_retain(mtl_handle);
          }
       }
+   }
+
+   if (image->vk.samples > 1 &&
+       !strcmp(debug_get_option("KK_CUSTOM_RESOLVE_DEBUG", ""), "log")) {
+      static uint32_t logged;
+      if (logged++ < 64)
+         mesa_logi("kk-cr-view: view=%p image=%p type=%d fmt=%d image_fmt=%d "
+                   "layers=%u+%u/%u aspects=0x%x usage=0x%x samples=%u "
+                   "sampled=%llx input=%llx render=%p",
+                   (void *)view, (void *)image, view->vk.view_type,
+                   view->vk.format, image->vk.format,
+                   view->vk.base_array_layer, view->vk.layer_count,
+                   image->vk.array_layers, view->vk.aspects,
+                   (unsigned)view->vk.usage, image->vk.samples,
+                   (unsigned long long)view->planes[0].sampled_gpu_resource_id,
+                   (unsigned long long)view->planes[0].input_gpu_resource_id,
+                   view->planes[0].mtl_handle_render);
    }
 
    return VK_SUCCESS;
