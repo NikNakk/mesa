@@ -73,7 +73,11 @@ end_recording(struct kk_cmd_buffer *cmd)
 
    cs_end(cmd);
    mtl_end_command_buffer(cmd->metal.cmd_buf);
-   kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
+   if (cmd->state.gfx.stitch.starts_resumed ||
+       cmd->state.gfx.stitch.ends_suspended)
+      cmd->metal.held_allocator = cmd->metal.allocator;
+   else
+      kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd), cmd->metal.allocator);
    cmd->metal.allocator = NULL;
 }
 
@@ -89,6 +93,9 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    /* Ensure closed command buffer for safe returns to pool */
    end_recording(cmd);
+   if (cmd->metal.held_allocator)
+      kk_cmd_pool_return_allocator(pool, cmd->metal.held_allocator);
+   cmd->metal.held_allocator = NULL;
    if (cmd->metal.cmd_buf)
       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
@@ -172,6 +179,10 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
 
    /* Ensure closed command buffer so we can start it again */
    end_recording(cmd);
+   if (cmd->metal.held_allocator)
+      kk_cmd_pool_return_allocator(kk_cmd_buffer_pool(cmd),
+                                   cmd->metal.held_allocator);
+   cmd->metal.held_allocator = NULL;
    kk_cmd_release_resources(dev, cmd);
 
    cmd->uploader.bo = NULL;
@@ -272,7 +283,6 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
       mtl_encoder_push_debug_group(encoder, label->pLabelName);
 }
 
-static void kk_encoder_stat(const char *what, bool broke_render);
 
 static void
 kk_stitch_violation(struct kk_cmd_buffer *cmd, const char *why)
@@ -357,15 +367,16 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    cs_end(cmd);
 
    uint32_t options = 0;
-   if (KK_EXPERIMENTAL(STITCH_PASSES)) {
+   if (state->render.stitch) {
       if ((state->render.flags & VK_RENDERING_RESUMING_BIT) &&
           state->render.encoders == 0 && !state->in_custom_resolve)
          options |= MTL_RENDER_ENCODER_RESUMING;
       if ((state->render.flags & VK_RENDERING_SUSPENDING_BIT) &&
           !state->in_custom_resolve)
          options |= MTL_RENDER_ENCODER_SUSPENDING;
-      kk_stitch_note_encoder(cmd, options);
    }
+   if (KK_EXPERIMENTAL(STITCH_PASSES))
+      kk_stitch_note_encoder(cmd, options);
    state->render.encoders++;
    state->render.suspending_encoder = options & MTL_RENDER_ENCODER_SUSPENDING;
    state->render.resuming_encoder = options & MTL_RENDER_ENCODER_RESUMING;
@@ -437,7 +448,7 @@ cs_get_render(struct kk_cmd_buffer *cmd)
    return cmd->metal.render;
 }
 
-static void
+void
 kk_encoder_stat(const char *what, bool broke_render)
 {
    static int enabled = -1;

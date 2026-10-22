@@ -94,6 +94,16 @@ kk_cmd_pool_get_allocator(struct kk_cmd_pool *pool)
                                mtl_command_allocator *);
 
    struct kk_device *dev = kk_cmd_pool_device(pool);
+   mtl_command_allocator *allocator = NULL;
+   simple_mtx_lock(&dev->stitch_allocators.mutex);
+   if (util_dynarray_num_elements(&dev->stitch_allocators.free,
+                                  mtl_command_allocator *) > 0u)
+      allocator = util_dynarray_pop(&dev->stitch_allocators.free,
+                                    mtl_command_allocator *);
+   simple_mtx_unlock(&dev->stitch_allocators.mutex);
+   if (allocator)
+      return allocator;
+
    return mtl_new_command_allocator(dev->mtl_handle);
 }
 
