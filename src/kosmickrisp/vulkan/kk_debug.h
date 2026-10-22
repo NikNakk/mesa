@@ -33,6 +33,7 @@ enum kk_experimental {
    KK_EXPERIMENTAL_STITCH_PASSES = 1ull << 7,
    KK_EXPERIMENTAL_MS_INPUT_FETCH = 1ull << 8,
    KK_EXPERIMENTAL_DS_RESOLVE = 1ull << 9,
+   KK_EXPERIMENTAL_ASYNC_PIPELINES = 1ull << 10,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

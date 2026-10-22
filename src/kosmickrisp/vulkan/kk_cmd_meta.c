@@ -94,6 +94,7 @@ static void
 kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
               VkPipelineBindPoint bind_point, const char *debug_label)
 {
+   kk_shader_set_sync_compiles(true);
    struct kk_descriptor_state *desc = kk_get_descriptors_state(cmd, bind_point);
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
@@ -142,7 +143,7 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
 }
 
 static void
-kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+kk_meta_end_impl(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
             VkPipelineBindPoint bind_point)
 {
    struct kk_descriptor_state *desc = kk_get_descriptors_state(cmd, bind_point);
@@ -199,6 +200,14 @@ kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
    cmd->state.cond_render = save->cond_render;
 
    memcpy(desc->root.push, save->push, sizeof(save->push));
+}
+
+static void
+kk_meta_end(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
+            VkPipelineBindPoint bind_point)
+{
+   kk_meta_end_impl(cmd, save, bind_point);
+   kk_shader_set_sync_compiles(false);
 }
 
 VKAPI_ATTR void VKAPI_CALL

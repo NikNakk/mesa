@@ -6,6 +6,8 @@
  */
 
 #include "kk_device.h"
+#include "kk_debug.h"
+#include "util/u_cpu_detect.h"
 
 #include "kk_buffer.h"
 #include "kk_buffer_view.h"
@@ -316,7 +318,16 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
       dev->has_queue = true;
    }
 
+   if (KK_EXPERIMENTAL(ASYNC_PIPELINES)) {
+      unsigned threads = CLAMP(util_get_cpu_caps()->nr_cpus - 2, 2, 8);
+      dev->has_pipeline_queue =
+         util_queue_init(&dev->pipeline_queue, "kkpso", 256, threads,
+                         UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL);
+   }
+
+   kk_shader_set_sync_compiles(true);
    result = kk_device_init_meta(dev);
+   kk_shader_set_sync_compiles(false);
    if (result != VK_SUCCESS)
       goto fail_mem_cache;
 
@@ -377,6 +388,12 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
     * may run into issues. */
    if (dev->gpu_capture_active) {
       mtl_stop_gpu_capture();
+   }
+
+   if (dev->has_pipeline_queue) {
+      util_queue_finish(&dev->pipeline_queue);
+      util_queue_destroy(&dev->pipeline_queue);
+      dev->has_pipeline_queue = false;
    }
 
    /* Meta first since it may destroy Vulkan objects */
