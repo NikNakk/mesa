@@ -154,6 +154,25 @@ mtl_render_pipeline_descriptor_set_color_attachment_format(mtl_render_pipeline_d
 }
 
 void
+mtl_render_pipeline_descriptor_set_color_attachment_write_mask(mtl_render_pipeline_descriptor *descriptor,
+                                                               uint8_t index, uint32_t mask)
+{
+   @autoreleasepool {
+      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+      MTLColorWriteMask m = MTLColorWriteMaskNone;
+      if (mask & 1)
+         m |= MTLColorWriteMaskRed;
+      if (mask & 2)
+         m |= MTLColorWriteMaskGreen;
+      if (mask & 4)
+         m |= MTLColorWriteMaskBlue;
+      if (mask & 8)
+         m |= MTLColorWriteMaskAlpha;
+      desc.colorAttachments[index].writeMask = m;
+   }
+}
+
+void
 mtl_render_pipeline_descriptor_set_raster_sample_count(mtl_render_pipeline_descriptor *descriptor,
                                                        uint32_t sample_count)
 {

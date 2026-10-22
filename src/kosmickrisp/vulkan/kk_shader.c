@@ -133,6 +133,8 @@ struct kk_fs_key {
    uint8_t stencil_input_att;
    bool custom_resolve;
    bool fdm_frag_coord;
+   bool ms_input_fetch;
+   bool tile_resolve;
    uint8_t input_color_count;
    uint8_t input_color_map[MESA_VK_MAX_COLOR_ATTACHMENTS];
 };
@@ -175,6 +177,8 @@ kk_populate_fs_key(struct kk_fs_key *key,
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP);
 
    key->custom_resolve = state->rp->custom_resolve;
+   key->ms_input_fetch = KK_EXPERIMENTAL(MS_INPUT_FETCH);
+   key->tile_resolve = KK_EXPERIMENTAL(TILE_RESOLVE);
    key->fdm_frag_coord =
       KK_EXPERIMENTAL(FDM_RATE) &&
       (state->pipeline_flags &
@@ -866,7 +870,10 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
       if (kk_fs_needs_forced_depth_write(nir, state))
          NIR_PASS(_, nir, msl_ensure_depth_write);
 
-      msl_nir_lower_input_attachments(nir, state->ial, state->cal);
+      msl_nir_lower_input_attachments(
+         nir, state->ial, state->cal,
+         KK_EXPERIMENTAL(MS_INPUT_FETCH) &&
+            !(state->rp && state->rp->custom_resolve));
    }
 
    const struct lower_ycbcr_state ycbcr_state = {
@@ -1008,6 +1015,11 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
             mtl_release(pipe->gfx.tile[i]);
          pipe->gfx.tile[i] = NULL;
       }
+      for (uint32_t i = 0; i < ARRAY_SIZE(pipe->gfx.masked); i++) {
+         if (pipe->gfx.masked[i].render)
+            mtl_release(pipe->gfx.masked[i].render);
+         pipe->gfx.masked[i].render = NULL;
+      }
 
       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i)
          mtl_release(pipe->gfx.pre_render[i]);
@@ -1058,6 +1070,31 @@ fs_uses_flat_varying(nir_shader *nir)
    return false;
 }
 
+static bool
+kk_fs_reads_ms_texture(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (tex->sampler_dim == GLSL_SAMPLER_DIM_MS ||
+                   tex->sampler_dim == GLSL_SAMPLER_DIM_SUBPASS_MS ||
+                   tex->op == nir_texop_txf_ms)
+                  return true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (nir_intrinsic_has_image_dim(intr) &&
+                   (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_MS ||
+                    nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_SUBPASS_MS))
+                  return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 static void
 gather_shader_info(struct kk_shader *shader, nir_shader *nir,
                    const struct vk_graphics_pipeline_state *state)
@@ -1076,6 +1113,7 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
          nir->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_ANY;
       shader->info.fs.uses_flat_varyings = fs_uses_flat_varying(nir);
       shader->info.fs.outputs_written = nir->info.outputs_written;
+      shader->info.fs.reads_ms_texture = kk_fs_reads_ms_texture(nir);
    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
@@ -1659,6 +1697,9 @@ gather_graphics_pipeline_create_info(
       info->vs.view_mask = state->mv->view_mask;
    }
 
+   info->vs.dynamic_write_masks =
+      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
+      BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES);
    info->vs.has_ds = has_static_depth_stencil_state(state);
    if (info->vs.has_ds)
       kk_gather_ds_info(state->ds, has_depth, has_stencil, info);
@@ -1754,6 +1795,114 @@ kk_shader_get_tile_pipeline(struct kk_device *device, struct kk_shader *vs,
    return pipeline;
 }
 
+/* Builds the Metal render pipeline of a vertex shader object. masks holds 4
+ * Vulkan colour write mask bits per logical colour attachment; UINT32_MAX
+ * leaves Metal's default of writing every channel. */
+static mtl_render_pipeline_state *
+kk_build_render_pipeline(struct kk_device *device, struct kk_shader *vs,
+                         mesa_shader_stage vs_stage, uint32_t masks)
+{
+   struct kk_physical_device *pdev = kk_device_physical(device);
+   mtl_render_pipeline_state *render = NULL;
+
+   const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+   mtl_library *vertex_library = mtl_new_library(
+      device->mtl_compiler_handle, vs_data->code, pdev->info.msl_version,
+      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   if (vertex_library == NULL)
+      return NULL;
+
+   mtl_function_descriptor *vertex_function =
+      mtl_new_library_function_descriptor(vertex_library,
+                                          vs_data->entrypoint_name);
+
+   const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
+   mtl_library *fragment_library = mtl_new_library(
+      device->mtl_compiler_handle, fs_data->code, pdev->info.msl_version,
+      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   if (fragment_library == NULL)
+      goto destroy_vertex;
+   mtl_function_descriptor *fragment_function =
+      mtl_new_library_function_descriptor(fragment_library,
+                                          fs_data->entrypoint_name);
+
+   mtl_render_pipeline_descriptor *pipeline_descriptor =
+      mtl_new_render_pipeline_descriptor();
+   mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
+                                                    vertex_function);
+   mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,
+                                                      fragment_function);
+
+   /* Layered rendering in Metal requires setting primitive topology class */
+   mtl_render_pipeline_descriptor_set_input_primitive_topology(
+      pipeline_descriptor, vs->info.vs.topology);
+
+   /* If color attachments are reordered there might be unused / invalid gaps
+    * in the array so need to check them all, not just first
+    * color_attachment_count entries.
+    */
+   for (uint8_t i = 0; i < MAX_DRAW_BUFFERS; ++i) {
+      if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID) {
+         mtl_render_pipeline_descriptor_set_color_attachment_format(
+            pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+         if (masks != UINT32_MAX)
+            mtl_render_pipeline_descriptor_set_color_attachment_write_mask(
+               pipeline_descriptor, i, (masks >> (4 * i)) & 0xf);
+      }
+   }
+
+   if (vs->info.vs.view_mask) {
+      uint32_t max_amplification = util_bitcount(vs->info.vs.view_mask);
+      mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
+         pipeline_descriptor, max_amplification);
+   }
+
+   if (vs->info.vs.has_ms) {
+      mtl_render_pipeline_descriptor_set_raster_sample_count(
+         pipeline_descriptor, vs->info.vs.sample_count);
+   }
+
+   render =
+      mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
+
+   mtl_release(pipeline_descriptor);
+   mtl_release(fragment_function);
+   mtl_release(fragment_library);
+destroy_vertex:
+   mtl_release(vertex_function);
+   mtl_release(vertex_library);
+   return render;
+}
+
+mtl_render_pipeline_state *
+kk_shader_get_masked_pipeline(struct kk_device *device, struct kk_shader *vs,
+                              uint32_t masks)
+{
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+   mtl_render_pipeline_state *pipeline = NULL;
+
+   simple_mtx_lock(&lock);
+   uint32_t free_slot = ARRAY_SIZE(vs->pipeline.gfx.masked);
+   for (uint32_t i = 0; i < ARRAY_SIZE(vs->pipeline.gfx.masked); i++) {
+      if (vs->pipeline.gfx.masked[i].render == NULL) {
+         free_slot = MIN2(free_slot, i);
+      } else if (vs->pipeline.gfx.masked[i].masks == masks) {
+         pipeline = vs->pipeline.gfx.masked[i].render;
+         break;
+      }
+   }
+   if (pipeline == NULL && free_slot < ARRAY_SIZE(vs->pipeline.gfx.masked)) {
+      pipeline = kk_build_render_pipeline(device, vs,
+                                          vs->pipeline.gfx.render_stage, masks);
+      if (pipeline) {
+         vs->pipeline.gfx.masked[free_slot].masks = masks;
+         vs->pipeline.gfx.masked[free_slot].render = pipeline;
+      }
+   }
+   simple_mtx_unlock(&lock);
+   return pipeline;
+}
+
 static VkResult
 kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
 {
@@ -1781,77 +1930,12 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
       vs_stage = u_bit_scan(&stages_bits);
    }
 
-   const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
-   mtl_library *vertex_library = mtl_new_library(
-      device->mtl_compiler_handle, vs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
-   if (vertex_library == NULL)
-      return VK_ERROR_INVALID_SHADER_NV;
-
-   mtl_function_descriptor *vertex_function =
-      mtl_new_library_function_descriptor(vertex_library,
-                                          vs_data->entrypoint_name);
-
-   const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
-   mtl_library *fragment_library = mtl_new_library(
-      device->mtl_compiler_handle, fs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
-   if (fragment_library == NULL) {
-      result = VK_ERROR_INVALID_SHADER_NV;
-      goto destroy_vertex;
-   }
-   mtl_function_descriptor *fragment_function =
-      mtl_new_library_function_descriptor(fragment_library,
-                                          fs_data->entrypoint_name);
-
-   mtl_render_pipeline_descriptor *pipeline_descriptor =
-      mtl_new_render_pipeline_descriptor();
-   mtl_render_pipeline_descriptor_set_vertex_shader(pipeline_descriptor,
-                                                    vertex_function);
-   mtl_render_pipeline_descriptor_set_fragment_shader(pipeline_descriptor,
-                                                      fragment_function);
-
-   /* Layered rendering in Metal requires setting primitive topology class */
-   mtl_render_pipeline_descriptor_set_input_primitive_topology(
-      pipeline_descriptor, vs->info.vs.topology);
-
-   /* If color attachments are reordered there might be unused / invalid gaps
-    * in the array so need to check them all, not just first
-    * color_attachment_count entries.
-    */
-   for (uint8_t i = 0; i < MAX_DRAW_BUFFERS; ++i) {
-      if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID)
-         mtl_render_pipeline_descriptor_set_color_attachment_format(
-            pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
-   }
-
-   if (vs->info.vs.has_ds) {
+   pipe->gfx.render_stage = vs_stage;
+   if (vs->info.vs.has_ds)
       pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
-   }
-
-   if (vs->info.vs.view_mask) {
-      uint32_t max_amplification = util_bitcount(vs->info.vs.view_mask);
-      mtl_render_pipeline_descriptor_set_max_vertex_amplification_count(
-         pipeline_descriptor, max_amplification);
-   }
-
-   if (vs->info.vs.has_ms) {
-      mtl_render_pipeline_descriptor_set_raster_sample_count(
-         pipeline_descriptor, vs->info.vs.sample_count);
-   }
-
-   pipe->gfx.render =
-      mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
+   pipe->gfx.render = kk_build_render_pipeline(device, vs, vs_stage, UINT32_MAX);
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
-
-
-   mtl_release(pipeline_descriptor);
-   mtl_release(fragment_function);
-   mtl_release(fragment_library);
-destroy_vertex:
-   mtl_release(vertex_function);
-   mtl_release(vertex_library);
 
    return result;
 }

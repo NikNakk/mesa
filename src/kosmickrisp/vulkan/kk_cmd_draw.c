@@ -32,6 +32,12 @@
 
 #include "util/log.h"
 #include "util/u_debug.h"
+#include "util/os_time.h"
+#include "util/format/u_format.h"
+#include "c11/threads.h"
+#include "kk_bo.h"
+#include "kk_image.h"
+#include "kosmickrisp/libkk/kk_query.h"
 
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
@@ -639,6 +645,106 @@ kk_custom_resolve_debug_log(const struct kk_rendering_state *render)
              render->force_attachment_store);
 }
 
+struct kk_dump {
+   struct kk_bo *bo;
+   char path[512];
+   uint32_t width, height, layers, bytes_per_pixel, format;
+};
+
+static int
+kk_dump_thread(void *data)
+{
+   struct kk_dump *dump = data;
+   uint64_t size = (uint64_t)dump->width * dump->height * dump->bytes_per_pixel *
+                   dump->layers;
+   volatile uint32_t *marker = (uint32_t *)((char *)dump->bo->cpu + size);
+   for (int i = 0; i < 3000 && *marker != 1; i++)
+      os_time_sleep(10000);
+   if (*marker != 1) {
+      mesa_logw("kk-dump: %s never completed", dump->path);
+      free(dump);
+      return 0;
+   }
+   FILE *f = fopen(dump->path, "wb");
+   if (f) {
+      fprintf(f, "KKDUMP %u %u %u %u %u\n", dump->width, dump->height,
+              dump->layers, dump->bytes_per_pixel, dump->format);
+      fwrite(dump->bo->cpu, 1, size, f);
+      fclose(f);
+      mesa_logi("kk-dump: wrote %s", dump->path);
+   }
+   free(dump);
+   return 0;
+}
+
+static void
+kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
+{
+   static const char *dir;
+   static int64_t first = -1, step, count;
+   static uint32_t seen;
+   if (first < 0) {
+      dir = debug_get_option("KK_DUMP_RESOLVE_DIR", NULL);
+      first = debug_get_num_option("KK_DUMP_RESOLVE_FIRST", 600);
+      step = MAX2(debug_get_num_option("KK_DUMP_RESOLVE_STEP", 600), 1);
+      count = debug_get_num_option("KK_DUMP_RESOLVE_COUNT", 4);
+   }
+   const struct kk_image_view *view = cmd->state.gfx.dump.view;
+   cmd->state.gfx.dump.view = NULL;
+   if (!dir || !view)
+      return;
+
+   uint32_t index = p_atomic_inc_return(&seen) - 1;
+   if (index < first || (index - first) % step || (index - first) / step >= count)
+      return;
+
+   struct kk_image *image = container_of(view->vk.image, struct kk_image, vk);
+   const struct kk_image_plane *plane = &image->planes[0];
+   VkRect2D area = cmd->state.gfx.dump.area;
+   uint32_t width = area.extent.width, height = area.extent.height;
+   uint32_t bpp = util_format_get_blocksize(plane->layout.format.pipe);
+   uint32_t layers = view->vk.layer_count;
+   uint64_t size = (uint64_t)width * height * bpp * layers;
+
+   struct kk_dump *dump = calloc(1, sizeof(*dump));
+   if (!dump)
+      return;
+   if (kk_alloc_bo(kk_cmd_buffer_device(cmd), &cmd->vk.base, size + 4, 16,
+                   &dump->bo) != VK_SUCCESS) {
+      free(dump);
+      return;
+   }
+   memset((char *)dump->bo->cpu + size, 0, 4);
+   snprintf(dump->path, sizeof(dump->path), "%s/resolve-%05u.kkdump", dir, index);
+   dump->width = width;
+   dump->height = height;
+   dump->layers = layers;
+   dump->bytes_per_pixel = bpp;
+   dump->format = view->vk.format;
+
+   mtl_compute_encoder *enc = cs_get_compute(cmd);
+   for (uint32_t l = 0; l < layers; l++) {
+      struct mtl_buffer_image_copy copy = {
+         .image_size = {.x = width, .y = height, .z = 1},
+         .image_origin = {.x = area.offset.x, .y = area.offset.y, .z = 0},
+         .buffer = dump->bo->map,
+         .image = plane->mtl_handle,
+         .buffer_offset_B = (size_t)width * height * bpp * l,
+         .buffer_stride_B = (size_t)width * bpp,
+         .buffer_2d_image_size_B = (size_t)width * height * bpp,
+         .image_slice = view->vk.base_array_layer + l,
+         .image_level = view->vk.base_mip_level,
+      };
+      mtl_copy_from_texture_to_buffer(enc, &copy);
+   }
+   mtl_barrier_after_encoder_stages(enc, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
+   libkk_write_u32(cmd, kk_grid_1d(1), true, dump->bo->gpu + size, 1);
+
+   thrd_t thread;
+   if (thrd_create(&thread, kk_dump_thread, dump) == thrd_success)
+      thrd_detach(thread);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
                        UNUSED const VkRenderingEndInfoKHR *pRenderingEndInfo)
@@ -758,6 +864,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       need_meta_resolve = false;
 
    memset(render, 0, sizeof(*render));
+   kk_dump_custom_resolve(cmd);
 
    if (need_meta_resolve) {
       kk_meta_resolve_rendering(cmd, &vk_render);
@@ -935,6 +1042,13 @@ kk_CmdBeginCustomResolveEXT(
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
+   gfx->dump.view = gfx->render.color_att_count &&
+                          gfx->render.color_att[0].resolve_mode ==
+                             VK_RESOLVE_MODE_CUSTOM_BIT_EXT
+                       ? gfx->render.color_att[0].resolve_iview
+                       : NULL;
+   gfx->dump.area = gfx->render.area;
+
    if (!kk_tile_resolve_can_start(cmd)) {
       gfx->tile_resolve.possible = false;
       kk_begin_custom_resolve_legacy(cmd);
@@ -963,7 +1077,14 @@ kk_draw_prologue(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
-   if (gfx->tile_resolve.pending_split && !gfx->tile_resolve.active) {
+   const struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   bool fetch_only = KK_EXPERIMENTAL(MS_INPUT_FETCH) &&
+                     (!fs || !fs->info.fs.reads_ms_texture);
+   if (gfx->tile_resolve.pending_split && !gfx->tile_resolve.active &&
+       fetch_only)
+      kk_seq_log(cmd, "deferred barrier kept, draw reads no multisampled texture");
+   if (gfx->tile_resolve.pending_split && !gfx->tile_resolve.active &&
+       !fetch_only) {
       gfx->tile_resolve.pending_split = false;
       if (cmd->metal.render) {
          kk_seq_log(cmd, "deferred barrier split");
@@ -1301,9 +1422,34 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
       mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
 
-   if (IS_SHADER_DIRTY(VERTEX)) {
-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+   struct kk_shader *pipeline_vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   bool masks_dirty = pipeline_vs && pipeline_vs->info.vs.dynamic_write_masks &&
+                      (IS_DIRTY(CB_WRITE_MASKS) | IS_DIRTY(CB_COLOR_WRITE_ENABLES));
+   if (IS_SHADER_DIRTY(VERTEX) || masks_dirty) {
+      struct kk_shader *vs = pipeline_vs;
+      mtl_render_pipeline_state *pipeline = vs->pipeline.gfx.render;
+      if (vs->info.vs.dynamic_write_masks) {
+         uint32_t masks = 0, defaults = 0;
+         const struct kk_rendering_state *render = &gfx->render;
+         for (uint32_t i = 0; i < render->color_att_count && i < MAX_DRAW_BUFFERS; i++) {
+            uint8_t logical = render->color_map[i];
+            if (logical >= MAX_DRAW_BUFFERS ||
+                vs->info.vs.rt_formats[logical] == MTL_PIXEL_FORMAT_INVALID)
+               continue;
+            uint32_t mask = dyn->cb.attachments[i].write_mask & 0xf;
+            if (!(dyn->cb.color_write_enables & BITFIELD_BIT(i)))
+               mask = 0;
+            masks |= mask << (4 * logical);
+            defaults |= 0xfu << (4 * logical);
+         }
+         if (masks != defaults) {
+            mtl_render_pipeline_state *masked =
+               kk_shader_get_masked_pipeline(kk_cmd_buffer_device(cmd), vs, masks);
+            if (masked)
+               pipeline = masked;
+         }
+      }
+      mtl_render_set_pipeline_state(enc, pipeline);
       if (gfx->depth_stencil_state)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
@@ -2402,9 +2548,36 @@ kk_seq_draw(struct kk_cmd_buffer *cmd, const char *what, uint32_t count,
    if (!cmd->state.gfx.seq_log)
       return;
    const struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   const char *msl_dir = debug_get_option("KK_SEQ_MSL_DIR", NULL);
+   const struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (msl_dir && vs && vs->msl_data[MESA_SHADER_FRAGMENT].code) {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/fs-%p.metal", msl_dir, (const void *)fs);
+      FILE *f = fopen(path, "wx");
+      if (f) {
+         fputs(vs->msl_data[MESA_SHADER_FRAGMENT].code, f);
+         fclose(f);
+      }
+   }
    kk_seq_log(cmd, "%s %u x%u fs %p outputs 0x%llx", what, count, instances,
               (const void *)fs,
               fs ? (unsigned long long)fs->info.fs.outputs_written : 0ull);
+   if (count == 4 || count == 3) {
+      const struct vk_dynamic_graphics_state *d = &cmd->vk.dynamic_graphics_state;
+      kk_seq_log(cmd, "  state: cb mask 0x%x blend %d (%d,%d op %d), depth test %d write %d op %d, "
+                      "stencil test %d front fail %d pass %d dfail %d cmp %d cmask 0x%x wmask 0x%x ref %u, "
+                      "samples %u sample shading %d",
+                 d->cb.attachments[0].write_mask, d->cb.attachments[0].blend_enable,
+                 d->cb.attachments[0].src_color_blend_factor,
+                 d->cb.attachments[0].dst_color_blend_factor,
+                 d->cb.attachments[0].color_blend_op, d->ds.depth.test_enable,
+                 d->ds.depth.write_enable, d->ds.depth.compare_op,
+                 d->ds.stencil.test_enable, d->ds.stencil.front.op.fail,
+                 d->ds.stencil.front.op.pass, d->ds.stencil.front.op.depth_fail,
+                 d->ds.stencil.front.op.compare, d->ds.stencil.front.compare_mask,
+                 d->ds.stencil.front.write_mask, d->ds.stencil.front.reference,
+                 d->ms.rasterization_samples, 0);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

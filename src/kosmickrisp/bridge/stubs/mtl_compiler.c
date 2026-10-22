@@ -75,6 +75,12 @@ mtl_render_pipeline_descriptor_set_color_attachment_format(
 }
 
 void
+mtl_render_pipeline_descriptor_set_color_attachment_write_mask(
+   mtl_render_pipeline_descriptor *descriptor, uint8_t index, uint32_t mask)
+{
+}
+
+void
 mtl_render_pipeline_descriptor_set_raster_sample_count(
    mtl_render_pipeline_descriptor *descriptor, uint32_t sample_count)
 {
