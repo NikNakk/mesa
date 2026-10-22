@@ -169,6 +169,8 @@ struct kk_device;
 mtl_render_pipeline_state *kk_shader_get_tile_pipeline(struct kk_device *device,
                                                        struct kk_shader *vs,
                                                        uint32_t samples);
+void kk_compile_log(const char *what, int64_t start_ns);
+
 mtl_render_pipeline_state *
 kk_shader_get_masked_pipeline(struct kk_device *device, struct kk_shader *vs,
                               uint32_t masks);

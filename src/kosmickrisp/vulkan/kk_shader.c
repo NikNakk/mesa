@@ -20,6 +20,8 @@
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_tile.h"
 #include "util/simple_mtx.h"
+#include "util/os_time.h"
+#include <pthread.h>
 #include "kosmickrisp/bridge/ns_process_info.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 #include "kosmickrisp/compiler/nir_to_msl.h"
@@ -1601,6 +1603,61 @@ get_empty_nir(struct kk_device *dev, mesa_shader_stage stage,
    return nir;
 }
 
+/* KK_COMPILE_LOG: log compile steps over 5 ms with their thread, and a
+ * per-second total of compile time per kind. */
+static bool
+kk_compile_log_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("KK_COMPILE_LOG", false);
+   return enabled;
+}
+
+void
+kk_compile_log(const char *what, int64_t start_ns)
+{
+   if (!kk_compile_log_enabled())
+      return;
+   int64_t now = os_time_get_nano();
+   int64_t ns = now - start_ns;
+   uint64_t tid = 0;
+   pthread_threadid_np(NULL, &tid);
+   if (ns > 5000000)
+      mesa_logi("kk-compile: %s %.1f ms on thread %llu", what, ns / 1e6,
+                (unsigned long long)tid);
+
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+   static struct {
+      const char *what;
+      int64_t ns;
+      uint32_t count;
+   } totals[16];
+   static int64_t window_start;
+   simple_mtx_lock(&lock);
+   uint32_t i;
+   for (i = 0; i < ARRAY_SIZE(totals) && totals[i].what && totals[i].what != what; i++)
+      ;
+   if (i < ARRAY_SIZE(totals)) {
+      totals[i].what = what;
+      totals[i].ns += ns;
+      totals[i].count++;
+   }
+   if (window_start == 0)
+      window_start = now;
+   if (now - window_start >= 1000000000ll) {
+      for (i = 0; i < ARRAY_SIZE(totals) && totals[i].what; i++) {
+         if (totals[i].count)
+            mesa_logi("kk-compile-second: %s %u calls %.1f ms", totals[i].what,
+                      totals[i].count, totals[i].ns / 1e6);
+         totals[i].ns = 0;
+         totals[i].count = 0;
+      }
+      window_start = now;
+   }
+   simple_mtx_unlock(&lock);
+}
+
 static VkResult
 kk_compile_compute_pipeline(struct kk_device *device,
                             const struct msl_compile_data *data,
@@ -1873,9 +1930,11 @@ kk_shader_get_tile_pipeline(struct kk_device *device, struct kk_shader *vs,
          mtl_function_descriptor *function =
             mtl_new_library_function_descriptor(library,
                                                 vs->tile_msl.entrypoint_name);
+         int64_t start_ns = os_time_get_nano();
          pipeline = mtl_new_tile_render_pipeline(
             device->mtl_compiler_handle, function, samples,
             vs->info.vs.rt_formats, MAX_DRAW_BUFFERS);
+         kk_compile_log("metal tile pipeline at draw", start_ns);
          mtl_release(function);
          mtl_release(library);
       }
@@ -1982,8 +2041,10 @@ kk_shader_get_masked_pipeline(struct kk_device *device, struct kk_shader *vs,
       }
    }
    if (pipeline == NULL && free_slot < ARRAY_SIZE(vs->pipeline.gfx.masked)) {
+      int64_t start_ns = os_time_get_nano();
       pipeline = kk_build_render_pipeline(device, vs,
                                           vs->pipeline.gfx.render_stage, masks);
+      kk_compile_log("metal write-mask variant at draw", start_ns);
       if (pipeline) {
          vs->pipeline.gfx.masked[free_slot].masks = masks;
          vs->pipeline.gfx.masked[free_slot].render = pipeline;
@@ -2035,7 +2096,9 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    pipe->gfx.render_stage = vs_stage;
    if (vs->info.vs.has_ds)
       pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
+   int64_t start_ns = os_time_get_nano();
    pipe->gfx.render = kk_build_render_pipeline(device, vs, vs_stage, UINT32_MAX);
+   kk_compile_log("metal render pipeline", start_ns);
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
 
@@ -2102,7 +2165,7 @@ kk_forward_gs_primitive_id(nir_shader *gs, nir_shader *fs)
 }
 
 static VkResult
-kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+kk_compile_shaders_impl(struct vk_device *device, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
                    const struct vk_graphics_pipeline_state *state,
                    const struct vk_features *enabled_features,
@@ -2296,7 +2359,7 @@ kk_msl_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
 }
 
 static VkResult
-kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+kk_deserialize_shader_impl(struct vk_device *vk_dev, struct blob_reader *blob,
                       uint32_t binary_version,
                       const VkAllocationCallbacks *pAllocator,
                       struct vk_shader **shader_out)
@@ -2462,6 +2525,35 @@ static const struct vk_shader_ops kk_shader_ops = {
    .get_executable_internal_representations =
       kk_shader_get_executable_internal_representations,
 };
+
+static VkResult
+kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+                   struct vk_shader_compile_info *infos,
+                   const struct vk_graphics_pipeline_state *state,
+                   const struct vk_features *enabled_features,
+                   const VkAllocationCallbacks *pAllocator,
+                   struct vk_shader **shaders_out)
+{
+   int64_t start_ns = os_time_get_nano();
+   VkResult result = kk_compile_shaders_impl(device, shader_count, infos, state,
+                                             enabled_features, pAllocator,
+                                             shaders_out);
+   kk_compile_log("compile shaders", start_ns);
+   return result;
+}
+
+static VkResult
+kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+                      uint32_t binary_version,
+                      const VkAllocationCallbacks *pAllocator,
+                      struct vk_shader **shader_out)
+{
+   int64_t start_ns = os_time_get_nano();
+   VkResult result = kk_deserialize_shader_impl(vk_dev, blob, binary_version,
+                                                pAllocator, shader_out);
+   kk_compile_log("load shader from cache", start_ns);
+   return result;
+}
 
 const struct vk_device_shader_ops kk_device_shader_ops = {
    .get_nir_options = kk_get_nir_options,
