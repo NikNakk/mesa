@@ -6,6 +6,7 @@
  */
 
 #include "kk_queue.h"
+#include <pthread.h>
 #include "kk_fdm.h"
 #include "kk_debug.h"
 #include "util/log.h"
@@ -580,6 +581,21 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * Otherwise, users are playing with fire. */
    kk_device_make_resources_resident(dev);
    kk_fdm_latch_gaze();
+   if (debug_get_bool_option("KK_COMPILE_LOG", false)) {
+      static uint64_t seen[4];
+      uint64_t tid = 0;
+      pthread_threadid_np(NULL, &tid);
+      for (uint32_t i = 0; i < ARRAY_SIZE(seen); i++) {
+         if (seen[i] == tid)
+            break;
+         if (seen[i] == 0) {
+            seen[i] = tid;
+            mesa_logi("kk-compile: queue submissions from thread %llu",
+                      (unsigned long long)tid);
+            break;
+         }
+      }
+   }
 
    if (KK_EXPERIMENTAL(STITCH_PASSES)) {
       VkResult result = kk_queue_submit_stitched(queue, submit);
