@@ -6,6 +6,7 @@
  */
 
 #include "kk_queue.h"
+#include "kk_fdm.h"
 #include "kk_debug.h"
 #include "util/log.h"
 #include "kk_buffer.h"
@@ -376,7 +377,11 @@ kk_chain_can_stitch(struct kk_cmd_buffer **chain, uint32_t count)
    for (uint32_t i = 0; i < count; i++) {
       const struct kk_cmd_buffer *cmd = chain[i];
       bool first = i == 0, last = i == count - 1;
-      if (cmd->state.gfx.stitch.violation || cmd->drawable)
+      if (cmd->state.gfx.stitch.violation || cmd->drawable ||
+          cmd->state.gfx.stitch.fdm_mixed)
+         return false;
+      if (cmd->state.gfx.stitch.fdm_serial &&
+          cmd->state.gfx.stitch.fdm_serial != chain[0]->state.gfx.stitch.fdm_serial)
          return false;
       if (cmd->state.gfx.stitch.starts_resumed == first)
          return false;
@@ -574,6 +579,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * work. All resources should have been allocated before submission.
     * Otherwise, users are playing with fire. */
    kk_device_make_resources_resident(dev);
+   kk_fdm_latch_gaze();
 
    if (KK_EXPERIMENTAL(STITCH_PASSES)) {
       VkResult result = kk_queue_submit_stitched(queue, submit);

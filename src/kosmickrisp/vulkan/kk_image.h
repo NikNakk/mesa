@@ -63,6 +63,8 @@ struct kk_image {
       uint32_t version;
       void *map;
       uint32_t map_version, map_width, map_height, map_layers;
+      int16_t map_shift[8][2];
+      uint64_t serial;
       struct kk_bo *params;
       struct kk_bo **old_params;
       uint32_t old_params_count;
@@ -70,6 +72,7 @@ struct kk_image {
 
    struct kk_bo *rate_params;
    const void *rate_params_owner;
+   uint64_t rate_params_serial;
    uint32_t rate_params_version;
 
    uint8_t plane_count;
