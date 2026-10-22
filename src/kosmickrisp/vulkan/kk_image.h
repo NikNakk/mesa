@@ -65,6 +65,7 @@ struct kk_image {
       uint32_t map_version, map_width, map_height, map_layers;
       int16_t map_shift[8][2];
       uint64_t serial;
+      uint32_t params_bytes;
       struct kk_bo *params;
       struct kk_bo **old_params;
       uint32_t old_params_count;
