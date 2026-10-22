@@ -302,6 +302,8 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* We need to initialize the device residency set before any bo is created. */
    simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
+   simple_mtx_init(&dev->stitch_allocators.mutex, mtx_plain);
+   util_dynarray_init(&dev->stitch_allocators.free, NULL);
    dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
    if (dev->residency_set.handle == NULL)
       goto fail_compiler;
@@ -391,6 +393,12 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
    }
+
+   util_dynarray_foreach(&dev->stitch_allocators.free, mtl_command_allocator *,
+                         allocator)
+      mtl_release(*allocator);
+   util_dynarray_fini(&dev->stitch_allocators.free);
+   simple_mtx_destroy(&dev->stitch_allocators.mutex);
 
    /* Release the residency set last once all BOs are released. */
    mtl_release(dev->residency_set.handle);

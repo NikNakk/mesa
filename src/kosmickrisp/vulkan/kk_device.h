@@ -94,6 +94,11 @@ struct kk_device {
     * recording as required by Metal. */
    struct kk_residency_set residency_set;
 
+   struct {
+      simple_mtx_t mutex;
+      struct util_dynarray free;
+   } stitch_allocators;
+
    struct kk_precompiled_cache precompiled_cache;
 
    bool has_queue;

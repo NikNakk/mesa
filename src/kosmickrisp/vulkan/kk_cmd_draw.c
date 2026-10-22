@@ -386,9 +386,12 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    /* renderTargetWidth/Height doesn't seem to guarantee
     * that the attachments won't get touched outside the area
     * so just checking for offset = 0 doesn't cut it. */
+   render->stitch = KK_EXPERIMENTAL(STITCH_PASSES) && !cmd->no_stitch &&
+                    (render->flags & (VK_RENDERING_RESUMING_BIT |
+                                      VK_RENDERING_SUSPENDING_BIT));
    bool force_attachment_load =
-      !is_whole_framebuffer || ((render->flags & VK_RENDERING_RESUMING_BIT) &&
-                                !KK_EXPERIMENTAL(STITCH_PASSES));
+      !is_whole_framebuffer ||
+      ((render->flags & VK_RENDERING_RESUMING_BIT) && !render->stitch);
 
    render->force_attachment_store =
       !is_whole_framebuffer || (render->flags & VK_RENDERING_SUSPENDING_BIT);

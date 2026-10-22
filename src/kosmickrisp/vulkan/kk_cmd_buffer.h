@@ -137,6 +137,7 @@ struct kk_rendering_state {
    uint32_t sample_locations_count;
    VkSampleLocationEXT sample_locations[KK_MAX_SAMPLES];
    bool force_attachment_store;
+   bool stitch;
    uint32_t encoders;
    bool suspending_encoder;
    bool resuming_encoder;
@@ -283,6 +284,7 @@ struct kk_cmd_buffer {
       mtl_render_encoder *render;
       mtl_compute_encoder *compute;
       mtl_command_buffer *head;
+      mtl_command_allocator *held_allocator;
       bool tail_used;
    } metal;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
@@ -295,6 +297,7 @@ struct kk_cmd_buffer {
 
    void *drawable;
    mtl_argument_table *argument_table;
+   bool no_stitch;
 
    struct {
       struct kk_graphics_state gfx;
@@ -359,6 +362,8 @@ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
 mtl_compute_encoder *cs_get_compute_from(struct kk_cmd_buffer *cmd, const char *caller);
 #define cs_get_compute(cmd) cs_get_compute_from(cmd, __func__)
 void kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep);
+
+void kk_encoder_stat(const char *what, bool broke_render);
 void cs_end(struct kk_cmd_buffer *cmd);
 void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
                                         uint64_t addr);
