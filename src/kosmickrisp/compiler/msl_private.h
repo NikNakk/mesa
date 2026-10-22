@@ -25,6 +25,9 @@ struct nir_to_msl_ctx {
    struct _mesa_string_buffer *text;
    uint64_t disabled_workarounds;
    bool uses_per_draw_data;
+   bool tile_function;
+   uint32_t tile_outputs_offset;
+   uint8_t tile_rt_kind[MAX_DRAW_BUFFERS];
    unsigned short indentlevel;
    struct io_slot_info inputs_info[NUM_TOTAL_VARYING_SLOTS];
    struct io_slot_info outputs_info[NUM_TOTAL_VARYING_SLOTS];
@@ -49,6 +52,8 @@ struct nir_to_msl_ctx {
  * map from nir_def* to base type.*/
 
 struct hash_table *msl_infer_types(nir_shader *shader);
+
+const char *msl_fs_output_name(unsigned location);
 
 const char *msl_type_for_def(struct hash_table *types, nir_def *def);
 

@@ -26,6 +26,8 @@ const struct debug_named_value experimental_flags[] = {
    {"fdm", KK_EXPERIMENTAL_FDM},
    {"fdm_rate", KK_EXPERIMENTAL_FDM_RATE},
    {"light_barriers", KK_EXPERIMENTAL_LIGHT_BARRIERS},
+   {"tile_resolve", KK_EXPERIMENTAL_TILE_RESOLVE},
+   {"stitch_passes", KK_EXPERIMENTAL_STITCH_PASSES},
    {NULL, 0},
 };
 

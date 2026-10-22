@@ -429,17 +429,17 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
 
    if (!gfx->in_custom_resolve)
       gfx->seq_log = false;
-   if (density && render->samples > 1 && !gfx->in_custom_resolve) {
-      static int enabled = -1;
+   if (render->samples > 1 && !gfx->in_custom_resolve) {
+      static int64_t start = -2;
       static uint32_t ms_passes;
-      if (enabled < 0)
-         enabled = debug_get_bool_option("KK_SEQ_LOG", false);
+      if (start == -2)
+         start = debug_get_num_option("KK_SEQ_LOG", -1);
       gfx->seq_log = false;
-      if (enabled) {
+      if (start >= 0) {
          simple_mtx_lock(&kk_fdm_lock);
          uint32_t n = ms_passes++;
          simple_mtx_unlock(&kk_fdm_lock);
-         gfx->seq_log = n >= 3000 && n < 3003;
+         gfx->seq_log = n >= start && n < start + 3;
       }
    }
 

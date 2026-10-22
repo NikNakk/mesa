@@ -29,6 +29,8 @@ enum kk_experimental {
    KK_EXPERIMENTAL_FDM = 1ull << 3,
    KK_EXPERIMENTAL_FDM_RATE = 1ull << 4,
    KK_EXPERIMENTAL_LIGHT_BARRIERS = 1ull << 5,
+   KK_EXPERIMENTAL_TILE_RESOLVE = 1ull << 6,
+   KK_EXPERIMENTAL_STITCH_PASSES = 1ull << 7,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

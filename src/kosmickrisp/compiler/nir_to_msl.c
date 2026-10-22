@@ -86,6 +86,9 @@ emit_sysvals(struct nir_to_msl_ctx *ctx, nir_shader *shader)
          sysval = sysval_table[i];
 
       assert(sysval);
+      if (ctx->tile_function &&
+          (i == SYSTEM_VALUE_FRAG_COORD || i == SYSTEM_VALUE_LAYER_ID))
+         continue;
       P_IND(ctx, "%s,\n", sysval);
    }
 }
@@ -95,7 +98,8 @@ emit_inputs(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
    switch (shader->info.stage) {
    case MESA_SHADER_FRAGMENT:
-      P_IND(ctx, "FragmentIn in [[stage_in]],\n");
+      if (!ctx->tile_function)
+         P_IND(ctx, "FragmentIn in [[stage_in]],\n");
       break;
    default:
       break;
@@ -1345,6 +1349,14 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_per_draw_ptr_kk:
       P(ctx, "(ulong)&per_draw.contents[0];\n");
       break;
+   case nir_intrinsic_load_imageblock_sample_kk: {
+      nir_alu_type t = nir_alu_type_get_base_type(nir_intrinsic_dest_type(instr));
+      P(ctx, "%s4(kk_ib.read(kk_lid, ushort(",
+        t == nir_type_float ? "float" : t == nir_type_int ? "int" : "uint");
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, "), imageblock_data_rate::sample).c%u);\n", nir_intrinsic_base(instr));
+      break;
+   }
    case nir_intrinsic_rate_map_physical_to_screen_kk:
    case nir_intrinsic_rate_map_screen_to_physical_kk:
       P(ctx, "rasterization_rate_map_decoder(*(constant "
@@ -2198,10 +2210,38 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
 }
 
 static void
+emit_tile_writes(struct nir_to_msl_ctx *ctx, nir_shader *shader)
+{
+   static const char *types[] = {NULL, "float", "uint", "int"};
+   for (uint32_t i = 0; i < MAX_DRAW_BUFFERS; i++) {
+      uint32_t location = FRAG_RESULT_DATA0 + i;
+      if (!ctx->tile_rt_kind[i] ||
+          !(shader->info.outputs_written & BITFIELD64_BIT(location)))
+         continue;
+      const char *t = types[ctx->tile_rt_kind[i]];
+      unsigned n = ctx->outputs_info[location].num_components;
+      const char *pad = n == 1 ? ", 0, 0, 1" : n == 2 ? ", 0, 1" : n == 3 ? ", 1" : "";
+      P_IND(ctx, "{\n");
+      ctx->indentlevel++;
+      P_IND(ctx,
+            "texture2d_array<%s, access::write> kk_t = *(constant "
+            "texture2d_array<%s, access::write>*)((ulong)&buf0.contents[0] + %uu);\n",
+            t, t, ctx->tile_outputs_offset + i * 8u);
+      P_IND(ctx, "if (kk_gid.x < kk_t.get_width() && kk_gid.y < kk_t.get_height())\n");
+      P_IND(ctx, "    kk_t.write(%s4(out.%s%s), kk_gid, kk_layer);\n", t,
+            msl_fs_output_name(location), pad);
+      ctx->indentlevel--;
+      P_IND(ctx, "}\n");
+   }
+}
+
+static void
 emit_output_return(struct nir_to_msl_ctx *ctx, nir_shader *shader)
 {
-   if (shader->info.stage == MESA_SHADER_VERTEX ||
-       shader->info.stage == MESA_SHADER_FRAGMENT)
+   if (ctx->tile_function)
+      emit_tile_writes(ctx, shader);
+   else if (shader->info.stage == MESA_SHADER_VERTEX ||
+            shader->info.stage == MESA_SHADER_FRAGMENT)
       P_IND(ctx, "return out;\n");
 }
 
@@ -2516,7 +2556,10 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
       .shader = shader,
       .text = _mesa_string_buffer_create(options->mem_ctx, 1024),
       .disabled_workarounds = options->disabled_workarounds,
+      .tile_function = options->tile_function,
+      .tile_outputs_offset = options->tile_outputs_offset,
    };
+   memcpy(ctx.tile_rt_kind, options->tile_rt_kind, sizeof(ctx.tile_rt_kind));
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    msl_gather_info(&ctx, options);
 
@@ -2533,9 +2576,16 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
    if (shader->info.stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.early_fragment_tests)
       P(&ctx, "[[early_fragment_tests]]\n");
-   P(&ctx, "%s %s %s(\n", get_stage_string(shader->info.stage),
-     output_type(shader), get_entrypoint_name(shader));
+   P(&ctx, "%s %s %s(\n",
+     ctx.tile_function ? "kernel" : get_stage_string(shader->info.stage),
+     ctx.tile_function ? "void" : output_type(shader), get_entrypoint_name(shader));
    ctx.indentlevel++;
+   if (ctx.tile_function) {
+      P_IND(&ctx, "imageblock<KKTileBlock, imageblock_layout_implicit> kk_ib,\n");
+      P_IND(&ctx, "ushort2 kk_lid [[thread_position_in_threadgroup]],\n");
+      P_IND(&ctx, "uint2 kk_gid [[thread_position_in_grid]],\n");
+      P_IND(&ctx, "uint kk_layer [[render_target_array_index]],\n");
+   }
    emit_sysvals(&ctx, shader);
    emit_inputs(&ctx, shader);
    ctx.indentlevel--;
@@ -2553,6 +2603,12 @@ nir_to_msl(nir_shader *shader, struct nir_to_msl_options *options)
                   "}\n");
    }
 
+   if (ctx.tile_function &&
+       BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_FRAG_COORD))
+      P_IND(&ctx, "float4 gl_FragCoord = float4(float2(kk_gid) + 0.5, 0.0, 1.0);\n");
+   if (ctx.tile_function &&
+       BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_LAYER_ID))
+      P_IND(&ctx, "uint gl_Layer = kk_layer;\n");
    msl_emit_output_var(&ctx, shader);
    emit_local_vars(&ctx, shader);
    predeclare_ssa_values(&ctx, impl);

@@ -6,6 +6,7 @@
  */
 
 #include "kk_queue.h"
+#include "kk_debug.h"
 #include "util/log.h"
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
@@ -108,6 +109,10 @@ kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
 }
 
 static VkResult
+rerecord_cmd_buffer(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+                    struct kk_commit_data **out);
+
+static VkResult
 rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
                                struct kk_cmd_buffer *cmd)
 {
@@ -177,6 +182,180 @@ unlock:
 }
 
 static VkResult
+rerecord_cmd_buffer(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
+                    struct kk_commit_data **out)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+   struct vk_command_buffer *vk_cmd = NULL;
+   struct kk_cmd_buffer *rerecord;
+   VkResult result = VK_SUCCESS;
+
+   *out = NULL;
+   mtx_lock(&queue->mutex);
+
+   if (util_dynarray_num_elements(&queue->free_cmd_buffers,
+                                  struct vk_command_buffer *) > 0u) {
+      vk_cmd = util_dynarray_pop(&queue->free_cmd_buffers,
+                                 struct vk_command_buffer *);
+   } else {
+      result = kk_cmd_buffer_ops.create(
+         &queue->cmd_pool->vk, VK_COMMAND_BUFFER_LEVEL_PRIMARY, &vk_cmd);
+      if (result != VK_SUCCESS)
+         goto unlock;
+   }
+
+   rerecord = container_of(vk_cmd, struct kk_cmd_buffer, vk);
+   VkCommandBuffer rerecord_handle = kk_cmd_buffer_to_handle(rerecord);
+   const VkCommandBufferBeginInfo begin_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   result = kk_BeginCommandBuffer(rerecord_handle, &begin_info);
+   if (result != VK_SUCCESS)
+      goto release;
+
+   vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
+                        &dev->vk.dispatch_table);
+
+   result = kk_EndCommandBuffer(rerecord_handle);
+   if (result != VK_SUCCESS)
+      goto release;
+
+   if (!kk_cmd_buffer_has_work(rerecord))
+      goto release;
+
+   struct kk_commit_data *commit = vk_alloc(&dev->vk.alloc, sizeof(*commit), 8,
+                                            VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (commit == NULL) {
+      result = vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto release;
+   }
+   commit->queue = queue;
+   commit->cmd = rerecord;
+   kk_device_make_resources_resident(dev);
+   queue->commits_in_flight++;
+   *out = commit;
+   mtx_unlock(&queue->mutex);
+   return VK_SUCCESS;
+
+release:
+   kk_queue_release_cmd_buffer_locked(queue, rerecord);
+unlock:
+   mtx_unlock(&queue->mutex);
+   return result;
+}
+
+struct kk_commit_group {
+   mtl_command_buffer *bufs[32];
+   struct kk_commit_data *commits[32];
+   uint32_t count;
+};
+
+static void
+kk_commit_group_flush(struct kk_queue *queue, struct kk_commit_group *group)
+{
+   if (group->count == 0)
+      return;
+   struct kk_device *dev = kk_queue_device(queue);
+   mtl_commit_options *options = mtl_new_commit_options();
+   mtl_commit_options_add_feedback_handler(options, commit_callback, dev);
+   for (uint32_t i = 0; i < group->count; i++) {
+      if (group->commits[i])
+         mtl_commit_options_add_feedback_handler(options, rerecord_commit_callback,
+                                                 group->commits[i]);
+   }
+   mtl_command_queue_commit(queue->mtl_handle, group->bufs, group->count,
+                            options);
+   mtl_release(options);
+   group->count = 0;
+}
+
+static VkResult
+kk_queue_submit_stitched(struct kk_queue *queue, struct vk_queue_submit *submit)
+{
+   struct kk_commit_group group = {0};
+   struct kk_commit_group deferred = {0};
+   bool chain_open = false;
+
+   for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
+      struct kk_cmd_buffer *cmd_buffer =
+         container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+
+      if (cmd_buffer->drawable) {
+         kk_commit_group_flush(queue, &group);
+         mtl_command_queue_wait_for_drawable(queue->mtl_handle,
+                                             cmd_buffer->drawable);
+      }
+
+      struct kk_cmd_buffer *committed = cmd_buffer;
+      struct kk_commit_data *commit = NULL;
+      if (cmd_buffer->submitted) {
+         VkResult result = rerecord_cmd_buffer(queue, cmd_buffer, &commit);
+         if (result != VK_SUCCESS)
+            return result;
+         committed = commit ? commit->cmd : NULL;
+      } else if (!kk_cmd_buffer_has_work(cmd_buffer)) {
+         committed = NULL;
+      }
+      cmd_buffer->submitted = true;
+
+      if (committed && chain_open && !committed->state.gfx.stitch.starts_resumed &&
+          !cmd_buffer->drawable) {
+         static uint32_t logged;
+         if (logged++ < 4)
+            mesa_logi("kk: deferring a command buffer submitted inside a stitched render pass");
+         if (deferred.count == ARRAY_SIZE(deferred.bufs))
+            kk_commit_group_flush(queue, &deferred);
+         deferred.bufs[deferred.count] = committed->metal.cmd_buf;
+         deferred.commits[deferred.count] = commit;
+         deferred.count++;
+         continue;
+      }
+
+      if (committed) {
+         if (group.count + 1 >= ARRAY_SIZE(group.bufs))
+            kk_commit_group_flush(queue, &group);
+         if (committed->metal.head) {
+            group.bufs[group.count] = committed->metal.head;
+            group.commits[group.count] = NULL;
+            group.count++;
+            kk_commit_group_flush(queue, &group);
+            if (committed->metal.tail_used) {
+               group.bufs[group.count] = committed->metal.cmd_buf;
+               group.commits[group.count] = commit;
+               group.count++;
+            } else if (commit) {
+               group.bufs[group.count] = committed->metal.cmd_buf;
+               group.commits[group.count] = commit;
+               group.count++;
+            }
+         } else {
+            group.bufs[group.count] = committed->metal.cmd_buf;
+            group.commits[group.count] = commit;
+            group.count++;
+         }
+      }
+
+      if (cmd_buffer->drawable) {
+         kk_commit_group_flush(queue, &group);
+         mtl_command_queue_signal_drawable(queue->mtl_handle,
+                                           cmd_buffer->drawable);
+         mtl_release(cmd_buffer->drawable);
+         cmd_buffer->drawable = NULL;
+      }
+
+      chain_open = committed && committed->state.gfx.stitch.ends_suspended;
+      if (!chain_open) {
+         kk_commit_group_flush(queue, &group);
+         kk_commit_group_flush(queue, &deferred);
+      }
+   }
+   kk_commit_group_flush(queue, &group);
+   kk_commit_group_flush(queue, &deferred);
+   return VK_SUCCESS;
+}
+
+static VkResult
 kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
@@ -197,6 +376,13 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * work. All resources should have been allocated before submission.
     * Otherwise, users are playing with fire. */
    kk_device_make_resources_resident(dev);
+
+   if (KK_EXPERIMENTAL(STITCH_PASSES)) {
+      VkResult result = kk_queue_submit_stitched(queue, submit);
+      if (result != VK_SUCCESS)
+         return result;
+      goto signal;
+   }
 
    for (uint32_t i = 0; i < submit->command_buffer_count; ++i) {
       struct kk_cmd_buffer *cmd_buffer =
@@ -227,6 +413,7 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       }
    }
 
+signal:
    for (uint32_t i = 0u; i < submit->signal_count; ++i) {
       struct vk_sync_signal *signal = &submit->signals[i];
       struct kk_sync_timeline *sync =

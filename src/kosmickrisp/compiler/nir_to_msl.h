@@ -23,6 +23,10 @@ struct nir_to_msl_options {
     * the render target has. This leads to an incorrect calculation of the
     * component count for the render target formats. */
    uint8_t rts_component_count[MAX_DRAW_BUFFERS];
+
+   bool tile_function;
+   uint32_t tile_outputs_offset;
+   uint8_t tile_rt_kind[MAX_DRAW_BUFFERS];
 };
 
 /* Assumes nir_shader_gather_info has been called beforehand. */
