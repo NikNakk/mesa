@@ -17,10 +17,12 @@
 #include "kosmickrisp/bridge/mtl_rate_map.h"
 
 #include "util/log.h"
+#include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
 #include "vk_util.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +196,113 @@ kk_fdm_image_finish(struct kk_device *dev, struct kk_image *image)
 }
 
 #define KK_FDM_TEXEL_SIZE 32
+#define KK_FDM_PARAMS_RING 8
+
+static struct {
+   bool valid;
+   float x, y;
+} kk_fdm_gaze[KK_RATE_PARAMS_MAX_LAYERS], kk_fdm_latched[KK_RATE_PARAMS_MAX_LAYERS];
+static uint64_t kk_fdm_serial;
+
+PUBLIC void
+kk_fdm_set_gaze(uint32_t view, float x, float y, bool valid)
+{
+   if (view >= KK_RATE_PARAMS_MAX_LAYERS)
+      return;
+   simple_mtx_lock(&kk_fdm_lock);
+   kk_fdm_gaze[view].valid = valid;
+   kk_fdm_gaze[view].x = CLAMP(x, 0.0f, 1.0f);
+   kk_fdm_gaze[view].y = CLAMP(y, 0.0f, 1.0f);
+   simple_mtx_unlock(&kk_fdm_lock);
+}
+
+/* KK_FDM_GAZE simulates gaze: "x,y" for a fixed point, or "sweep[:seconds]"
+ * for a point that circles the view. */
+static bool
+kk_fdm_live_gaze(uint32_t layer, float *x, float *y)
+{
+   static const char *sim;
+   static bool init;
+   if (!init) {
+      sim = getenv("KK_FDM_GAZE");
+      init = true;
+   }
+   if (sim && sim[0]) {
+      if (!strncmp(sim, "sweep", 5)) {
+         double period = sim[5] == ':' ? atof(sim + 6) : 4.0;
+         if (period <= 0)
+            period = 4.0;
+         double t = os_time_get_nano() / 1e9 / period * 2.0 * M_PI;
+         *x = 0.5f + 0.3f * (float)cos(t);
+         *y = 0.5f + 0.25f * (float)sin(t);
+         return true;
+      }
+      return sscanf(sim, "%f,%f", x, y) == 2;
+   }
+   if (!kk_fdm_gaze[layer].valid)
+      return false;
+   *x = kk_fdm_gaze[layer].x;
+   *y = kk_fdm_gaze[layer].y;
+   return true;
+}
+
+static bool
+kk_fdm_get_gaze(uint32_t layer, float *x, float *y)
+{
+   *x = kk_fdm_latched[layer].x;
+   *y = kk_fdm_latched[layer].y;
+   return kk_fdm_latched[layer].valid;
+}
+
+void
+kk_fdm_latch_gaze(void)
+{
+   static uint64_t last_ns;
+   if (!KK_EXPERIMENTAL(FDM_RATE))
+      return;
+   uint64_t now = os_time_get_nano();
+   simple_mtx_lock(&kk_fdm_lock);
+   if (now - last_ns >= 10000000ull) {
+      last_ns = now;
+      for (uint32_t l = 0; l < KK_RATE_PARAMS_MAX_LAYERS; l++) {
+         float x = 0.5f, y = 0.5f;
+         kk_fdm_latched[l].valid = kk_fdm_live_gaze(l, &x, &y);
+         kk_fdm_latched[l].x = x;
+         kk_fdm_latched[l].y = y;
+      }
+   }
+   simple_mtx_unlock(&kk_fdm_lock);
+}
+
+/* Moves a rate profile so that the middle of its highest-rate band lands on
+ * position target, in profile entries. Returns the shift applied. */
+static int
+kk_fdm_shift_profile(float *profile, uint32_t n, float target)
+{
+   float best = 0;
+   for (uint32_t i = 0; i < n; i++)
+      best = MAX2(best, profile[i]);
+   int first = -1, last = -1;
+   for (uint32_t i = 0; i < n; i++) {
+      if (profile[i] >= best * 0.999f) {
+         if (first < 0)
+            first = i;
+         last = i;
+      }
+   }
+   if (first < 0)
+      return 0;
+   int shift = (int)lroundf(target - 0.5f * (first + last));
+   if (shift == 0)
+      return 0;
+   float tmp[2 * 256 + 1];
+   if (n > ARRAY_SIZE(tmp))
+      return 0;
+   for (uint32_t i = 0; i < n; i++)
+      tmp[i] = profile[CLAMP((int)i - shift, 0, (int)n - 1)];
+   memcpy(profile, tmp, n * sizeof(float));
+   return shift;
+}
 
 static float
 kk_fdm_density(const struct kk_image *density, uint32_t layer, uint32_t x,
@@ -209,15 +318,10 @@ kk_fdm_density(const struct kk_image *density, uint32_t layer, uint32_t x,
 
 static void *
 kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
-               VkExtent2D screen)
+               VkExtent2D screen, VkRect2D area)
 {
    if (density->fdm.cpu == NULL)
       return NULL;
-
-   if (density->fdm.map && density->fdm.map_version == density->fdm.version &&
-       density->fdm.map_width == screen.width &&
-       density->fdm.map_height == screen.height)
-      return density->fdm.map;
 
    const uint32_t mw = DIV_ROUND_UP(screen.width, KK_FDM_TEXEL_SIZE);
    const uint32_t mh = DIV_ROUND_UP(screen.height, KK_FDM_TEXEL_SIZE);
@@ -260,6 +364,29 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
       }
    }
 
+   int16_t shift[KK_RATE_PARAMS_MAX_LAYERS][2] = {{0}};
+   for (uint32_t l = 0; l < layers; l++) {
+      float gx, gy;
+      if (!kk_fdm_get_gaze(l, &gx, &gy))
+         continue;
+      /* Profile entry 2k + 1 is the middle of map texel k. */
+      float px = area.offset.x + gx * area.extent.width;
+      float py = area.offset.y + gy * area.extent.height;
+      shift[l][0] = kk_fdm_shift_profile(&horizontal[l * nh], nh,
+                                         2.0f * px / KK_FDM_TEXEL_SIZE);
+      shift[l][1] = kk_fdm_shift_profile(&vertical[l * nv], nv,
+                                         2.0f * py / KK_FDM_TEXEL_SIZE);
+   }
+
+   if (density->fdm.map && density->fdm.map_version == density->fdm.version &&
+       density->fdm.map_width == screen.width &&
+       density->fdm.map_height == screen.height &&
+       !memcmp(density->fdm.map_shift, shift, sizeof(shift))) {
+      free(horizontal);
+      free(vertical);
+      return density->fdm.map;
+   }
+
    void *map = mtl_new_rate_map(dev->mtl_handle, screen.width, screen.height,
                                 layers, nh, nv, horizontal, vertical);
    free(horizontal);
@@ -272,9 +399,16 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
       mtl_release(map);
       return NULL;
    }
-   struct kk_bo *params;
-   if (kk_alloc_bo(dev, &density->vk.base, KK_RATE_PARAMS_SIZE_B, 0, &params) !=
-       VK_SUCCESS) {
+   /* Earlier parameter blocks may still be read by work in flight. Maps
+    * change at most once a frame, so the oldest of a short ring is free. */
+   struct kk_bo *params = NULL;
+   if (density->fdm.old_params_count >= KK_FDM_PARAMS_RING) {
+      params = density->fdm.old_params[0];
+      memmove(density->fdm.old_params, density->fdm.old_params + 1,
+              (density->fdm.old_params_count - 1) * sizeof(params));
+      density->fdm.old_params_count--;
+   } else if (kk_alloc_bo(dev, &density->vk.base, KK_RATE_PARAMS_SIZE_B, 0,
+                          &params) != VK_SUCCESS) {
       mtl_release(map);
       return NULL;
    }
@@ -291,6 +425,8 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
       density->fdm.old_params = old;
    }
    density->fdm.params = params;
+   density->fdm.serial = ++kk_fdm_serial;
+   memcpy(density->fdm.map_shift, shift, sizeof(shift));
 
    struct kk_rate_params_header *header = density->fdm.params->cpu;
    memset(header, 0, KK_RATE_PARAMS_HEADER_B);
@@ -312,13 +448,17 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
    density->fdm.map_height = screen.height;
    density->fdm.map_layers = layers;
 
-   if (kk_fdm_debug())
-      mesa_logi("kk-fdm: rate map %ux%u from %ux%ux%u density map, layer 0 "
-                "physical %ux%u (%.1f%%)",
-                screen.width, screen.height, mw, mh, layers,
-                header->physical[0][0], header->physical[0][1],
-                100.0 * header->physical[0][0] * header->physical[0][1] /
-                   ((double)screen.width * screen.height));
+   if (kk_fdm_debug()) {
+      static uint32_t logged;
+      if (logged++ < 16 || (logged & (logged - 1)) == 0)
+         mesa_logi("kk-fdm: rate map %u: %ux%u from %ux%ux%u density map, layer 0 "
+                   "physical %ux%u (%.1f%%), shift %d,%d / %d,%d texels/2",
+                   logged, screen.width, screen.height, mw, mh, layers,
+                   header->physical[0][0], header->physical[0][1],
+                   100.0 * header->physical[0][0] * header->physical[0][1] /
+                      ((double)screen.width * screen.height),
+                   shift[0][0], shift[0][1], shift[1][0], shift[1][1]);
+   }
    return map;
 }
 
@@ -385,7 +525,8 @@ kk_fdm_publish(struct kk_cmd_buffer *cmd, struct kk_image *density,
    struct kk_image *image = container_of(iview->vk.image, struct kk_image, vk);
    if (image->rate_params == NULL)
       return;
-   if (image->rate_params_owner == density->fdm.params)
+   if (image->rate_params_owner == density &&
+       image->rate_params_serial == density->fdm.serial)
       return;
    if (cmd->metal.render == NULL)
       mtl_copy_from_buffer_to_buffer(cs_get_compute(cmd), density->fdm.params->map,
@@ -400,7 +541,8 @@ kk_fdm_publish(struct kk_cmd_buffer *cmd, struct kk_image *density,
          mesa_logi("kk-fdm: %u parameter block rewrites of already-published images",
                    republished);
    }
-   image->rate_params_owner = density->fdm.params;
+   image->rate_params_owner = density;
+   image->rate_params_serial = density->fdm.serial;
 }
 
 void
@@ -444,7 +586,7 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    }
 
    simple_mtx_lock(&kk_fdm_lock);
-   void *map = density ? kk_fdm_get_map(dev, density, screen) : NULL;
+   void *map = density ? kk_fdm_get_map(dev, density, screen, render->area) : NULL;
    if (map && !kk_fdm_all_subsampled(render)) {
       static uint32_t logged;
       if (kk_fdm_debug() && logged++ < 8)
@@ -496,6 +638,11 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    }
 
    gfx->fdm.density = map ? density : NULL;
+   if (map && render->stitch) {
+      if (gfx->stitch.fdm_serial && gfx->stitch.fdm_serial != density->fdm.serial)
+         gfx->stitch.fdm_mixed = true;
+      gfx->stitch.fdm_serial = density->fdm.serial;
+   }
    uint64_t params = 0;
    if (map) {
       mtl_render_pass_descriptor_set_rate_map(descriptor, map);

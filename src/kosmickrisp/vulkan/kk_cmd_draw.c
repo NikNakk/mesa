@@ -741,6 +741,34 @@ kk_dump_view(struct kk_cmd_buffer *cmd, const char *dir, const char *name,
       thrd_detach(thread);
 }
 
+/* KK_DUMP_PASSES_DIR writes colour attachment 0 of every multiview pass
+ * from pass KK_DUMP_PASSES_FIRST for KK_DUMP_PASSES_COUNT passes. */
+static void
+kk_dump_pass(struct kk_cmd_buffer *cmd, const struct kk_image_view *view,
+             VkRect2D area)
+{
+   static const char *dir;
+   static int64_t first = -1, count;
+   static uint32_t seen;
+   if (first < 0) {
+      dir = debug_get_option("KK_DUMP_PASSES_DIR", NULL);
+      first = debug_get_num_option("KK_DUMP_PASSES_FIRST", 6000);
+      count = debug_get_num_option("KK_DUMP_PASSES_COUNT", 40);
+   }
+   if (!dir || !view || view->vk.image->samples > 1)
+      return;
+   uint32_t index = p_atomic_inc_return(&seen) - 1;
+   if (index < first || index - first >= count)
+      return;
+   char name[64];
+   snprintf(name, sizeof(name), "pass-f%d-%ux%u%s", view->vk.format,
+            area.extent.width, area.extent.height,
+            (view->vk.image->create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT)
+               ? "-sub"
+               : "");
+   kk_dump_view(cmd, dir, name, index, view, area, false);
+}
+
 static void
 kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
 {
@@ -888,6 +916,13 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    if (render->flags & VK_RENDERING_SUSPENDING_BIT)
       need_meta_resolve = false;
 
+   const struct kk_image_view *pass_view =
+      render->color_att_count && render->view_mask &&
+            !(render->flags & VK_RENDERING_SUSPENDING_BIT)
+         ? render->color_att[0].iview
+         : NULL;
+   VkRect2D pass_area = render->area;
+
    memset(render, 0, sizeof(*render));
 
    if (need_meta_resolve) {
@@ -920,6 +955,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    }
 
    kk_dump_custom_resolve(cmd);
+   kk_dump_pass(cmd, pass_view, pass_area);
 }
 
 static void

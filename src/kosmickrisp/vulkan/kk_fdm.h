@@ -19,6 +19,15 @@ void kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
 
 void kk_fdm_carry_to_next_rendering(struct kk_cmd_buffer *cmd);
 
+/* Gaze point per view, in [0, 1] across the render area, for gaze-centred
+ * rate maps. Exported for the OpenXR layer in the same process. */
+PUBLIC void kk_fdm_set_gaze(uint32_t view, float x, float y, bool valid);
+
+/* Takes the gaze used by rate maps recorded until the next latch. Called at
+ * queue submission, at most once every 10 ms, so that the passes of a frame
+ * share one map. */
+void kk_fdm_latch_gaze(void);
+
 void kk_seq_log(struct kk_cmd_buffer *cmd, const char *fmt, ...);
 
 struct vk_image;

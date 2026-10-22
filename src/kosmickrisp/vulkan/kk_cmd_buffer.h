@@ -193,6 +193,8 @@ struct kk_graphics_state {
       bool ends_suspended;
       bool suspended_open;
       bool violation;
+      uint64_t fdm_serial;
+      bool fdm_mixed;
       char trace[384];
    } stitch;
    struct {
