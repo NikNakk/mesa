@@ -31,6 +31,9 @@ struct kk_queue {
    uint32_t commits_in_flight;
    mtx_t mutex;
    cnd_t cond;
+
+   mtl_shared_event *stitch_event;
+   uint64_t stitch_value;
 };
 
 static inline struct kk_device *
