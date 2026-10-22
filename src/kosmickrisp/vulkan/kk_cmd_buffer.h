@@ -190,6 +190,7 @@ struct kk_graphics_state {
       bool ends_suspended;
       bool suspended_open;
       bool violation;
+      char trace[384];
    } stitch;
    struct {
       bool possible;

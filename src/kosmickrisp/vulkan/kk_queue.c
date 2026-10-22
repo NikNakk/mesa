@@ -396,6 +396,18 @@ struct kk_pending {
    bool broken;
 };
 
+static void
+kk_stitch_wait(struct kk_queue *queue)
+{
+   if (!queue->stitch_event)
+      queue->stitch_event =
+         mtl_new_shared_event(kk_queue_device(queue)->mtl_handle);
+   mtl_signal_event(queue->mtl_handle, queue->stitch_event,
+                    ++queue->stitch_value);
+   mtl_wait_for_event(queue->mtl_handle, queue->stitch_event,
+                      queue->stitch_value);
+}
+
 static VkResult
 kk_submit_pending(struct kk_queue *queue, struct kk_pending *pending)
 {
@@ -421,6 +433,18 @@ kk_submit_pending(struct kk_queue *queue, struct kk_pending *pending)
    }
 
    kk_encoder_stat("stitched chain", false);
+   static uint32_t logged;
+   static int64_t log_limit = -1;
+   if (log_limit < 0)
+      log_limit = debug_get_num_option("KK_STITCH_LOG", 0);
+   if (logged < log_limit) {
+      logged++;
+      for (uint32_t i = 0; i < pending->count; i++)
+         mesa_logi("kk-stitch-log %u.%u %s:%s%s", logged, i,
+                   pending->in_chain[i] ? "seg" : "deferred",
+                   pending->cmds[i]->state.gfx.stitch.trace,
+                   pending->cmds[i]->metal.head ? " (split)" : "");
+   }
    struct kk_commit_group group = {0};
    for (uint32_t i = 0; i < n; i++) {
       struct kk_cmd_buffer *cmd = chain[i];
@@ -448,6 +472,7 @@ kk_submit_pending(struct kk_queue *queue, struct kk_pending *pending)
       kk_commit_group_add(queue, &group, committed->metal.head, commit,
                           tail ? NULL : committed);
       kk_commit_group_flush(queue, &group);
+      kk_stitch_wait(queue);
       if (tail)
          kk_commit_group_add(queue, &group, committed->metal.cmd_buf, commit,
                              committed);
@@ -667,6 +692,8 @@ kk_queue_finish(struct kk_device *dev, struct kk_queue *queue)
 
    mtl_command_queue_remove_residency_set(queue->mtl_handle,
                                           dev->residency_set.handle);
+   if (queue->stitch_event)
+      mtl_release(queue->stitch_event);
    mtl_release(queue->mtl_handle);
 
    kk_DestroyCommandPool(kk_device_to_handle(dev),

@@ -296,7 +296,7 @@ kk_stitch_violation(struct kk_cmd_buffer *cmd, const char *why)
 }
 
 static void
-kk_stitch_note_encoder(struct kk_cmd_buffer *cmd, uint32_t options)
+kk_stitch_note_encoder(struct kk_cmd_buffer *cmd, uint32_t options, bool render)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    if (gfx->stitch.suspended_open)
@@ -314,6 +314,30 @@ kk_stitch_note_encoder(struct kk_cmd_buffer *cmd, uint32_t options)
       gfx->stitch.ends_suspended = true;
    }
    gfx->stitch.encoders++;
+
+   static int log = -1;
+   if (log < 0)
+      log = debug_get_num_option("KK_STITCH_LOG", 0) > 0;
+   size_t len = strlen(gfx->stitch.trace);
+   if (!log || len > sizeof(gfx->stitch.trace) - 96)
+      return;
+   if (!render) {
+      snprintf(gfx->stitch.trace + len, sizeof(gfx->stitch.trace) - len, " C");
+      return;
+   }
+   const struct kk_rendering_state *r = &gfx->render;
+   const struct kk_image_view *v =
+      r->color_att_count && r->color_att[0].iview ? r->color_att[0].iview
+                                                   : r->depth_att.iview;
+   snprintf(gfx->stitch.trace + len, sizeof(gfx->stitch.trace) - len,
+            " R%s%s[%ux%ux%u s%u f%d c%u d%d vm%x L%u base%u a%ux%u+%d,%d f%x]",
+            options & MTL_RENDER_ENCODER_RESUMING ? "r" : "",
+            options & MTL_RENDER_ENCODER_SUSPENDING ? "s" : "",
+            v ? v->vk.image->extent.width : 0, v ? v->vk.image->extent.height : 0,
+            v ? v->vk.image->array_layers : 0, r->samples, v ? v->vk.format : 0,
+            r->color_att_count, r->depth_att.iview != NULL, r->view_mask,
+            r->layer_count, v ? v->vk.base_array_layer : 0, r->area.extent.width,
+            r->area.extent.height, r->area.offset.x, r->area.offset.y, r->flags);
 }
 
 static bool
@@ -378,7 +402,7 @@ cs_start_render(struct kk_cmd_buffer *cmd)
          options |= MTL_RENDER_ENCODER_SUSPENDING;
    }
    if (KK_EXPERIMENTAL(STITCH_PASSES))
-      kk_stitch_note_encoder(cmd, options);
+      kk_stitch_note_encoder(cmd, options, true);
    state->render.encoders++;
    state->render.suspending_encoder = options & MTL_RENDER_ENCODER_SUSPENDING;
    state->render.resuming_encoder = options & MTL_RENDER_ENCODER_RESUMING;
@@ -500,7 +524,7 @@ cs_get_compute_from(struct kk_cmd_buffer *cmd, const char *caller)
 
    if (cmd->metal.compute == NULL) {
       if (KK_EXPERIMENTAL(STITCH_PASSES))
-         kk_stitch_note_encoder(cmd, 0);
+         kk_stitch_note_encoder(cmd, 0, false);
       if (cmd->metal.head)
          cmd->metal.tail_used = true;
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
