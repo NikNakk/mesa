@@ -91,6 +91,7 @@ struct kk_shader_info {
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
+         bool dynamic_write_masks;
       } vs;
 
       struct {
@@ -107,6 +108,7 @@ struct kk_shader_info {
       struct {
          bool uses_flat_varyings;
          bool custom_resolve;
+         bool reads_ms_texture;
          uint64_t outputs_written;
       } fs;
 
@@ -130,6 +132,11 @@ struct kk_pipeline_handles {
          mtl_compute_pipeline_state *pre_render[4];
          mtl_depth_stencil_state *ds_handle;
          mtl_render_pipeline_state *tile[5];
+         struct {
+            uint32_t masks;
+            mtl_render_pipeline_state *render;
+         } masked[4];
+         uint32_t render_stage;
          uint32_t pre_render_count;
       } gfx;
       mtl_compute_pipeline_state *cs;
@@ -162,6 +169,9 @@ struct kk_device;
 mtl_render_pipeline_state *kk_shader_get_tile_pipeline(struct kk_device *device,
                                                        struct kk_shader *vs,
                                                        uint32_t samples);
+mtl_render_pipeline_state *
+kk_shader_get_masked_pipeline(struct kk_device *device, struct kk_shader *vs,
+                              uint32_t masks);
 
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)

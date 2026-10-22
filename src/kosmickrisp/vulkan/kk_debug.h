@@ -31,6 +31,7 @@ enum kk_experimental {
    KK_EXPERIMENTAL_LIGHT_BARRIERS = 1ull << 5,
    KK_EXPERIMENTAL_TILE_RESOLVE = 1ull << 6,
    KK_EXPERIMENTAL_STITCH_PASSES = 1ull << 7,
+   KK_EXPERIMENTAL_MS_INPUT_FETCH = 1ull << 8,
 };
 
 extern enum kk_experimental kk_mesa_experimental_flags;

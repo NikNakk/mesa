@@ -13,6 +13,7 @@
 struct lower_ia_state {
    const struct vk_input_attachment_location_state *ial;
    const struct vk_color_attachment_location_state *cal;
+   bool fetch_multisampled;
 };
 
 static bool
@@ -23,7 +24,9 @@ lower_ia(nir_builder *b, nir_intrinsic_instr *intrin,
 
    /* Framebuffer fetches are moved to output loads if they are not
     * depth/stencil nor multisample. */
-   if (nir_intrinsic_image_dim(intrin) == GLSL_SAMPLER_DIM_SUBPASS &&
+   enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intrin);
+   if ((dim == GLSL_SAMPLER_DIM_SUBPASS ||
+        (state->fetch_multisampled && dim == GLSL_SAMPLER_DIM_SUBPASS_MS)) &&
        nir_src_is_const(intrin->src[3])) {
       b->cursor = nir_before_instr(&intrin->instr);
       uint32_t ia_index =
@@ -88,7 +91,8 @@ msl_nir_lower_frag_input_attachments(nir_shader *nir,
 void
 msl_nir_lower_input_attachments(
    nir_shader *nir, const struct vk_input_attachment_location_state *ial,
-   const struct vk_color_attachment_location_state *cal)
+   const struct vk_color_attachment_location_state *cal,
+   bool fetch_multisampled)
 {
    assert(nir->info.stage == MESA_SHADER_FRAGMENT);
 
@@ -96,6 +100,7 @@ msl_nir_lower_input_attachments(
       struct lower_ia_state state = {
          .ial = ial,
          .cal = cal,
+         .fetch_multisampled = fetch_multisampled,
       };
       NIR_PASS(_, nir, msl_nir_lower_frag_input_attachments, &state);
    }

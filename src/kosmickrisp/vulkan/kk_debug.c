@@ -28,6 +28,7 @@ const struct debug_named_value experimental_flags[] = {
    {"light_barriers", KK_EXPERIMENTAL_LIGHT_BARRIERS},
    {"tile_resolve", KK_EXPERIMENTAL_TILE_RESOLVE},
    {"stitch_passes", KK_EXPERIMENTAL_STITCH_PASSES},
+   {"ms_input_fetch", KK_EXPERIMENTAL_MS_INPUT_FETCH},
    {NULL, 0},
 };
 

@@ -185,6 +185,10 @@ struct kk_graphics_state {
    bool seq_log;
    bool in_custom_resolve;
    struct {
+      const struct kk_image_view *view;
+      VkRect2D area;
+   } dump;
+   struct {
       uint32_t encoders;
       bool starts_resumed;
       bool ends_suspended;
