@@ -8,7 +8,9 @@
  */
 
 #include "kk_entrypoints.h"
+#include "kk_debug.h"
 #include "kk_fdm.h"
+#include "kosmickrisp/bridge/mtl_tile.h"
 
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
@@ -359,12 +361,25 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    /* Check if we are rendering to the whole framebuffer. Required to understand
     * if we need to load to avoid clearing all attachment when loading.
     */
+   uint32_t view_layers = render->layer_count;
+   if (KK_EXPERIMENTAL(TILE_RESOLVE) && render->view_mask) {
+      view_layers = UINT32_MAX;
+      for (uint32_t i = 0; i < render->color_att_count; i++)
+         if (render->color_att[i].iview)
+            view_layers = MIN2(view_layers, render->color_att[i].iview->vk.layer_count);
+      if (render->depth_att.iview)
+         view_layers = MIN2(view_layers, render->depth_att.iview->vk.layer_count);
+      if (render->stencil_att.iview)
+         view_layers = MIN2(view_layers, render->stencil_att.iview->vk.layer_count);
+      if (view_layers == UINT32_MAX)
+         view_layers = render->layer_count;
+   }
    bool is_whole_framebuffer =
       framebuffer_extent.width == render->area.extent.width &&
       framebuffer_extent.height == render->area.extent.height &&
       render->area.offset.x == 0u && render->area.offset.y == 0u &&
       (render->view_mask == 0u ||
-       render->view_mask == BITFIELD64_MASK(render->layer_count));
+       render->view_mask == BITFIELD64_MASK(view_layers));
 
    render->rendering_to_whole_framebuffer = is_whole_framebuffer;
 
@@ -372,7 +387,8 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * that the attachments won't get touched outside the area
     * so just checking for offset = 0 doesn't cut it. */
    bool force_attachment_load =
-      !is_whole_framebuffer || (render->flags & VK_RENDERING_RESUMING_BIT);
+      !is_whole_framebuffer || ((render->flags & VK_RENDERING_RESUMING_BIT) &&
+                                !KK_EXPERIMENTAL(STITCH_PASSES));
 
    render->force_attachment_store =
       !is_whole_framebuffer || (render->flags & VK_RENDERING_SUSPENDING_BIT);
@@ -453,6 +469,29 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
               render->color_att_count > 1 ? (int)render->color_att[1].resolve_mode : -1,
               render->depth_att.iview ? "yes" : "no", (int)render->depth_att.resolve_mode,
               (int)render->stencil_att.resolve_mode, render->view_mask);
+   kk_seq_log(cmd, "  colour load %d store %d, depth load %d store %d, force store %d",
+              render->color_att_count ? (int)render->color_att[0].load_op : -1,
+              render->color_att_count ? (int)render->color_att[0].store_op : -1,
+              (int)render->depth_att.load_op, (int)render->depth_att.store_op,
+              (int)render->force_attachment_store);
+
+   if (!cmd->state.gfx.in_custom_resolve) {
+      struct kk_graphics_state *gfx = &cmd->state.gfx;
+      gfx->tile_resolve.possible = false;
+      gfx->tile_resolve.active = false;
+      gfx->tile_resolve.pending_split = false;
+      if (KK_EXPERIMENTAL(TILE_RESOLVE) &&
+          (render->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT) &&
+          render->samples > 1 && render->color_att_count) {
+         uint32_t px = 32;
+         while (px > 8 && render->color_att_count * 16u * render->samples * px * px >
+                             32768u)
+            px /= 2;
+         gfx->tile_resolve.possible = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
+         gfx->tile_resolve.tile_px = px;
+         mtl_render_pass_descriptor_set_tile_size(pass_descriptor, px, px);
+      }
+   }
 
    /* Rendering with no attachments requires pushing the start of the render
     * pass to first pipeline binding to know sample count. */
@@ -606,6 +645,9 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    bool need_meta_resolve = false;
    kk_seq_log(cmd, "end rendering");
    cmd->state.gfx.in_custom_resolve = false;
+   cmd->state.gfx.tile_resolve.possible = false;
+   cmd->state.gfx.tile_resolve.active = false;
+   cmd->state.gfx.tile_resolve.pending_split = false;
 
    /* Translate render state back to VK for meta */
    VkRenderingAttachmentInfo vk_color_att[KK_MAX_RTS];
@@ -744,12 +786,10 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    }
 }
 
-VKAPI_ATTR void VKAPI_CALL
-kk_CmdBeginCustomResolveEXT(
-   VkCommandBuffer commandBuffer,
-   UNUSED const VkBeginCustomResolveInfoEXT *pBeginCustomResolveInfo)
+static void
+kk_begin_custom_resolve_legacy(struct kk_cmd_buffer *cmd)
 {
-   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   VkCommandBuffer commandBuffer = kk_cmd_buffer_to_handle(cmd);
    struct kk_rendering_state *render = &cmd->state.gfx.render;
 
    VkRenderingAttachmentInfo color_atts[KK_MAX_RTS];
@@ -860,6 +900,108 @@ kk_CmdBeginCustomResolveEXT(
       cmd->state.gfx.custom_resolve_debug.view_mask = rendering_info.viewMask;
       cmd->state.gfx.custom_resolve_debug.active = true;
    }
+}
+
+static bool
+kk_tile_resolve_can_start(struct kk_cmd_buffer *cmd)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_rendering_state *render = &gfx->render;
+   if (!gfx->tile_resolve.possible ||
+       kk_custom_resolve_debug_mode() != KK_CR_DEBUG_NONE ||
+       render->depth_att.resolve_mode == VK_RESOLVE_MODE_CUSTOM_BIT_EXT ||
+       render->stencil_att.resolve_mode == VK_RESOLVE_MODE_CUSTOM_BIT_EXT)
+      return false;
+   bool any = false;
+   for (uint32_t i = 0; i < render->color_att_count && i < KK_MAX_RTS; i++) {
+      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_CUSTOM_BIT_EXT)
+         continue;
+      const struct kk_image_view *iview = render->color_att[i].resolve_iview;
+      if (!iview || !iview->planes[0].storage_gpu_resource_id)
+         return false;
+      any = true;
+   }
+   return any;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+kk_CmdBeginCustomResolveEXT(
+   VkCommandBuffer commandBuffer,
+   UNUSED const VkBeginCustomResolveInfoEXT *pBeginCustomResolveInfo)
+{
+   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+
+   if (!kk_tile_resolve_can_start(cmd)) {
+      gfx->tile_resolve.possible = false;
+      kk_begin_custom_resolve_legacy(cmd);
+      return;
+   }
+
+   kk_seq_log(cmd, "begin custom resolve in tile memory");
+   struct kk_rendering_state *render = &gfx->render;
+   struct kk_descriptor_state *desc = &gfx->descriptors;
+   for (uint32_t i = 0; i < KK_MAX_RTS; i++) {
+      const struct kk_image_view *iview =
+         i < render->color_att_count &&
+               render->color_att[i].resolve_mode == VK_RESOLVE_MODE_CUSTOM_BIT_EXT
+            ? render->color_att[i].resolve_iview
+            : NULL;
+      desc->root.custom_resolve_outputs[i] =
+         iview ? iview->planes[0].storage_gpu_resource_id : 0;
+   }
+   desc->root_dirty = true;
+   gfx->tile_resolve.active = true;
+   gfx->tile_resolve.pending_split = false;
+}
+
+static bool
+kk_draw_prologue(struct kk_cmd_buffer *cmd)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+
+   if (gfx->tile_resolve.pending_split && !gfx->tile_resolve.active) {
+      gfx->tile_resolve.pending_split = false;
+      if (cmd->metal.render) {
+         kk_seq_log(cmd, "deferred barrier split");
+         kk_apply_attachment_store_ops(cmd, true);
+         cs_end(cmd);
+         gfx->restart_barrier = true;
+         cs_start_render(cmd);
+      }
+   }
+
+   if (!gfx->tile_resolve.active)
+      return false;
+
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   mtl_render_pipeline_state *tile =
+      vs ? kk_shader_get_tile_pipeline(kk_cmd_buffer_device(cmd), vs,
+                                       gfx->render.samples)
+         : NULL;
+   if (!tile) {
+      kk_seq_log(cmd, "no tile variant, custom resolve falls back");
+      gfx->tile_resolve.active = false;
+      gfx->tile_resolve.possible = false;
+      kk_begin_custom_resolve_legacy(cmd);
+      return false;
+   }
+
+   struct kk_descriptor_state *desc = &gfx->descriptors;
+   mtl_render_encoder *enc = cs_get_render(cmd);
+   if (desc->push_dirty)
+      kk_cmd_buffer_flush_push_descriptors(cmd, desc);
+   if (desc->root_dirty)
+      kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   if (desc->root.addr)
+      kk_cmd_bind_root_to_argument_table(cmd, desc->root.addr);
+   mtl_render_set_pipeline_state(enc, tile);
+   mtl_dispatch_threads_per_tile(enc, gfx->tile_resolve.tile_px,
+                                 gfx->tile_resolve.tile_px);
+   kk_seq_log(cmd, "tile resolve dispatch %ux%u", gfx->tile_resolve.tile_px,
+              gfx->tile_resolve.tile_px);
+   kk_cmd_buffer_dirty_all_gfx(cmd);
+   return true;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2272,6 +2414,8 @@ kk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "draw", vertexCount, instanceCount);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2307,6 +2451,8 @@ kk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "DrawMultiEXT", 0, 0);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2362,6 +2508,8 @@ kk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "draw indexed", indexCount, instanceCount);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2403,6 +2551,8 @@ kk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "DrawMultiIndexedEXT", 0, 0);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2461,6 +2611,8 @@ kk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "DrawIndirect2KHR", 0, 0);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2491,6 +2643,8 @@ kk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "DrawIndexedIndirect2KHR", 0, 0);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2524,6 +2678,8 @@ kk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "DrawIndirectCount2KHR", 0, 0);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -2556,6 +2712,8 @@ kk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
 
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    kk_seq_draw(cmd, "DrawIndexedIndirectCount2KHR", 0, 0);
+   if (kk_draw_prologue(cmd))
+      return;
 
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;

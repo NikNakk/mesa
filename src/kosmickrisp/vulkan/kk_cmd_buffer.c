@@ -20,6 +20,7 @@
 #include "kosmickrisp/bridge/mtl_command_buffer.h"
 #include "kosmickrisp/bridge/mtl_device.h"
 #include "kosmickrisp/bridge/mtl_encoder.h"
+#include "kosmickrisp/bridge/mtl_tile.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 
 #include "util/u_debug.h"
@@ -91,6 +92,9 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    if (cmd->metal.cmd_buf)
       kk_cmd_pool_return_cmd_buf(pool, cmd->metal.cmd_buf);
    cmd->metal.cmd_buf = NULL;
+   if (cmd->metal.head)
+      kk_cmd_pool_return_cmd_buf(pool, cmd->metal.head);
+   cmd->metal.head = NULL;
 
    mtl_release(cmd->argument_table);
 
@@ -175,6 +179,10 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
 
    memset(&cmd->state, 0, sizeof(cmd->state));
    cmd->uses_heap = false;
+   if (cmd->metal.head)
+      kk_cmd_pool_return_cmd_buf(kk_cmd_buffer_pool(cmd), cmd->metal.head);
+   cmd->metal.head = NULL;
+   cmd->metal.tail_used = false;
 }
 
 static void
@@ -266,6 +274,36 @@ kk_encoder_update_debug(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
 
 static void kk_encoder_stat(const char *what, bool broke_render);
 
+static void
+kk_stitch_violation(struct kk_cmd_buffer *cmd, const char *why)
+{
+   static uint32_t logged;
+   if (!cmd->state.gfx.stitch.violation && logged++ < 16)
+      mesa_logw("kk: render pass stitching rule broken: %s", why);
+   cmd->state.gfx.stitch.violation = true;
+}
+
+static void
+kk_stitch_note_encoder(struct kk_cmd_buffer *cmd, uint32_t options)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->stitch.suspended_open)
+      kk_stitch_violation(cmd, "encoder after a suspending render pass");
+   if (options & MTL_RENDER_ENCODER_RESUMING) {
+      if (gfx->stitch.encoders)
+         kk_stitch_violation(cmd, "resuming render pass is not the first encoder");
+      gfx->stitch.starts_resumed = true;
+   }
+   if ((options & MTL_RENDER_ENCODER_SUSPENDING) &&
+       !(options & MTL_RENDER_ENCODER_RESUMING) && gfx->stitch.starts_resumed)
+      kk_stitch_violation(cmd, "suspending render pass after a resumed one");
+   if (options & MTL_RENDER_ENCODER_SUSPENDING) {
+      gfx->stitch.suspended_open = true;
+      gfx->stitch.ends_suspended = true;
+   }
+   gfx->stitch.encoders++;
+}
+
 static bool
 kk_label_passes(void)
 {
@@ -318,12 +356,36 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    /* Ensure no other active encoder, aka compute */
    cs_end(cmd);
 
-   cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
-      cmd->metal.cmd_buf, state->render_pass_descriptor);
+   uint32_t options = 0;
+   if (KK_EXPERIMENTAL(STITCH_PASSES)) {
+      if ((state->render.flags & VK_RENDERING_RESUMING_BIT) &&
+          state->render.encoders == 0 && !state->in_custom_resolve)
+         options |= MTL_RENDER_ENCODER_RESUMING;
+      if ((state->render.flags & VK_RENDERING_SUSPENDING_BIT) &&
+          !state->in_custom_resolve)
+         options |= MTL_RENDER_ENCODER_SUSPENDING;
+      kk_stitch_note_encoder(cmd, options);
+   }
+   state->render.encoders++;
+   state->render.suspending_encoder = options & MTL_RENDER_ENCODER_SUSPENDING;
+   state->render.resuming_encoder = options & MTL_RENDER_ENCODER_RESUMING;
+   if (cmd->metal.head)
+      cmd->metal.tail_used = true;
+
+   if (KK_EXPERIMENTAL(STITCH_PASSES))
+      mtl_render_pass_descriptor_set_visibility_accumulate(
+         state->render_pass_descriptor, options != 0);
+   cmd->metal.render =
+      options ? mtl_new_render_command_encoder_with_options(
+                   cmd->metal.cmd_buf, state->render_pass_descriptor, options)
+              : mtl_new_render_command_encoder_with_descriptor(
+                   cmd->metal.cmd_buf, state->render_pass_descriptor);
    if (KK_EXPERIMENTAL(LIGHT_BARRIERS)) {
       uint32_t src = state->pending_barrier_src, dst = state->pending_barrier_dst;
       if (state->restart_barrier)
          src = dst = MTL_STAGE_ALL;
+      if (options & MTL_RENDER_ENCODER_RESUMING)
+         src = dst = 0;
       if (src && dst)
          mtl_barrier_after_queue_stages(cmd->metal.render, src, dst);
       state->pending_barrier_src = 0;
@@ -353,7 +415,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    /* Argument table won't ever change */
    mtl_render_set_argument_table(
       cmd->metal.render, cmd->argument_table,
-      MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_FRAGMENT);
+      MTL_RENDER_STAGE_VERTEX | MTL_RENDER_STAGE_FRAGMENT |
+         (cmd->state.gfx.tile_resolve.possible ? MTL_RENDER_STAGE_TILE : 0));
 
    kk_cmd_buffer_dirty_all_gfx(cmd);
 }
@@ -423,6 +486,10 @@ cs_get_compute_from(struct kk_cmd_buffer *cmd, const char *caller)
    }
 
    if (cmd->metal.compute == NULL) {
+      if (KK_EXPERIMENTAL(STITCH_PASSES))
+         kk_stitch_note_encoder(cmd, 0);
+      if (cmd->metal.head)
+         cmd->metal.tail_used = true;
       cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
       if (KK_EXPERIMENTAL(LIGHT_BARRIERS)) {
          mtl_barrier_after_queue_stages(cmd->metal.compute, MTL_STAGE_ALL,
@@ -482,6 +549,16 @@ cs_end(struct kk_cmd_buffer *cmd)
    if (cmd->metal.render) {
       end_encoder(cmd, cmd->metal.render);
       cmd->metal.render = NULL;
+
+      if (cmd->state.gfx.render.resuming_encoder &&
+          !cmd->state.gfx.render.suspending_encoder && cmd->metal.head == NULL &&
+          cmd->metal.allocator) {
+         cmd->state.gfx.render.resuming_encoder = false;
+         mtl_end_command_buffer(cmd->metal.cmd_buf);
+         cmd->metal.head = cmd->metal.cmd_buf;
+         cmd->metal.cmd_buf = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
+         mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
+      }
 
       /* The stage map is only valid for the current render encoder */
       util_dynarray_clear(&cmd->ts_stage_map);
@@ -700,6 +777,24 @@ kk_accumulate_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
    }
 }
 
+static bool
+kk_barrier_dst_is_fragment_only(const VkDependencyInfo *dep)
+{
+   const VkPipelineStageFlags2 fragment =
+      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+   VkPipelineStageFlags2 dst = 0;
+   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++)
+      dst |= dep->pMemoryBarriers[i].dstStageMask;
+   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++)
+      dst |= dep->pBufferMemoryBarriers[i].dstStageMask;
+   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++)
+      dst |= dep->pImageMemoryBarriers[i].dstStageMask;
+   return dst && !(dst & ~fragment);
+}
+
 void
 kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
 {
@@ -709,6 +804,13 @@ kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
        * break the render pass. See comment in kk_barrier_requires_encoder_split
        */
       const bool required = kk_barrier_requires_encoder_split(cmd, dep);
+      if (cmd->state.gfx.tile_resolve.possible && !cmd->state.gfx.tile_resolve.active &&
+          (dep->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) &&
+          kk_barrier_dst_is_fragment_only(dep)) {
+         kk_seq_log(cmd, "barrier in pass deferred");
+         cmd->state.gfx.tile_resolve.pending_split = true;
+         return;
+      }
       if (cmd->state.gfx.seq_log) {
          VkPipelineStageFlags2 ss = 0, ds = 0;
          VkAccessFlags2 sa = 0, da = 0;
@@ -1206,6 +1308,7 @@ kk_get_attachment_store_op(const struct kk_attachment *attachment,
 void
 kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
 {
+   const bool force_store_in = force_store;
    if (!cmd->metal.render)
       return;
 
@@ -1213,6 +1316,21 @@ kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
    mtl_render_encoder *encoder = cs_get_render(cmd);
 
    force_store |= render->force_attachment_store;
+
+   if (render->suspending_encoder && !force_store_in &&
+       !cmd->state.gfx.stitch.violation) {
+      for (uint32_t i = 0; i < render->color_att_count; i++) {
+         uint32_t logical_index = cmd->state.gfx.render.color_map[i];
+         if (render->color_att[i].iview && logical_index != MESA_VK_ATTACHMENT_UNUSED)
+            mtl_render_set_color_store_action(encoder, MTL_STORE_ACTION_DONT_CARE,
+                                              logical_index);
+      }
+      if (render->depth_att.iview)
+         mtl_render_set_depth_store_action(encoder, MTL_STORE_ACTION_DONT_CARE);
+      if (render->stencil_att.iview)
+         mtl_render_set_stencil_store_action(encoder, MTL_STORE_ACTION_DONT_CARE);
+      return;
+   }
 
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       uint32_t logical_index = cmd->state.gfx.render.color_map[i];
@@ -1222,6 +1340,12 @@ kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
          enum mtl_store_action store_action = kk_get_attachment_store_op(
             &render->color_att[i], force_store,
             render->rendering_to_whole_framebuffer, VK_IMAGE_ASPECT_COLOR_BIT);
+         if (cmd->state.gfx.tile_resolve.active &&
+             render->color_att[i].resolve_mode == VK_RESOLVE_MODE_CUSTOM_BIT_EXT &&
+             render->color_att[i].store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE &&
+             (render->color_att[i].iview->vk.image->usage &
+              VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT))
+            store_action = MTL_STORE_ACTION_DONT_CARE;
 
          mtl_render_set_color_store_action(encoder, store_action,
                                            logical_index);

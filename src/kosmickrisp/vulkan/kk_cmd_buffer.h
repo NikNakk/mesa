@@ -64,6 +64,7 @@ struct kk_root_descriptor_table {
    uint64_t custom_resolve_inputs[KK_MAX_RTS + 2];
 
    uint64_t fdm_rate_params;
+   uint64_t custom_resolve_outputs[KK_MAX_RTS];
 };
 
 struct kk_descriptor_state {
@@ -130,6 +131,9 @@ struct kk_rendering_state {
    uint32_t sample_locations_count;
    VkSampleLocationEXT sample_locations[KK_MAX_SAMPLES];
    bool force_attachment_store;
+   uint32_t encoders;
+   bool suspending_encoder;
+   bool resuming_encoder;
    bool rendering_to_whole_framebuffer;
 };
 
@@ -173,6 +177,19 @@ struct kk_graphics_state {
    } custom_resolve_debug;
    bool seq_log;
    bool in_custom_resolve;
+   struct {
+      uint32_t encoders;
+      bool starts_resumed;
+      bool ends_suspended;
+      bool suspended_open;
+      bool violation;
+   } stitch;
+   struct {
+      bool possible;
+      bool active;
+      bool pending_split;
+      uint32_t tile_px;
+   } tile_resolve;
 
    struct {
       enum mtl_visibility_result_mode mode;
@@ -252,6 +269,8 @@ struct kk_cmd_buffer {
       mtl_command_buffer *cmd_buf;
       mtl_render_encoder *render;
       mtl_compute_encoder *compute;
+      mtl_command_buffer *head;
+      bool tail_used;
    } metal;
    /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;

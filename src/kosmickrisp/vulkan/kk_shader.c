@@ -18,6 +18,8 @@
 #include "kk_sampler.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
+#include "kosmickrisp/bridge/mtl_tile.h"
+#include "util/simple_mtx.h"
 #include "kosmickrisp/bridge/ns_process_info.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
 #include "kosmickrisp/compiler/nir_to_msl.h"
@@ -772,6 +774,7 @@ kk_lower_custom_resolve_input(nir_builder *b, nir_tex_instr *tex, void *data)
    int slot = kk_custom_resolve_input_slot(ial, ia_index);
    if (slot < 0)
       return false;
+   tex->backend_flags = slot + 1;
 
    b->cursor = nir_before_instr(&tex->instr);
    nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
@@ -1000,6 +1003,11 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
          mtl_release(pipe->gfx.ds_handle);
       pipe->gfx.render = NULL;
       pipe->gfx.ds_handle = NULL;
+      for (uint32_t i = 0; i < ARRAY_SIZE(pipe->gfx.tile); i++) {
+         if (pipe->gfx.tile[i])
+            mtl_release(pipe->gfx.tile[i]);
+         pipe->gfx.tile[i] = NULL;
+      }
 
       for (uint32_t i = 0u; i < pipe->gfx.pre_render_count; ++i)
          mtl_release(pipe->gfx.pre_render[i]);
@@ -1015,6 +1023,8 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
    struct msl_compile_data *data = &shader->msl_data[shader->info.stage];
    ralloc_free((void *)data->entrypoint_name);
    ralloc_free((void *)data->code);
+   ralloc_free((void *)shader->tile_msl.entrypoint_name);
+   ralloc_free((void *)shader->tile_msl.code);
 
    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
 }
@@ -1133,6 +1143,123 @@ kk_nir_lower_vertex_id_zero_base(struct nir_shader *nir)
    return progress;
 }
 
+
+struct kk_tile_lower_state {
+   bool ok;
+   bool reads;
+};
+
+static bool
+kk_tile_lower_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct kk_tile_lower_state *st = data;
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (!tex->backend_flags)
+         return false;
+      unsigned slot = tex->backend_flags - 1;
+      if (slot >= KK_MAX_RTS || tex->def.bit_size != 32 ||
+          (tex->op != nir_texop_txf_ms && tex->op != nir_texop_txf)) {
+         st->ok = false;
+         return false;
+      }
+      b->cursor = nir_before_instr(instr);
+      int si = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+      nir_def *sample = si >= 0 ? tex->src[si].src.ssa : nir_imm_int(b, 0);
+      nir_def *v = nir_load_imageblock_sample_kk(b, sample, .base = slot,
+                                                 .dest_type = tex->dest_type);
+      nir_def_replace(&tex->def, nir_trim_vector(b, v, tex->def.num_components));
+      st->reads = true;
+      return true;
+   }
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_output:
+      if (nir_intrinsic_io_semantics(intr).location < FRAG_RESULT_DATA0)
+         st->ok = false;
+      return false;
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_load_interpolated_input:
+   case nir_intrinsic_load_barycentric_pixel:
+   case nir_intrinsic_load_barycentric_centroid:
+   case nir_intrinsic_load_barycentric_sample:
+   case nir_intrinsic_load_barycentric_at_sample:
+   case nir_intrinsic_load_barycentric_at_offset:
+   case nir_intrinsic_load_sample_id:
+   case nir_intrinsic_load_sample_mask_in:
+   case nir_intrinsic_load_sample_pos:
+   case nir_intrinsic_load_sample_pos_from_id:
+   case nir_intrinsic_load_front_face:
+   case nir_intrinsic_load_point_coord:
+   case nir_intrinsic_load_primitive_id:
+   case nir_intrinsic_load_helper_invocation:
+   case nir_intrinsic_is_helper_invocation:
+   case nir_intrinsic_demote:
+   case nir_intrinsic_demote_if:
+   case nir_intrinsic_terminate:
+   case nir_intrinsic_terminate_if:
+      st->ok = false;
+      return false;
+   default:
+      return false;
+   }
+}
+
+static void
+kk_compile_tile_variant(struct kk_physical_device *pdev, struct kk_shader *shader,
+                        nir_shader *nir,
+                        const struct vk_graphics_pipeline_state *state)
+{
+   nir_shader *tile = nir_shader_clone(NULL, nir);
+   struct kk_tile_lower_state st = {.ok = true};
+   nir_shader_instructions_pass(tile, kk_tile_lower_instr,
+                                nir_metadata_control_flow, &st);
+   if (!st.ok || !st.reads) {
+      ralloc_free(tile);
+      return;
+   }
+   NIR_PASS(_, tile, nir_opt_dce);
+   nir_shader_gather_info(tile, nir_shader_get_entrypoint(tile));
+   msl_optimize_nir(tile);
+   modify_nir_info(tile);
+
+   struct nir_to_msl_options options = {
+      .disabled_workarounds = pdev->settings.disabled_workarounds,
+      .tile_function = true,
+      .tile_outputs_offset =
+         offsetof(struct kk_root_descriptor_table, custom_resolve_outputs),
+   };
+   for (uint32_t i = 0u; i < MAX_DRAW_BUFFERS; ++i)
+      options.rts_component_count[i] = 4;
+   for (uint32_t i = 0u; i < state->rp->color_attachment_count; ++i) {
+      uint8_t logical_index = kk_get_logical_color_att_index(state, i);
+      if (logical_index == MESA_VK_ATTACHMENT_UNUSED)
+         continue;
+      enum pipe_format format =
+         vk_format_to_pipe_format(state->rp->color_attachment_formats[i]);
+      if (format == PIPE_FORMAT_NONE)
+         continue;
+      options.rts_component_count[logical_index] =
+         util_format_get_nr_components(format);
+      options.tile_rt_kind[logical_index] = util_format_is_pure_uint(format)   ? 2
+                                            : util_format_is_pure_sint(format) ? 3
+                                                                               : 1;
+   }
+
+   shader->tile_msl.code = nir_to_msl(tile, &options);
+   const char *entrypoint_name = nir_shader_get_entrypoint(tile)->function->name;
+   shader->tile_msl.entrypoint_name = ralloc_strdup(NULL, entrypoint_name);
+   shader->info.has_tile = true;
+   if (KK_DEBUG(MSL))
+      mesa_logi("%s\n", shader->tile_msl.code);
+   ralloc_free(tile);
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
@@ -1219,6 +1346,10 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
    }
 
    NIR_PASS(_, nir, kk_nir_lower_poly);
+
+   if (stage == MESA_SHADER_FRAGMENT && KK_EXPERIMENTAL(TILE_RESOLVE) && state &&
+       state->rp && state->rp->custom_resolve)
+      kk_compile_tile_variant(pdev, shader, nir, state);
 
    msl_optimize_nir(nir);
    modify_nir_info(nir);
@@ -1556,6 +1687,13 @@ gather_graphics_pipeline_create_info(
 
       info->vs.additional_stages_bits |= BITFIELD_BIT(stage);
 
+      if (s->info.has_tile) {
+         vs->tile_msl.code = ralloc_strdup(NULL, s->tile_msl.code);
+         vs->tile_msl.entrypoint_name =
+            ralloc_strdup(NULL, s->tile_msl.entrypoint_name);
+         info->has_tile = true;
+      }
+
       if (s->info.stage == MESA_SHADER_TESS_CTRL)
          info->vs.tess_local_thread_size = s->info.tess.tcs_output_patch_size;
    }
@@ -1581,6 +1719,39 @@ gather_graphics_pipeline_create_info(
 
    info->vs.topology =
       vk_primitive_topology_to_mtl_primitive_topology_class(topology);
+}
+
+mtl_render_pipeline_state *
+kk_shader_get_tile_pipeline(struct kk_device *device, struct kk_shader *vs,
+                            uint32_t samples)
+{
+   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
+   struct kk_physical_device *pdev = kk_device_physical(device);
+   uint32_t index = util_logbase2(samples);
+   if (!vs->info.has_tile || !vs->tile_msl.code ||
+       index >= ARRAY_SIZE(vs->pipeline.gfx.tile))
+      return NULL;
+
+   simple_mtx_lock(&lock);
+   mtl_render_pipeline_state *pipeline = vs->pipeline.gfx.tile[index];
+   if (pipeline == NULL) {
+      mtl_library *library = mtl_new_library(
+         device->mtl_compiler_handle, vs->tile_msl.code, pdev->info.msl_version,
+         MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+      if (library) {
+         mtl_function_descriptor *function =
+            mtl_new_library_function_descriptor(library,
+                                                vs->tile_msl.entrypoint_name);
+         pipeline = mtl_new_tile_render_pipeline(
+            device->mtl_compiler_handle, function, samples,
+            vs->info.vs.rt_formats, MAX_DRAW_BUFFERS);
+         mtl_release(function);
+         mtl_release(library);
+      }
+      vs->pipeline.gfx.tile[index] = pipeline;
+   }
+   simple_mtx_unlock(&lock);
+   return pipeline;
 }
 
 static VkResult
@@ -1673,6 +1844,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
       mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
    if (pipe->gfx.render == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
+
 
    mtl_release(pipeline_descriptor);
    mtl_release(fragment_function);
@@ -1812,6 +1984,17 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
 }
 
 static void
+kk_msl_data_serialize(struct msl_compile_data *data, struct blob *blob)
+{
+   uint32_t entrypoint_length = strlen(data->entrypoint_name) + 1;
+   uint32_t code_length = strlen(data->code) + 1;
+   blob_write_uint32(blob, entrypoint_length);
+   blob_write_uint32(blob, code_length);
+   blob_write_bytes(blob, data->entrypoint_name, entrypoint_length);
+   blob_write_bytes(blob, data->code, code_length);
+}
+
+static void
 kk_msl_serialize(struct kk_shader *shader, mesa_shader_stage stage,
                  struct blob *blob)
 {
@@ -1837,8 +2020,24 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
          kk_msl_serialize(shader, stage, blob);
       }
    }
+   if (shader->info.has_tile)
+      kk_msl_data_serialize(&shader->tile_msl, blob);
 
    return !blob->out_of_memory;
+}
+
+static VkResult
+kk_msl_data_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
+{
+   const uint32_t entrypoint_length = blob_read_uint32(blob);
+   const uint32_t code_length = blob_read_uint32(blob);
+   data->entrypoint_name = ralloc_array(NULL, char, entrypoint_length);
+   data->code = ralloc_array(NULL, char, code_length);
+   if (data->entrypoint_name == NULL || data->code == NULL)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   blob_copy_bytes(blob, (void *)data->entrypoint_name, entrypoint_length);
+   blob_copy_bytes(blob, (void *)data->code, code_length);
+   return blob->overrun ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT : VK_SUCCESS;
 }
 
 static VkResult
@@ -1895,6 +2094,11 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
          if (result != VK_SUCCESS)
             goto fail;
       }
+   }
+   if (shader->info.has_tile) {
+      result = kk_msl_data_deserialize(blob, &shader->tile_msl);
+      if (result != VK_SUCCESS)
+         goto fail;
    }
 
    if (info.stage == MESA_SHADER_COMPUTE) {

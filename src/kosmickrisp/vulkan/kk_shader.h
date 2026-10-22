@@ -47,6 +47,7 @@ kk_tess_info_merge(struct kk_tess_info a, struct kk_tess_info b)
 
 struct kk_shader_info {
    mesa_shader_stage stage;
+   bool has_tile;
    bool uses_per_draw_data;
 
    /* Required for fragment shader cull distance discards. */
@@ -117,6 +118,7 @@ struct kk_pipeline_handles {
          /* Vertex, tess ctrl and tess eval at most needed before pre-render. */
          mtl_compute_pipeline_state *pre_render[3];
          mtl_depth_stencil_state *ds_handle;
+         mtl_render_pipeline_state *tile[5];
          uint32_t pre_render_count;
       } gfx;
       mtl_compute_pipeline_state *cs;
@@ -134,12 +136,18 @@ struct kk_shader {
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;
    struct msl_compile_data msl_data[MESA_SHADER_STAGES];
+   struct msl_compile_data tile_msl;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,
                                VK_OBJECT_TYPE_SHADER_EXT);
 
 extern const struct vk_device_shader_ops kk_device_shader_ops;
+
+struct kk_device;
+mtl_render_pipeline_state *kk_shader_get_tile_pipeline(struct kk_device *device,
+                                                       struct kk_shader *vs,
+                                                       uint32_t samples);
 
 static inline nir_address_format
 kk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)

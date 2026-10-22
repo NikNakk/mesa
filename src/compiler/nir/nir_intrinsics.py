@@ -3334,6 +3334,9 @@ intrinsic("rate_map_physical_to_screen_kk", src_comp=[1, 2, 1], dest_comp=2,
           flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
 intrinsic("rate_map_screen_to_physical_kk", src_comp=[1, 2, 1], dest_comp=2,
           flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
+intrinsic("load_imageblock_sample_kk", src_comp=[1], dest_comp=4,
+          indices=[BASE, DEST_TYPE], flags=[CAN_ELIMINATE, CAN_REORDER],
+          bit_sizes=[32])
 # Load a bindless sampler handle mapping a binding table sampler.
 intrinsic("load_sampler_handle_kk", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],

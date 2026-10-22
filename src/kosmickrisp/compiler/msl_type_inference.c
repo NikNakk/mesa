@@ -388,6 +388,15 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->src[2], TYPE_UINT);
       set_type(types, &instr->def, TYPE_FLOAT);
       break;
+   case nir_intrinsic_load_imageblock_sample_kk: {
+      nir_alu_type t = nir_alu_type_get_base_type(nir_intrinsic_dest_type(instr));
+      set_type(types, &instr->src[0], TYPE_UINT);
+      set_type(types, &instr->def,
+               t == nir_type_float ? TYPE_FLOAT
+               : t == nir_type_int ? TYPE_INT
+                                   : TYPE_UINT);
+      break;
+   }
    // The defs of these instructions don't participate in type inference
    // but their sources are pointers (i.e. uints).
    case nir_intrinsic_load_texture_handle_kk:

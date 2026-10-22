@@ -308,12 +308,22 @@ fs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
            depth_layout_arg[depth_layout]);
       } else {
          // TODO: scalarized fs outputs
-         P(ctx, "%s [[%s]];\n", FS_OUTPUT_NAME[location],
-           FS_OUTPUT_SEMANTIC[location]);
+         if (ctx->tile_function) {
+            P(ctx, "%s;\n", FS_OUTPUT_NAME[location]);
+         } else {
+            P(ctx, "%s [[%s]];\n", FS_OUTPUT_NAME[location],
+              FS_OUTPUT_SEMANTIC[location]);
+         }
       }
    }
    ctx->indentlevel--;
    P_IND(ctx, "};\n")
+}
+
+const char *
+msl_fs_output_name(unsigned location)
+{
+   return FS_OUTPUT_NAME[location];
 }
 
 struct gather_ctx {
@@ -435,8 +445,17 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
       vs_output_block(shader, ctx);
       break;
    case MESA_SHADER_FRAGMENT:
-      fs_input_block(shader, ctx);
+      if (!ctx->tile_function)
+         fs_input_block(shader, ctx);
       fs_output_block(shader, ctx);
+      if (ctx->tile_function) {
+         static const char *kinds[] = {NULL, "float4", "uint4", "int4"};
+         P(ctx, "struct KKTileBlock {\n");
+         for (uint32_t i = 0; i < MAX_DRAW_BUFFERS; i++)
+            if (ctx->tile_rt_kind[i])
+               P(ctx, "    %s c%u [[color(%u)]];\n", kinds[ctx->tile_rt_kind[i]], i, i);
+         P(ctx, "};\n");
+      }
       break;
    case MESA_SHADER_COMPUTE:
    case MESA_SHADER_TESS_CTRL:
