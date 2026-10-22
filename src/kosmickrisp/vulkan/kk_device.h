@@ -9,6 +9,7 @@
 #define KK_DEVICE_H 1
 
 #include "kk_private.h"
+#include "util/u_queue.h"
 
 #include "kk_query_table.h"
 #include "kk_queue.h"
@@ -97,6 +98,10 @@ struct kk_device {
       simple_mtx_t mutex;
       struct util_dynarray free;
    } stitch_allocators;
+
+   /* Builds Metal render pipelines in the background with async_pipelines. */
+   struct util_queue pipeline_queue;
+   bool has_pipeline_queue;
 
    struct kk_precompiled_cache precompiled_cache;
 

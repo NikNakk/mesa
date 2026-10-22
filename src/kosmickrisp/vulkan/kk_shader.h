@@ -10,6 +10,7 @@
 
 #include "kk_device_memory.h"
 #include "kk_private.h"
+#include "util/u_queue.h"
 
 #include "kosmickrisp/bridge/mtl_format.h"
 
@@ -126,6 +127,10 @@ struct kk_pipeline_handles {
             mtl_render_pipeline_state *render;
          } masked[4];
          uint32_t render_stage;
+         /* With async_pipelines, render is built in the background and
+          * published before ready is signalled. */
+         struct util_queue_fence ready;
+         bool async;
          uint32_t pre_render_count;
       } gfx;
       mtl_compute_pipeline_state *cs;
@@ -156,6 +161,14 @@ mtl_render_pipeline_state *kk_shader_get_tile_pipeline(struct kk_device *device,
                                                        struct kk_shader *vs,
                                                        uint32_t samples);
 void kk_compile_log(const char *what, int64_t start_ns);
+
+/* Marks the calling thread as creating driver-internal pipelines, which are
+ * always compiled synchronously. Nests. */
+void kk_shader_set_sync_compiles(bool sync);
+
+/* Whether the vertex shader object's render pipeline can be used, waiting a
+ * short time for a background build. */
+bool kk_shader_pipeline_ready(struct kk_shader *vs);
 
 mtl_render_pipeline_state *
 kk_shader_get_masked_pipeline(struct kk_device *device, struct kk_shader *vs,

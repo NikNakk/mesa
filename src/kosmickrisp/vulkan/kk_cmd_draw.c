@@ -1149,6 +1149,12 @@ kk_draw_prologue(struct kk_cmd_buffer *cmd)
 {
    struct kk_graphics_state *gfx = &cmd->state.gfx;
 
+   struct kk_shader *pipeline_vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (pipeline_vs && !kk_shader_pipeline_ready(pipeline_vs)) {
+      kk_encoder_stat("draw skipped, pipeline still compiling", false);
+      return true;
+   }
+
    const struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
    bool fetch_only = KK_EXPERIMENTAL(MS_INPUT_FETCH) &&
                      (!fs || !fs->info.fs.reads_ms_texture);

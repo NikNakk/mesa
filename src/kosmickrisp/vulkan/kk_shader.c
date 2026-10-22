@@ -1007,7 +1007,11 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
       pipe->gfx.pre_render_count = 0u;
 
       /* Graphics pipeline. */
-      mtl_release(pipe->gfx.render);
+      if (pipe->gfx.async)
+         util_queue_fence_wait(&pipe->gfx.ready);
+      util_queue_fence_destroy(&pipe->gfx.ready);
+      if (pipe->gfx.render)
+         mtl_release(pipe->gfx.render);
       if (pipe->gfx.ds_handle)
          mtl_release(pipe->gfx.ds_handle);
       pipe->gfx.render = NULL;
@@ -1964,6 +1968,45 @@ kk_shader_get_masked_pipeline(struct kk_device *device, struct kk_shader *vs,
    return pipeline;
 }
 
+static __thread int kk_sync_compiles;
+
+void
+kk_shader_set_sync_compiles(bool sync)
+{
+   kk_sync_compiles += sync ? 1 : -1;
+   assert(kk_sync_compiles >= 0);
+}
+
+static void
+kk_build_render_pipeline_job(void *data, void *gdata, int thread_index)
+{
+   struct kk_shader *vs = data;
+   struct kk_device *device =
+      container_of(vs->vk.base.device, struct kk_device, vk);
+   int64_t start_ns = os_time_get_nano();
+   mtl_render_pipeline_state *render = kk_build_render_pipeline(
+      device, vs, vs->pipeline.gfx.render_stage, UINT32_MAX);
+   kk_compile_log("metal render pipeline (background)", start_ns);
+   if (render == NULL)
+      mesa_loge("kk: background render pipeline build failed");
+   p_atomic_set(&vs->pipeline.gfx.render, render);
+}
+
+bool
+kk_shader_pipeline_ready(struct kk_shader *vs)
+{
+   struct kk_pipeline_handles *pipe = &vs->pipeline;
+   if (pipe->gfx.async && !util_queue_fence_is_signalled(&pipe->gfx.ready)) {
+      static int64_t wait_ns = -1;
+      if (wait_ns < 0)
+         wait_ns = debug_get_num_option("KK_ASYNC_PIPELINE_WAIT_MS", 2) * 1000000ll;
+      if (!util_queue_fence_wait_timeout(&pipe->gfx.ready,
+                                         os_time_get_nano() + wait_ns))
+         return false;
+   }
+   return p_atomic_read(&pipe->gfx.render) != NULL;
+}
+
 static VkResult
 kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
 {
@@ -1994,6 +2037,15 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
    pipe->gfx.render_stage = vs_stage;
    if (vs->info.vs.has_ds)
       pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
+   util_queue_fence_init(&pipe->gfx.ready);
+
+   if (device->has_pipeline_queue && kk_sync_compiles == 0) {
+      pipe->gfx.async = true;
+      util_queue_add_job(&device->pipeline_queue, vs, &pipe->gfx.ready,
+                         kk_build_render_pipeline_job, NULL, 0);
+      return VK_SUCCESS;
+   }
+
    int64_t start_ns = os_time_get_nano();
    pipe->gfx.render = kk_build_render_pipeline(device, vs, vs_stage, UINT32_MAX);
    kk_compile_log("metal render pipeline", start_ns);
