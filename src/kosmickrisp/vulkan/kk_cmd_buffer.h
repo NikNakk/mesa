@@ -111,6 +111,10 @@ struct kk_attachment {
    VkAttachmentLoadOp load_op;
    VkAttachmentStoreOp store_op;
    VkClearValue clear_value;
+
+   /* Resolve in the render pass even though it does not cover the whole
+    * framebuffer or is a depth/stencil resolve. */
+   bool resolve_in_pass;
 };
 
 struct kk_rendering_state {
@@ -186,6 +190,7 @@ struct kk_graphics_state {
    bool in_custom_resolve;
    struct {
       const struct kk_image_view *view;
+      const struct kk_image_view *depth_view;
       VkRect2D area;
    } dump;
    struct {

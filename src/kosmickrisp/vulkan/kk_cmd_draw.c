@@ -395,6 +395,14 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    render->stitch = KK_EXPERIMENTAL(STITCH_PASSES) && !cmd->no_stitch &&
                     (render->flags & (VK_RENDERING_RESUMING_BIT |
                                       VK_RENDERING_SUSPENDING_BIT));
+
+   /* A stitched pass is followed by a queue wait, which also orders its
+    * depth/stencil resolves. The render target size is the area, so with no
+    * offset the resolve covers exactly the area. */
+   bool ds_in_pass = KK_EXPERIMENTAL(DS_RESOLVE) && render->stitch &&
+                     render->area.offset.x == 0 && render->area.offset.y == 0;
+   render->depth_att.resolve_in_pass = ds_in_pass;
+   render->stencil_att.resolve_in_pass = ds_in_pass;
    bool force_attachment_load =
       !is_whole_framebuffer ||
       ((render->flags & VK_RENDERING_RESUMING_BIT) && !render->stitch);
@@ -678,31 +686,17 @@ kk_dump_thread(void *data)
 }
 
 static void
-kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
+kk_dump_view(struct kk_cmd_buffer *cmd, const char *dir, const char *name,
+             uint32_t index, const struct kk_image_view *view, VkRect2D area,
+             bool depth)
 {
-   static const char *dir;
-   static int64_t first = -1, step, count;
-   static uint32_t seen;
-   if (first < 0) {
-      dir = debug_get_option("KK_DUMP_RESOLVE_DIR", NULL);
-      first = debug_get_num_option("KK_DUMP_RESOLVE_FIRST", 600);
-      step = MAX2(debug_get_num_option("KK_DUMP_RESOLVE_STEP", 600), 1);
-      count = debug_get_num_option("KK_DUMP_RESOLVE_COUNT", 4);
-   }
-   const struct kk_image_view *view = cmd->state.gfx.dump.view;
-   cmd->state.gfx.dump.view = NULL;
-   if (!dir || !view)
-      return;
-
-   uint32_t index = p_atomic_inc_return(&seen) - 1;
-   if (index < first || (index - first) % step || (index - first) / step >= count)
-      return;
-
    struct kk_image *image = container_of(view->vk.image, struct kk_image, vk);
    const struct kk_image_plane *plane = &image->planes[0];
-   VkRect2D area = cmd->state.gfx.dump.area;
    uint32_t width = area.extent.width, height = area.extent.height;
-   uint32_t bpp = util_format_get_blocksize(plane->layout.format.pipe);
+   enum pipe_format format = plane->layout.format.pipe;
+   if (depth)
+      format = util_format_get_depth_only(format);
+   uint32_t bpp = util_format_get_blocksize(format);
    uint32_t layers = view->vk.layer_count;
    uint64_t size = (uint64_t)width * height * bpp * layers;
 
@@ -715,12 +709,12 @@ kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
       return;
    }
    memset((char *)dump->bo->cpu + size, 0, 4);
-   snprintf(dump->path, sizeof(dump->path), "%s/resolve-%05u.kkdump", dir, index);
+   snprintf(dump->path, sizeof(dump->path), "%s/%s-%05u.kkdump", dir, name, index);
    dump->width = width;
    dump->height = height;
    dump->layers = layers;
    dump->bytes_per_pixel = bpp;
-   dump->format = view->vk.format;
+   dump->format = depth ? VK_FORMAT_D32_SFLOAT : view->vk.format;
 
    mtl_compute_encoder *enc = cs_get_compute(cmd);
    for (uint32_t l = 0; l < layers; l++) {
@@ -734,6 +728,8 @@ kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
          .buffer_2d_image_size_B = (size_t)width * height * bpp,
          .image_slice = view->vk.base_array_layer + l,
          .image_level = view->vk.base_mip_level,
+         .options = depth ? MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL
+                          : MTL_BLIT_OPTION_NONE,
       };
       mtl_copy_from_texture_to_buffer(enc, &copy);
    }
@@ -743,6 +739,35 @@ kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
    thrd_t thread;
    if (thrd_create(&thread, kk_dump_thread, dump) == thrd_success)
       thrd_detach(thread);
+}
+
+static void
+kk_dump_custom_resolve(struct kk_cmd_buffer *cmd)
+{
+   static const char *dir;
+   static int64_t first = -1, step, count;
+   static uint32_t seen;
+   if (first < 0) {
+      dir = debug_get_option("KK_DUMP_RESOLVE_DIR", NULL);
+      first = debug_get_num_option("KK_DUMP_RESOLVE_FIRST", 600);
+      step = MAX2(debug_get_num_option("KK_DUMP_RESOLVE_STEP", 600), 1);
+      count = debug_get_num_option("KK_DUMP_RESOLVE_COUNT", 4);
+   }
+   const struct kk_image_view *view = cmd->state.gfx.dump.view;
+   const struct kk_image_view *depth_view = cmd->state.gfx.dump.depth_view;
+   cmd->state.gfx.dump.view = NULL;
+   cmd->state.gfx.dump.depth_view = NULL;
+   if (!dir || !view)
+      return;
+
+   uint32_t index = p_atomic_inc_return(&seen) - 1;
+   if (index < first || (index - first) % step || (index - first) / step >= count)
+      return;
+
+   kk_dump_view(cmd, dir, "resolve", index, view, cmd->state.gfx.dump.area, false);
+   if (depth_view)
+      kk_dump_view(cmd, dir, "depth", index, depth_view, cmd->state.gfx.dump.area,
+                   true);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -864,7 +889,6 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       need_meta_resolve = false;
 
    memset(render, 0, sizeof(*render));
-   kk_dump_custom_resolve(cmd);
 
    if (need_meta_resolve) {
       kk_meta_resolve_rendering(cmd, &vk_render);
@@ -894,6 +918,8 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       };
       kk_meta_resolve_rendering(cmd, &avg_render);
    }
+
+   kk_dump_custom_resolve(cmd);
 }
 
 static void
@@ -901,6 +927,11 @@ kk_begin_custom_resolve_legacy(struct kk_cmd_buffer *cmd)
 {
    VkCommandBuffer commandBuffer = kk_cmd_buffer_to_handle(cmd);
    struct kk_rendering_state *render = &cmd->state.gfx.render;
+
+   /* The resolve shader may read the multisampled depth and stencil, so they
+    * have to be stored, and are then resolved after the pass as usual. */
+   render->depth_att.resolve_in_pass = false;
+   render->stencil_att.resolve_in_pass = false;
 
    VkRenderingAttachmentInfo color_atts[KK_MAX_RTS];
    for (uint32_t i = 0; i < render->color_att_count; i++) {
@@ -1048,6 +1079,11 @@ kk_CmdBeginCustomResolveEXT(
                        ? gfx->render.color_att[0].resolve_iview
                        : NULL;
    gfx->dump.area = gfx->render.area;
+   gfx->dump.depth_view = gfx->render.depth_att.resolve_mode != VK_RESOLVE_MODE_NONE &&
+                                gfx->render.depth_att.resolve_mode !=
+                                   VK_RESOLVE_MODE_CUSTOM_BIT_EXT
+                             ? gfx->render.depth_att.resolve_iview
+                             : NULL;
 
    if (!kk_tile_resolve_can_start(cmd)) {
       gfx->tile_resolve.possible = false;

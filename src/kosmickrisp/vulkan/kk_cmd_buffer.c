@@ -1393,14 +1393,25 @@ kk_apply_attachment_store_ops(struct kk_cmd_buffer *cmd, bool force_store)
    }
    enum mtl_store_action depth_store_action = MTL_STORE_ACTION_UNKNOWN;
    enum mtl_store_action stencil_store_action = MTL_STORE_ACTION_UNKNOWN;
+   /* Metal skips the resolve of all but the first layer when a partial render
+    * target is both stored and resolved, so a don't-care attachment resolved
+    * in the pass is only resolved at the end of the pass. */
+   bool depth_force = force_store;
+   bool stencil_force = force_store;
+   if (!force_store_in && render->depth_att.resolve_in_pass &&
+       render->depth_att.store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE)
+      depth_force = false;
+   if (!force_store_in && render->stencil_att.resolve_in_pass &&
+       render->stencil_att.store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE)
+      stencil_force = false;
    if (render->depth_att.iview) {
       depth_store_action = kk_get_attachment_store_op(
-         &render->depth_att, force_store,
+         &render->depth_att, depth_force,
          render->rendering_to_whole_framebuffer, VK_IMAGE_ASPECT_DEPTH_BIT);
    }
    if (render->stencil_att.iview) {
       stencil_store_action = kk_get_attachment_store_op(
-         &render->stencil_att, force_store,
+         &render->stencil_att, stencil_force,
          render->rendering_to_whole_framebuffer, VK_IMAGE_ASPECT_STENCIL_BIT);
    }
    bool ds_resolve_dont_care =
@@ -1435,7 +1446,7 @@ kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
                                     bool rendering_to_whole_framebuffer,
                                     VkImageAspectFlags aspect)
 {
-   if (!rendering_to_whole_framebuffer)
+   if (!rendering_to_whole_framebuffer && !attachment->resolve_in_pass)
       return false;
 
    if (attachment->resolve_mode == VK_RESOLVE_MODE_NONE ||
@@ -1446,7 +1457,8 @@ kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
     * Producer barriers do not synchronize depth render pass resolves
     * properly, even when it's STAGE_ALL -> STAGE_ALL.
     * Force meta resolves for depth and stencil for now. */
-   if (!(attachment->resolve_iview->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT))
+   if (!(attachment->resolve_iview->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT) &&
+       !attachment->resolve_in_pass)
       return false;
 
    /* Dynamic rendering doesn't allow different formats but the Mesa Vulkan
