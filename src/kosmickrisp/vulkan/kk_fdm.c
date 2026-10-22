@@ -426,6 +426,8 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
    }
    density->fdm.params = params;
    density->fdm.serial = ++kk_fdm_serial;
+   density->fdm.params_bytes =
+      KK_RATE_PARAMS_HEADER_B + mtl_rate_map_parameter_size(map);
    memcpy(density->fdm.map_shift, shift, sizeof(shift));
 
    struct kk_rate_params_header *header = density->fdm.params->cpu;
@@ -525,22 +527,14 @@ kk_fdm_publish(struct kk_cmd_buffer *cmd, struct kk_image *density,
    struct kk_image *image = container_of(iview->vk.image, struct kk_image, vk);
    if (image->rate_params == NULL)
       return;
-   if (image->rate_params_owner == density &&
-       image->rate_params_serial == density->fdm.serial)
-      return;
+   /* Copied in every pass that renders the image rather than once: the
+    * command buffer holding an earlier copy may be re-recorded or dropped. */
+   uint32_t bytes = MIN2(density->fdm.params_bytes, KK_RATE_PARAMS_SIZE_B);
    if (cmd->metal.render == NULL)
       mtl_copy_from_buffer_to_buffer(cs_get_compute(cmd), density->fdm.params->map,
-                                     0, image->rate_params->map, 0,
-                                     KK_RATE_PARAMS_SIZE_B);
+                                     0, image->rate_params->map, 0, bytes);
    else
-      memcpy(image->rate_params->cpu, density->fdm.params->cpu,
-             KK_RATE_PARAMS_SIZE_B);
-   if (kk_fdm_debug()) {
-      static uint32_t republished;
-      if (image->rate_params_owner != NULL && (++republished & (republished - 1)) == 0)
-         mesa_logi("kk-fdm: %u parameter block rewrites of already-published images",
-                   republished);
-   }
+      memcpy(image->rate_params->cpu, density->fdm.params->cpu, bytes);
    image->rate_params_owner = density;
    image->rate_params_serial = density->fdm.serial;
 }
@@ -644,17 +638,22 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
       gfx->stitch.fdm_serial = density->fdm.serial;
    }
    uint64_t params = 0;
+   /* Resumed segments of a stitched pass may not start with another
+    * encoder; the segment that began the pass published the parameters. */
+   bool publish = !(render->flags & VK_RENDERING_RESUMING_BIT);
    if (map) {
       mtl_render_pass_descriptor_set_rate_map(descriptor, map);
       params = density->fdm.params->gpu;
-      for (uint32_t i = 0; i < render->color_att_count; i++) {
+      for (uint32_t i = 0; publish && i < render->color_att_count; i++) {
          kk_fdm_publish(cmd, density, render->color_att[i].iview);
          kk_fdm_publish(cmd, density, render->color_att[i].resolve_iview);
       }
-      kk_fdm_publish(cmd, density, render->depth_att.iview);
-      kk_fdm_publish(cmd, density, render->depth_att.resolve_iview);
-      kk_fdm_publish(cmd, density, render->stencil_att.iview);
-      kk_fdm_publish(cmd, density, render->stencil_att.resolve_iview);
+      if (publish) {
+         kk_fdm_publish(cmd, density, render->depth_att.iview);
+         kk_fdm_publish(cmd, density, render->depth_att.resolve_iview);
+         kk_fdm_publish(cmd, density, render->stencil_att.iview);
+         kk_fdm_publish(cmd, density, render->stencil_att.resolve_iview);
+      }
    }
    simple_mtx_unlock(&kk_fdm_lock);
 
