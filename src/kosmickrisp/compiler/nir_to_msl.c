@@ -2049,8 +2049,7 @@ jump_instr_to_msl(struct nir_to_msl_ctx *ctx, nir_jump_instr *jump)
       break;
    case nir_jump_break:
       /* KK_WORKAROUND_9 */
-      if (!ctx->shader->info.maximally_reconverges ||
-          (ctx->disabled_workarounds & BITFIELD64_BIT(9))) {
+      if (ctx->disabled_workarounds & BITFIELD64_BIT(9)) {
          P_IND(ctx, "break;\n");
       } else {
          P_IND(ctx, "if ((ulong)simd_active_threads_mask()) break;\n");
