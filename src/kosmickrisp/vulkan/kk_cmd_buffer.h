@@ -337,6 +337,10 @@ struct kk_cmd_buffer {
     * enqueueing in the trampolines since they can never be replayed. */
    bool one_time_submit;
    bool defer_encoding;
+   bool fdm_offset_deferred;
+   const struct list_head *fdm_scan_head;
+   const struct list_head *fdm_scan_next;
+   VkOffset2D fdm_offsets[8];
    /* Metal command buffers are single-shot: a resubmission must re-record
     * by replaying the enqueued commands (see rerecord_cmd_buffer). */
    bool submitted;
