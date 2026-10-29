@@ -155,6 +155,8 @@ kk_CreateDescriptorSetLayout(VkDevice device,
    layout->vk.destroy = kk_descriptor_set_layout_destroy;
    layout->flags = pCreateInfo->flags;
    layout->binding_count = num_bindings;
+   layout->first_immutable_binding = UINT32_MAX;
+   uint32_t *next_immutable_binding = &layout->first_immutable_binding;
 
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];
@@ -231,6 +233,9 @@ kk_CreateDescriptorSetLayout(VkDevice device,
       uint8_t max_plane_count = 1;
 
       if (binding_has_immutable_samplers(binding)) {
+         *next_immutable_binding = b;
+         layout->binding[b].next_immutable_binding = UINT32_MAX;
+         next_immutable_binding = &layout->binding[b].next_immutable_binding;
          layout->binding[b].immutable_samplers = samplers;
          samplers += binding->descriptorCount;
          for (uint32_t i = 0; i < binding->descriptorCount; i++) {

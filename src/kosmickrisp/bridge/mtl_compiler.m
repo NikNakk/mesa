@@ -173,6 +173,38 @@ mtl_render_pipeline_descriptor_set_color_attachment_write_mask(mtl_render_pipeli
 }
 
 void
+mtl_render_pipeline_descriptor_set_color_attachment_blend(
+   mtl_render_pipeline_descriptor *descriptor, uint8_t index,
+   const struct mtl_color_blend_state *blend)
+{
+   @autoreleasepool {
+      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+      MTL4RenderPipelineColorAttachmentDescriptor *att = desc.colorAttachments[index];
+      att.blendingState = blend->enabled ? MTL4BlendStateEnabled : MTL4BlendStateDisabled;
+      att.rgbBlendOperation = (MTLBlendOperation)blend->rgb_operation;
+      att.alphaBlendOperation = (MTLBlendOperation)blend->alpha_operation;
+      att.sourceRGBBlendFactor = (MTLBlendFactor)blend->source_rgb;
+      att.destinationRGBBlendFactor = (MTLBlendFactor)blend->destination_rgb;
+      att.sourceAlphaBlendFactor = (MTLBlendFactor)blend->source_alpha;
+      att.destinationAlphaBlendFactor = (MTLBlendFactor)blend->destination_alpha;
+      mtl_render_pipeline_descriptor_set_color_attachment_write_mask(
+         descriptor, index, blend->write_mask);
+   }
+}
+
+void
+mtl_render_pipeline_descriptor_set_multisample_alpha(
+   mtl_render_pipeline_descriptor *descriptor, bool coverage, bool one)
+{
+   @autoreleasepool {
+      MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
+      desc.alphaToCoverageState = coverage ? MTL4AlphaToCoverageStateEnabled
+                                          : MTL4AlphaToCoverageStateDisabled;
+      desc.alphaToOneState = one ? MTL4AlphaToOneStateEnabled : MTL4AlphaToOneStateDisabled;
+   }
+}
+
+void
 mtl_render_pipeline_descriptor_set_raster_sample_count(mtl_render_pipeline_descriptor *descriptor,
                                                        uint32_t sample_count)
 {

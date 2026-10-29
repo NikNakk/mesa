@@ -11,6 +11,7 @@
 #include "kk_dispatch_trampolines.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
+#include "util/u_debug.h"
 #include "kk_instance.h"
 #include "wsi_common.h"
 
@@ -64,6 +65,8 @@ kk_bind_drawable_to_vkimage(VkImage vk_image, void *drawable)
    plane->mtl_handle = mtl_retain(texture);
    plane->mtl_handle_array = NULL;
    plane->addr = mtl_texture_get_gpu_resource_id(texture);
+   if (image->wsi_direct)
+      image->wsi_drawable = drawable;
 
    return VK_SUCCESS;
 }
@@ -83,11 +86,20 @@ kk_wsi_cmd_blit_image(VkCommandBuffer vk_cmd, const VkBlitImageInfo2 *blit_info,
 }
 
 static void
-kk_encode_drawable_present(VkCommandBuffer vk_cmd, void *drawable)
+kk_set_direct_image(VkImage vk_image)
+{
+   VK_FROM_HANDLE(kk_image, image, vk_image);
+   image->wsi_direct = true;
+}
+
+static void
+kk_encode_drawable_present(VkCommandBuffer vk_cmd, void *drawable,
+                            bool signal_only)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, vk_cmd);
    mtl_retain(drawable);
    cmd->drawable = drawable;
+   cmd->wsi_signal_only = signal_only;
 }
 
 static void *
@@ -127,6 +139,8 @@ kk_init_wsi(struct kk_physical_device *pdev)
       return result;
 
    wsi->metal.bind_drawable_to_vkimage = kk_bind_drawable_to_vkimage;
+   if (debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false))
+      wsi->metal.set_direct_image = kk_set_direct_image;
    wsi->metal.encode_drawable_present = kk_encode_drawable_present;
    wsi->metal.cmd_blit_image = kk_wsi_cmd_blit_image;
    wsi->metal.get_mtl4_command_queue = kk_get_mtl4_command_queue;

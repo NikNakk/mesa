@@ -20,6 +20,13 @@
 
 struct kk_cmd_buffer;
 
+static inline bool
+kk_is_turning_target_shader(uint32_t hash)
+{
+   return hash == 0x0e188069 || hash == 0x814b104f;
+}
+
+
 struct kk_tess_info {
    enum tess_primitive_mode mode : 8;
    enum gl_tess_spacing spacing  : 8;
@@ -89,6 +96,10 @@ struct kk_shader_info {
          bool has_depth_write;
          bool has_stencil_test;
          bool dynamic_write_masks;
+         bool native_blend;
+         bool alpha_to_coverage;
+         bool alpha_to_one;
+         struct mtl_color_blend_state blend[MAX_DRAW_BUFFERS];
       } vs;
 
       struct {
@@ -144,6 +155,7 @@ struct msl_compile_data {
 
 struct kk_shader {
    struct vk_shader vk;
+   uint32_t diagnostic_msl_hash;
 
    struct kk_pipeline_handles pipeline;
    struct kk_shader_info info;

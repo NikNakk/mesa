@@ -21,6 +21,8 @@
 #include "kosmickrisp/bridge/mtl_tile.h"
 #include "util/simple_mtx.h"
 #include "util/os_time.h"
+#include "util/os_file.h"
+#include "util/hash_table.h"
 #include <pthread.h>
 #include "kosmickrisp/bridge/ns_process_info.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
@@ -121,6 +123,12 @@ kk_populate_vs_key(struct kk_vs_key *key,
    key->vi = *state->vi;
 }
 
+static bool
+kk_native_blend_supported(const struct vk_graphics_pipeline_state *state);
+
+static bool
+kk_native_multisample_alpha(const struct vk_graphics_pipeline_state *state);
+
 struct kk_fs_key {
    VkFormat color_formats[MESA_VK_MAX_COLOR_ATTACHMENTS];
    struct vk_color_blend_state color_blend;
@@ -128,6 +136,10 @@ struct kk_fs_key {
    uint32_t rasterization_samples;
    uint16_t static_sample_mask;
    bool sample_shading_enable;
+   bool native_blend;
+   bool native_multisample_alpha;
+   bool alpha_to_coverage;
+   bool alpha_to_one;
    bool has_depth;
    bool has_stencil;
    bool dynamic_input_attachment_map;
@@ -178,6 +190,10 @@ kk_populate_fs_key(struct kk_fs_key *key,
    key->dynamic_input_attachment_map =
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP);
 
+   key->native_blend = kk_native_blend_supported(state);
+   key->native_multisample_alpha = kk_native_multisample_alpha(state);
+   key->alpha_to_coverage = state->ms && state->ms->alpha_to_coverage_enable;
+   key->alpha_to_one = state->ms && state->ms->alpha_to_one_enable;
    key->custom_resolve = state->rp->custom_resolve;
    key->ms_input_fetch = KK_EXPERIMENTAL(MS_INPUT_FETCH);
    key->tile_resolve = KK_EXPERIMENTAL(TILE_RESOLVE);
@@ -440,6 +456,71 @@ kk_get_logical_color_att_index(const struct vk_graphics_pipeline_state *state,
    return (state->cal) ? state->cal->color_map[i] : i;
 }
 
+static int
+kk_native_blend_factor(VkBlendFactor factor)
+{
+   switch (factor) {
+   case VK_BLEND_FACTOR_ZERO: return MTL_BLEND_FACTOR_ZERO;
+   case VK_BLEND_FACTOR_ONE: return MTL_BLEND_FACTOR_ONE;
+   case VK_BLEND_FACTOR_SRC_COLOR: return MTL_BLEND_FACTOR_SOURCE_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR;
+   case VK_BLEND_FACTOR_DST_COLOR: return MTL_BLEND_FACTOR_DESTINATION_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR;
+   case VK_BLEND_FACTOR_SRC_ALPHA: return MTL_BLEND_FACTOR_SOURCE_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA;
+   case VK_BLEND_FACTOR_DST_ALPHA: return MTL_BLEND_FACTOR_DESTINATION_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA;
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE: return MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED;
+   default: return -1;
+   }
+}
+
+static bool
+kk_native_blend_supported(const struct vk_graphics_pipeline_state *state)
+{
+   if (!debug_get_bool_option("KK_NATIVE_BLEND", false) || !state->cb ||
+       state->cb->logic_op_enable || state->rp->custom_resolve ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP_ENABLE) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP))
+      return false;
+
+   for (uint32_t i = 0; i < state->rp->color_attachment_count; i++) {
+      if (kk_get_logical_color_att_index(state, i) == MESA_VK_ATTACHMENT_UNUSED ||
+          state->rp->color_attachment_formats[i] == VK_FORMAT_UNDEFINED)
+         continue;
+      const struct kk_va_format *format = kk_get_va_format(
+         vk_format_to_pipe_format(state->rp->color_attachment_formats[i]));
+      if (!format->is_native)
+         return false;
+      const struct vk_color_blend_attachment_state *att = &state->cb->attachments[i];
+      if (!att->blend_enable)
+         continue;
+      if (!format->blend || att->color_blend_op > VK_BLEND_OP_MAX ||
+          att->alpha_blend_op > VK_BLEND_OP_MAX ||
+          kk_native_blend_factor(att->src_color_blend_factor) < 0 ||
+          kk_native_blend_factor(att->dst_color_blend_factor) < 0 ||
+          kk_native_blend_factor(att->src_alpha_blend_factor) < 0 ||
+          kk_native_blend_factor(att->dst_alpha_blend_factor) < 0)
+         return false;
+   }
+   return true;
+}
+
+static bool
+kk_native_multisample_alpha(const struct vk_graphics_pipeline_state *state)
+{
+   return debug_get_bool_option("KK_NATIVE_MSAA_ALPHA", false) &&
+          kk_native_blend_supported(state) && state->ms &&
+          state->ms->rasterization_samples > 1 &&
+          state->rp->color_attachment_count > 0 &&
+          (!state->cal || state->cal->color_map[0] == 0) &&
+          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
+          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_ALPHA_TO_ONE_ENABLE);
+}
+
 static void
 kk_lower_fs_blend(nir_shader *nir,
                   const struct vk_graphics_pipeline_state *state)
@@ -551,7 +632,7 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
             nir_metadata_control_flow, &fdm_invocations);
 
    /* Must be lowered before blending */
-   if (state->ms) {
+   if (state->ms && !kk_native_multisample_alpha(state)) {
       NIR_PASS(_, nir, msl_nir_lower_multisample_alpha,
                state->ms->alpha_to_coverage_enable,
                state->ms->alpha_to_one_enable);
@@ -564,7 +645,7 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
    if (nir->info.fs.uses_sample_shading)
       NIR_PASS(_, nir, msl_nir_lower_sample_shading);
 
-   if (state->cb)
+   if (state->cb && !kk_native_blend_supported(state))
       kk_lower_fs_blend(nir, state);
 
    enum pipe_format rts[MAX_DRAW_BUFFERS] = {PIPE_FORMAT_NONE};
@@ -873,7 +954,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
          NIR_PASS(_, nir, msl_ensure_depth_write);
 
       msl_nir_lower_input_attachments(
-         nir, state->ial, state->cal,
+         nir, state->ial, state->cal, state->rp,
          KK_EXPERIMENTAL(MS_INPUT_FETCH) &&
             !(state->rp && state->rp->custom_resolve));
    }
@@ -1417,7 +1498,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
             vk_format_to_pipe_format(state->rp->color_attachment_formats[i]);
          if (format != PIPE_FORMAT_NONE) {
             translate_options.rts_component_count[logical_index] =
-               util_format_get_nr_components(format);
+               kk_native_blend_supported(state) ? 4 : util_format_get_nr_components(format);
          }
       }
    }
@@ -1434,6 +1515,188 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
 
    if (KK_DEBUG(MSL))
       mesa_logi("%s\n", data->code);
+   shader->diagnostic_msl_hash = _mesa_hash_string(data->code);
+   const char *loop_form = debug_get_option("KK_LOOP_FORM", "");
+   if (stage == MESA_SHADER_FRAGMENT && shader->diagnostic_msl_hash == 0x0e188069 &&
+       (!strcmp(loop_form, "countdown") || !strcmp(loop_form, "pair32") ||
+        !strcmp(loop_form, "uint32") || !strcmp(loop_form, "while") ||
+        !strcmp(loop_form, "condition"))) {
+      const char *from = "for (uint64_t no_crash = 0u; no_crash < 18446744073709551615; ++no_crash)";
+      const char *to = "for (uint64_t no_crash = 18446744073709551615ul; no_crash != 0ul; --no_crash)";
+      if (!strcmp(loop_form, "pair32"))
+         to = "for (uint2 no_crash = uint2(0u); any(no_crash != uint2(4294967295u)); no_crash = uint2(no_crash.x + 1u, no_crash.y + uint(no_crash.x == 4294967295u)))";
+      if (!strcmp(loop_form, "uint32"))
+         to = "for (uint no_crash = 0u; no_crash < 4294967295u; ++no_crash)";
+      if (!strcmp(loop_form, "while"))
+         to = "while (true)";
+      if (!strcmp(loop_form, "condition"))
+         to = "while (as_type<int>(r0) < t678)";
+      const char *cursor = data->code, *hit;
+      char *out = ralloc_strdup(NULL, "");
+      unsigned loop = 0;
+      unsigned target = debug_get_num_option("KK_LOOP_FORM_INDEX", 2);
+      while ((hit = strstr(cursor, from))) {
+         ralloc_strncat(&out, cursor, hit - cursor);
+         ralloc_strcat(&out, !target || ++loop == target ? to : from);
+         cursor = hit + strlen(from);
+      }
+      ralloc_strcat(&out, cursor);
+      data->code = out;
+      mesa_logi("kk-loop-form: FS-0e188069 form=%s index=%u", loop_form, target);
+   }
+   const char *turn_probe = debug_get_option("KK_TURN_PROBE", "");
+   if (stage == MESA_SHADER_FRAGMENT && shader->diagnostic_msl_hash == 0x0e188069 &&
+       (!strcmp(turn_probe, "clamp16") || !strcmp(turn_probe, "nohelpers") ||
+        !strcmp(turn_probe, "tripwire"))) {
+      if (!strcmp(turn_probe, "clamp16")) {
+         const char *from = "t678 = *(coherent device int*)((t355 + uint(4u)));";
+         const char *to = "t678 = min(*(coherent device int*)((t355 + uint(4u))), 16);";
+         const char *hit = strstr(data->code, from);
+         assert(hit);
+         char *out = ralloc_strndup(NULL, data->code, hit - data->code);
+         ralloc_strcat(&out, to);
+         ralloc_strcat(&out, hit + strlen(from));
+         data->code = out;
+      } else if (!strcmp(turn_probe, "nohelpers")) {
+         const char *from = "    r0 = as_type<uint>(int(int(0)));\n";
+         const char *hit = strstr(data->code, from);
+         assert(hit);
+         size_t n = hit - data->code + strlen(from);
+         char *out = ralloc_strndup(NULL, data->code, n);
+         ralloc_strcat(&out, "    if (!simd_is_helper_thread()) {\n");
+         const char *end = strstr(data->code + n, "    t733 = t31 << uint(4u);");
+         assert(end);
+         ralloc_strncat(&out, data->code + n, end - data->code - n);
+         ralloc_strcat(&out, "    }\n");
+         ralloc_strcat(&out, end);
+         data->code = out;
+      } else {
+         const char *count = strstr(data->code, "    t678 = *(coherent device int*)((t355 + uint(4u)));");
+         assert(count);
+         const char *header = strstr(count, "for (uint64_t no_crash");
+         assert(header);
+         const char *hit = strchr(header, '{');
+         assert(hit);
+         size_t n = hit - data->code + 2;
+         char *out = ralloc_strndup(NULL, data->code, n);
+         ralloc_asprintf_append(&out,
+            "        if (no_crash == 1000ul || (%u && no_crash == 0ul && (uint(gl_FragCoord.x) & 255u) == 0u && (uint(gl_FragCoord.y) & 255u) == 0u)) {\n"
+            "            device atomic_uint *kk_trip = (device atomic_uint *)(*(constant ulong *)((constant char *)&buf0 + %zu));\n"
+            "            uint kk_slot = atomic_fetch_add_explicit(kk_trip, 1u, memory_order_relaxed);\n"
+            "            if (kk_slot < 16u) {\n"
+            "                device atomic_uint *kk_record = kk_trip + 64u + kk_slot * 16u;\n"
+            "                uint4 kk_desc = uint4(*(coherent device packed_uint4*)(t57 + uint(64u)));\n"
+            "                uint kk_words[16] = { uint(t678), uint(t355), uint(t355 >> 32), uint(t57), uint(t57 >> 32), kk_desc.x, kk_desc.y, kk_desc.z, kk_desc.w, as_type<uint>(gl_FragCoord.x), as_type<uint>(gl_FragCoord.y), uint(simd_is_helper_thread()), uint((ulong)&buf0), uint(((ulong)&buf0) >> 32), r0, uint(no_crash) };\n"
+            "                for (uint kk_w = 0; kk_w < 16u; kk_w++) atomic_store_explicit(kk_record + kk_w, kk_words[kk_w], memory_order_relaxed);\n"
+            "                atomic_store_explicit(kk_trip + 32u + kk_slot, 0x4b4b1234u, memory_order_relaxed);\n"
+            "            }\n"
+            "            break;\n"
+            "        }\n",
+            debug_get_bool_option("KK_TRIPWIRE_CONTROL", false),
+            offsetof(struct kk_root_descriptor_table, diagnostic_gpu));
+         ralloc_strcat(&out, data->code + n);
+         data->code = out;
+      }
+      mesa_logi("kk-turn-probe: FS-0e188069 probe=%s", turn_probe);
+   }
+   const char *limit_list = getenv("KK_LOOP_LIMIT_SHADERS");
+   if (limit_list) {
+      char name[32];
+      snprintf(name, sizeof(name), "%s-%08x", _mesa_shader_stage_to_abbrev(stage),
+               _mesa_hash_string(data->code));
+      bool match = !strcmp(limit_list, "all") || strstr(limit_list, name);
+      for (const char *t = limit_list; !match && *t;) {
+         const char *end = strchr(t, ',');
+         size_t len = end ? (size_t)(end - t) : strlen(t);
+         if (len > 1 && t[len - 1] == '*' && !strncmp(name, t, len - 1))
+            match = true;
+         t += len + (end ? 1 : 0);
+      }
+      if (match) {
+         const char *from = "no_crash < 18446744073709551615";
+         const char *to = "no_crash < 65536";
+         char *out = ralloc_strdup(NULL, "");
+         const char *p = data->code, *hit;
+         unsigned loop = 0;
+         unsigned target = debug_get_num_option("KK_LOOP_LIMIT_INDEX", 0);
+         while ((hit = strstr(p, from))) {
+            ralloc_strncat(&out, p, hit - p);
+            ralloc_strcat(&out, !target || ++loop == target ? to : from);
+            p = hit + strlen(from);
+         }
+         ralloc_strcat(&out, p);
+         mesa_logi("kk-loop-limit: capped loops in %s index=%u (0=all)", name, target);
+         data->code = out;
+      }
+   }
+   if (debug_get_bool_option("KK_GPU_DIAG", false) &&
+       stage == MESA_SHADER_FRAGMENT && shader->diagnostic_msl_hash == 0x0e188069) {
+      const char *anchor = "    FragmentOut out = {};\n";
+      const char *hit = strstr(data->code, anchor);
+      assert(hit);
+      char *out = ralloc_strndup(NULL, data->code, hit - data->code + strlen(anchor));
+      ralloc_asprintf_append(&out,
+         "    device atomic_uint *kk_diag = (device atomic_uint *)(*(constant ulong *)((constant char *)&buf0 + %zu));\n"
+         "    bool kk_probe = ((uint(gl_FragCoord.x) & 255u) == 0u) && ((uint(gl_FragCoord.y) & 255u) == 0u);\n"
+         "    if (kk_probe) atomic_fetch_add_explicit(kk_diag + 0, 1u, memory_order_relaxed);\n",
+         offsetof(struct kk_root_descriptor_table, diagnostic_gpu));
+      ralloc_strcat(&out, hit + strlen(anchor));
+      const char *anchors[] = {
+         "    t355 = t352 | t354;\n",
+         "    t678 = *(coherent device int*)((t355 + uint(4u)));\n",
+         "    t733 = t31 << uint(4u);\n",
+      };
+      const char *inserts[] = {
+         "    if (kk_probe) atomic_fetch_add_explicit(kk_diag + 1, 1u, memory_order_relaxed);\n",
+         "    bool kk_bad = !t355 || t678 < 0 || t678 > 8;\n"
+         "    if (kk_probe || kk_bad) {\n"
+         "        atomic_fetch_add_explicit(kk_diag + 2, 1u, memory_order_relaxed);\n"
+         "        atomic_fetch_add_explicit(kk_diag + 16 + min(uint(t678), 15u), 1u, memory_order_relaxed);\n"
+         "        if (kk_bad) atomic_fetch_add_explicit(kk_diag + 4, 1u, memory_order_relaxed);\n"
+         "        uint kk_slot = atomic_fetch_add_explicit(kk_diag + (kk_bad ? 7 : 6), 1u, memory_order_relaxed);\n"
+         "        if (kk_slot < 16u) {\n"
+         "            device atomic_uint *kk_record = kk_diag + 64 + (kk_slot + (kk_bad ? 16u : 0u)) * 8u;\n"
+         "            atomic_store_explicit(kk_record + 0, uint((ulong)&buf0), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 1, uint(((ulong)&buf0) >> 32), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 2, uint(t57), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 3, uint(t57 >> 32), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 4, uint(t355), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 5, uint(t355 >> 32), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 6, uint(t678), memory_order_relaxed);\n"
+         "            atomic_store_explicit(kk_record + 7, t351.z, memory_order_relaxed);\n"
+         "        }\n"
+         "    }\n",
+         "    if (kk_probe) {\n"
+         "        atomic_fetch_add_explicit(kk_diag + 3, 1u, memory_order_relaxed);\n"
+         "        if (as_type<int>(r0) < t678) atomic_fetch_add_explicit(kk_diag + 5, 1u, memory_order_relaxed);\n"
+         "    }\n",
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(anchors); i++) {
+         hit = strstr(out, anchors[i]);
+         assert(hit);
+         size_t n = hit - out + (i < 2 ? strlen(anchors[i]) : 0);
+         char *next = ralloc_strndup(NULL, out, n);
+         ralloc_strcat(&next, inserts[i]);
+         ralloc_strcat(&next, out + n);
+         ralloc_free(out);
+         out = next;
+      }
+      data->code = out;
+      mesa_logi("kk-gpu-diag: instrumented FS-0e188069 root_offset=%zu",
+                offsetof(struct kk_root_descriptor_table, diagnostic_gpu));
+   }
+   const char *msl_dump_dir = getenv("KK_MSL_DUMP_DIR");
+   if (msl_dump_dir) {
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/%s-%08x.metal", msl_dump_dir,
+               _mesa_shader_stage_to_abbrev(stage),
+               _mesa_hash_string(data->code));
+      FILE *f = fopen(path, "wx");
+      if (f) {
+         fputs(data->code, f);
+         fclose(f);
+      }
+   }
 
    ralloc_free(nir);
 
@@ -1758,6 +2021,44 @@ gather_graphics_pipeline_create_info(
       info->vs.view_mask = state->mv->view_mask;
    }
 
+   info->vs.native_blend = kk_native_blend_supported(state);
+   if (kk_native_multisample_alpha(state)) {
+      info->vs.alpha_to_coverage = state->ms->alpha_to_coverage_enable;
+      info->vs.alpha_to_one = state->ms->alpha_to_one_enable;
+   }
+   if (debug_get_bool_option("KK_NATIVE_BLEND_LOG", false)) {
+      mesa_logi("kk-native-blend: enabled=%d custom=%d logic=%d dynamic=%d/%d/%d/%d/%d/%d alpha=%d/%d",
+                info->vs.native_blend, rp->custom_resolve,
+                state->cb ? state->cb->logic_op_enable : -1,
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP_ENABLE),
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP),
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES),
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS),
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_BLEND_ADVANCED),
+                BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP),
+                info->vs.alpha_to_coverage, info->vs.alpha_to_one);
+   }
+   if (info->vs.native_blend) {
+      for (uint32_t i = 0; i < rp->color_attachment_count; i++) {
+         uint8_t slot = kk_get_logical_color_att_index(state, i);
+         if (slot == MESA_VK_ATTACHMENT_UNUSED)
+            continue;
+         const struct vk_color_blend_attachment_state *att = &state->cb->attachments[i];
+         struct mtl_color_blend_state *blend = &info->vs.blend[slot];
+         blend->enabled = att->blend_enable;
+         blend->write_mask = state->cb->color_write_enables & BITFIELD_BIT(i)
+                                ? att->write_mask : 0;
+         if (att->blend_enable) {
+            blend->rgb_operation = att->color_blend_op;
+            blend->alpha_operation = att->alpha_blend_op;
+            blend->source_rgb = kk_native_blend_factor(att->src_color_blend_factor);
+            blend->destination_rgb = kk_native_blend_factor(att->dst_color_blend_factor);
+            blend->source_alpha = kk_native_blend_factor(att->src_alpha_blend_factor);
+            blend->destination_alpha = kk_native_blend_factor(att->dst_alpha_blend_factor);
+         }
+      }
+   }
+
    info->vs.dynamic_write_masks =
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) ||
       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES);
@@ -1880,9 +2181,42 @@ kk_build_render_pipeline(struct kk_device *device, struct kk_shader *vs,
                                           vs_data->entrypoint_name);
 
    const struct msl_compile_data *fs_data = &vs->msl_data[MESA_SHADER_FRAGMENT];
+   uint32_t fs_hash = _mesa_hash_string(fs_data->code);
+   char *replacement_msl = NULL;
+   const char *fragment_source = fs_data->code;
+   const char *replacement_path = getenv("KK_TARGET_MSL_FILE");
+   if (kk_is_turning_target_shader(fs_hash) && replacement_path) {
+      size_t replacement_size;
+      replacement_msl = os_read_file(replacement_path, &replacement_size);
+      if (!replacement_msl) {
+         mesa_loge("kk-target-source: cannot read %s", replacement_path);
+         goto destroy_vertex;
+      }
+      fragment_source = replacement_msl;
+      mesa_logi("kk-target-source: %s bytes=%zu", replacement_path, replacement_size);
+   }
+   bool target_safe_math = debug_get_bool_option("KK_TARGET_SAFE_MATH", false) &&
+                           kk_is_turning_target_shader(fs_hash);
+   if (target_safe_math)
+      mesa_logi("kk-target-safe-math: FS-%08x", fs_hash);
+   if (kk_is_turning_target_shader(fs_hash) && debug_get_bool_option("KK_TARGET_COMPILE_LOG", false)) {
+      mesa_logi("kk-target-compile: FS-%08x math=%s", fs_hash, target_safe_math ? "safe" : "fast");
+      const char *dir = getenv("KK_MSL_DUMP_DIR");
+      if (dir) {
+         char path[1024];
+         snprintf(path, sizeof(path), "%s/FS-%08x.compiled.metal", dir, fs_hash);
+         FILE *f = fopen(path, "wx");
+         if (f) {
+            fputs(fragment_source, f);
+            fclose(f);
+         }
+      }
+   }
    mtl_library *fragment_library = mtl_new_library(
-      device->mtl_compiler_handle, fs_data->code, pdev->info.msl_version,
-      MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+      device->mtl_compiler_handle, fragment_source, pdev->info.msl_version,
+      target_safe_math ? MTL_MATH_MODE_SAFE : MTL_MATH_MODE_FAST,
+      MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
+   free(replacement_msl);
    if (fragment_library == NULL)
       goto destroy_vertex;
    mtl_function_descriptor *fragment_function =
@@ -1908,11 +2242,17 @@ kk_build_render_pipeline(struct kk_device *device, struct kk_shader *vs,
       if (vs->info.vs.rt_formats[i] != MTL_PIXEL_FORMAT_INVALID) {
          mtl_render_pipeline_descriptor_set_color_attachment_format(
             pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
+         if (vs->info.vs.native_blend)
+            mtl_render_pipeline_descriptor_set_color_attachment_blend(
+               pipeline_descriptor, i, &vs->info.vs.blend[i]);
          if (masks != UINT32_MAX)
             mtl_render_pipeline_descriptor_set_color_attachment_write_mask(
                pipeline_descriptor, i, (masks >> (4 * i)) & 0xf);
       }
    }
+
+   mtl_render_pipeline_descriptor_set_multisample_alpha(
+      pipeline_descriptor, vs->info.vs.alpha_to_coverage, vs->info.vs.alpha_to_one);
 
    if (vs->info.vs.view_mask) {
       uint32_t max_amplification = util_bitcount(vs->info.vs.view_mask);
@@ -1927,6 +2267,29 @@ kk_build_render_pipeline(struct kk_device *device, struct kk_shader *vs,
 
    render =
       mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
+
+   if (render == NULL) {
+      mesa_loge("kk-pipeline-failure: FS-%08x VS-%08x samples=%u view_mask=%x masks=%08x",
+                fs_hash, _mesa_hash_string(vs_data->code),
+                vs->info.vs.sample_count, vs->info.vs.view_mask, masks);
+      for (uint32_t i = 0; i < MAX_DRAW_BUFFERS; ++i)
+         mesa_loge("kk-pipeline-failure: color[%u]=%u", i,
+                   vs->info.vs.rt_formats[i]);
+      const char *dir = getenv("KK_FAILED_PIPELINE_DUMP_DIR");
+      if (dir) {
+         for (uint32_t stage = 0; stage < 2; ++stage) {
+            const char *code = stage ? fs_data->code : vs_data->code;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s-%08x.metal", dir,
+                     stage ? "FS" : "VS", _mesa_hash_string(code));
+            FILE *f = fopen(path, "wx");
+            if (f) {
+               fputs(code, f);
+               fclose(f);
+            }
+         }
+      }
+   }
 
    mtl_release(pipeline_descriptor);
    mtl_release(fragment_function);

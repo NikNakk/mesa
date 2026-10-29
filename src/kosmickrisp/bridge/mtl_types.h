@@ -52,6 +52,31 @@ struct mtl_feedback_data;
 typedef void (*mtl_feedback_handler_callback)(struct mtl_feedback_data *data);
 
 /** ENUMS */
+enum mtl_blend_factor {
+   MTL_BLEND_FACTOR_ZERO = 0,
+   MTL_BLEND_FACTOR_ONE = 1,
+   MTL_BLEND_FACTOR_SOURCE_COLOR = 2,
+   MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_COLOR = 3,
+   MTL_BLEND_FACTOR_SOURCE_ALPHA = 4,
+   MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA = 5,
+   MTL_BLEND_FACTOR_DESTINATION_COLOR = 6,
+   MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_COLOR = 7,
+   MTL_BLEND_FACTOR_DESTINATION_ALPHA = 8,
+   MTL_BLEND_FACTOR_ONE_MINUS_DESTINATION_ALPHA = 9,
+   MTL_BLEND_FACTOR_SOURCE_ALPHA_SATURATED = 10,
+};
+
+struct mtl_color_blend_state {
+   unsigned char enabled;
+   unsigned char write_mask;
+   unsigned char rgb_operation;
+   unsigned char alpha_operation;
+   unsigned char source_rgb;
+   unsigned char destination_rgb;
+   unsigned char source_alpha;
+   unsigned char destination_alpha;
+};
+
 enum mtl_cpu_cache_mode {
    MTL_CPU_CACHE_MODE_DEFAULT_CACHE = 0,
    MTL_CPU_CACHE_MODE_WRITE_COMBINED = 1,

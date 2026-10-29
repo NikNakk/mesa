@@ -31,6 +31,8 @@
 #include "vk_format.h"
 #include "vk_pipeline_layout.h"
 
+DEBUG_GET_ONCE_BOOL_OPTION(kk_batch_timestamp_resolves, "KK_BATCH_TIMESTAMP_RESOLVES", false);
+
 static void
 kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
                          struct kk_descriptor_state *desc)
@@ -59,6 +61,10 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
       kk_destroy_bo(dev, *bo);
    }
    util_dynarray_clear(&cmd->large_bos);
+   util_dynarray_clear(&cmd->wsi_direct_images);
+   cmd->wsi_signal_only = false;
+   util_dynarray_clear(&cmd->diagnostic_sets);
+   cmd->diagnostic_target_draws = 0;
    util_dynarray_clear(&cmd->post_render_writes);
    util_dynarray_clear(&cmd->ts_resolves);
    util_dynarray_clear(&cmd->ts_stage_map);
@@ -72,6 +78,7 @@ end_recording(struct kk_cmd_buffer *cmd)
       return;
 
    cs_end(cmd);
+   kk_flush_timestamp_resolves(cmd);
    mtl_end_command_buffer(cmd->metal.cmd_buf);
    if (cmd->state.gfx.stitch.starts_resumed ||
        cmd->state.gfx.stitch.ends_suspended)
@@ -110,6 +117,8 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    kk_cmd_release_resources(dev, cmd);
    util_dynarray_fini(&cmd->large_bos);
+   util_dynarray_fini(&cmd->wsi_direct_images);
+   util_dynarray_fini(&cmd->diagnostic_sets);
    util_dynarray_fini(&cmd->post_render_writes);
    util_dynarray_fini(&cmd->ts_resolves);
    util_dynarray_fini(&cmd->ts_stage_map);
@@ -156,6 +165,8 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
+   cmd->wsi_direct_images = UTIL_DYNARRAY_INIT;
+   cmd->diagnostic_sets = UTIL_DYNARRAY_INIT;
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
    cmd->vk.dynamic_graphics_state.ms.sample_locations =
@@ -236,8 +247,12 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    }
 
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
+   cmd->defer_encoding =
+      debug_get_bool_option("KK_WSI_DEFER_ENCODING", false) &&
+      debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false);
    cmd->one_time_submit =
-      pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) &&
+      !debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false);
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */
@@ -550,14 +565,31 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
    mtl_end_encoding(encoder);
    mtl_release(encoder);
 
-   /* Fold the pending timestamp counter-heap resolves into `cmd_buf` */
-   util_dynarray_foreach(&cmd->ts_resolves, struct kk_ts_resolve, r) {
-      mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, r->heap, r->index,
-                                       1u, r->dst_addr);
-   }
+   if (!debug_get_option_kk_batch_timestamp_resolves())
+      kk_flush_timestamp_resolves(cmd);
+}
 
+void
+kk_flush_timestamp_resolves(struct kk_cmd_buffer *cmd)
+{
+   struct kk_ts_resolve *entries = cmd->ts_resolves.data;
+   unsigned total = util_dynarray_num_elements(&cmd->ts_resolves,
+                                               struct kk_ts_resolve);
+   for (unsigned i = 0; i < total;) {
+      const struct kk_ts_resolve *first = &entries[i];
+      unsigned count = 1;
+      while (i + count < total &&
+             entries[i + count].heap == first->heap &&
+             entries[i + count].index == (uint64_t)first->index + count &&
+             entries[i + count].dst_addr == first->dst_addr + count * sizeof(uint64_t))
+         count++;
+      mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, first->heap,
+                                       first->index, count, first->dst_addr);
+      i += count;
+   }
    util_dynarray_clear(&cmd->ts_resolves);
 }
+
 
 static void
 flush_post_render_writes(struct kk_cmd_buffer *cmd)
@@ -589,6 +621,7 @@ cs_end(struct kk_cmd_buffer *cmd)
           !cmd->state.gfx.render.suspending_encoder && cmd->metal.head == NULL &&
           cmd->metal.allocator) {
          cmd->state.gfx.render.resuming_encoder = false;
+         kk_flush_timestamp_resolves(cmd);
          mtl_end_command_buffer(cmd->metal.cmd_buf);
          cmd->metal.head = cmd->metal.cmd_buf;
          cmd->metal.cmd_buf = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
@@ -1190,6 +1223,8 @@ kk_upload_descriptor_root(struct kk_cmd_buffer *cmd,
       return 0u;
 
    root->addr = root_ptr.gpu;
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   root->diagnostic_gpu = dev->diagnostic_bo ? dev->diagnostic_bo->gpu : 0;
 
    memcpy(root_ptr.cpu, root, sizeof(*root));
    desc->root_dirty = false;
@@ -1446,6 +1481,9 @@ kk_attachment_do_renderpass_resolve(const struct kk_attachment *attachment,
 
    if (attachment->resolve_mode == VK_RESOLVE_MODE_NONE ||
        !attachment->resolve_iview || !attachment->iview)
+      return false;
+
+   if (attachment->iview->vk.image->samples <= VK_SAMPLE_COUNT_1_BIT)
       return false;
 
    /* There appears to be a synchronization bug in Metal.

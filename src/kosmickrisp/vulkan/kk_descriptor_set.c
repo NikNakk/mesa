@@ -8,6 +8,7 @@
 #include "kk_descriptor_set.h"
 
 #include "kk_bo.h"
+#include "kosmickrisp/bridge/mtl_buffer.h"
 #include "kk_buffer.h"
 #include "kk_buffer_view.h"
 #include "kk_descriptor_set_layout.h"
@@ -23,6 +24,8 @@
 #include "util/log.h"
 #include "util/u_debug.h"
 #include "util/half_float.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(kk_descriptor_diag, "KK_DESCRIPTOR_DIAG", false);
 
 static inline uint32_t
 align_u32(uint32_t v, uint32_t a)
@@ -239,6 +242,54 @@ write_buffer_desc(struct kk_descriptor_set *set,
       .size = addr_range.range,
    };
    write_desc(set, binding, elem, &desc, sizeof(desc));
+   const struct kk_descriptor_set_binding_layout *bl = &set->layout->binding[binding];
+   if (debug_get_option_kk_descriptor_diag() &&
+       bl->offset + elem * bl->stride == 64) {
+      void *cpu = buffer ? mtl_get_contents(buffer->metal.handle) : NULL;
+      set->diagnostic_addr = desc.base_addr;
+      set->diagnostic_cpu = cpu && desc.size >= 8
+         ? (char *)cpu + kk_buffer_mtl_offset(buffer, info->offset) : NULL;
+      static unsigned logged;
+      if (p_atomic_inc_return(&logged) <= 256 || !desc.base_addr)
+         mesa_logi("kk-desc-write: set=%p layout=%p binding=%u elem=%u type=%u "
+                   "buffer=%p offset=%llu range=%llu addr=%llx size=%u cpu=%p",
+                   (void *)set, (void *)set->layout, binding, elem, bl->type,
+                   (void *)buffer, (unsigned long long)info->offset,
+                   (unsigned long long)info->range,
+                   (unsigned long long)desc.base_addr, desc.size, set->diagnostic_cpu);
+   }
+}
+
+void
+kk_descriptor_diagnostic_submit(struct kk_descriptor_set *set)
+{
+   static unsigned logged, anomalies;
+   if (!set || set->size < 80)
+      return;
+   struct kk_buffer_address desc;
+   memcpy(&desc, (char *)set->mapped_ptr + 64, sizeof(desc));
+   int32_t header[2] = {0};
+   bool mapped = set->diagnostic_cpu && set->diagnostic_addr == desc.base_addr;
+   if (mapped)
+      memcpy(header, set->diagnostic_cpu, sizeof(header));
+   bool bad = !desc.base_addr || desc.size < 8 ||
+              (mapped && (header[1] < 0 || header[1] > 8 ||
+               (uint64_t)352 + (uint64_t)16 * header[1] > desc.size));
+   if (p_atomic_inc_return(&logged) <= 128 ||
+       (bad && p_atomic_inc_return(&anomalies) <= 128)) {
+      mesa_logi("kk-desc-submit: set=%p layout=%p set_addr=%llx addr=%llx size=%u "
+                "mapped=%u enabled=%d count=%d suspect=%u root_sets_offset=%zu",
+                (void *)set, (void *)set->layout, (unsigned long long)set->addr,
+                (unsigned long long)desc.base_addr, desc.size, mapped,
+                header[0], header[1], bad, (size_t)928);
+      for (unsigned b = 0; b < set->layout->binding_count; b++) {
+         const struct kk_descriptor_set_binding_layout *bl = &set->layout->binding[b];
+         if (bl->array_size && bl->stride && bl->offset <= 64 &&
+             64 - bl->offset < bl->array_size * bl->stride)
+            mesa_logi("kk-desc-layout: layout=%p binding=%u type=%u offset=%u stride=%u array=%u",
+                      (void *)set->layout, b, bl->type, bl->offset, bl->stride, bl->array_size);
+      }
+   }
 }
 
 static void
@@ -277,6 +328,7 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
    }
    write_desc(set, binding, elem, &desc, sizeof(desc));
+
 }
 
 static void
@@ -380,6 +432,15 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                MIN2(dst_binding_layout->stride, src_binding_layout->stride);
             assert(copy_size <= dst_max_size && copy_size <= src_max_size);
             memcpy(dst_map, src_map, copy_size);
+            if (debug_get_option_kk_descriptor_diag() &&
+                dst_binding_layout->offset + (copy->dstArrayElement + j) * dst_binding_layout->stride == 64) {
+               bool tracked = src_binding_layout->offset + (copy->srcArrayElement + j) * src_binding_layout->stride == 64;
+               dst->diagnostic_addr = tracked ? src->diagnostic_addr : 0;
+               dst->diagnostic_cpu = tracked ? src->diagnostic_cpu : NULL;
+               mesa_logi("kk-desc-copy: src=%p binding=%u elem=%u dst=%p binding=%u elem=%u tracked=%u",
+                         (void *)src, copy->srcBinding, copy->srcArrayElement+j,
+                         (void *)dst, copy->dstBinding, copy->dstArrayElement+j, tracked);
+            }
          }
       }
 
@@ -653,14 +714,8 @@ kk_descriptor_set_create(struct kk_device *dev, struct kk_descriptor_pool *pool,
    vk_descriptor_set_layout_ref(&layout->vk);
    set->layout = layout;
 
-   for (uint32_t b = 0; b < layout->binding_count; b++) {
-      if (layout->binding[b].type != VK_DESCRIPTOR_TYPE_SAMPLER &&
-          layout->binding[b].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-         continue;
-
-      if (layout->binding[b].immutable_samplers == NULL)
-         continue;
-
+   for (uint32_t b = layout->first_immutable_binding; b != UINT32_MAX;
+        b = layout->binding[b].next_immutable_binding) {
       uint32_t array_size = layout->binding[b].array_size;
       if (layout->binding[b].flags &
           VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)

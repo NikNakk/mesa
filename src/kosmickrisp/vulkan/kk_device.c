@@ -344,6 +344,16 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_sampler_heap;
 
+   if (debug_get_bool_option("KK_GPU_DIAG", false) ||
+       !strcmp(debug_get_option("KK_TURN_PROBE", ""), "tripwire")) {
+      result = kk_alloc_bo(dev, &dev->vk.base, 4096, 64, &dev->diagnostic_bo);
+      if (result != VK_SUCCESS) {
+         kk_device_finish_lib(dev);
+         goto fail_sampler_heap;
+      }
+      memset(dev->diagnostic_bo->cpu, 0, 4096);
+   }
+
    if (pdev->settings.gpu_capture_enabled) {
       const char *capture_directory =
          debug_get_option("MESA_KK_GPU_CAPTURE_DIRECTORY", NULL);
@@ -388,7 +398,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    /* End capture before we start releasing resources. Otherwise, Metal capture
     * may run into issues. */
-   if (pdev->settings.gpu_capture_enabled) {
+   if (pdev->settings.gpu_capture_enabled ||
+       debug_get_bool_option("KK_CAPTURE_TARGET_SUBMITS", false)) {
       mtl_stop_gpu_capture();
    }
 
@@ -412,6 +423,9 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
    }
+
+   if (dev->diagnostic_bo)
+      kk_destroy_bo(dev, dev->diagnostic_bo);
 
    util_dynarray_foreach(&dev->stitch_allocators.free, mtl_command_allocator *,
                          allocator)

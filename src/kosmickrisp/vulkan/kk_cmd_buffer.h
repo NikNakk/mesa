@@ -65,6 +65,7 @@ struct kk_root_descriptor_table {
 
    uint64_t fdm_rate_params;
    uint64_t custom_resolve_outputs[KK_MAX_RTS];
+   uint64_t diagnostic_gpu;
 };
 
 struct kk_descriptor_state {
@@ -140,6 +141,7 @@ struct kk_rendering_state {
    bool suspending_encoder;
    bool resuming_encoder;
    bool rendering_to_whole_framebuffer;
+   bool fdm_discard_depth;
 };
 
 /* Dirty tracking bits for state not tracked by vk_dynamic_graphics_state or
@@ -260,8 +262,6 @@ struct kk_uploader {
    uint32_t offset;
 };
 
-/* A pending resolve of one timestamp counter-heap entry into a query pool BO.
- * Recorded by vkCmdWriteTimestamp2 and flushed on the GPU timeline at cs_end. */
 struct kk_ts_resolve {
    mtl_counter_heap *heap;
    uint32_t index;
@@ -286,7 +286,6 @@ struct kk_cmd_buffer {
       mtl_command_allocator *held_allocator;
       bool tail_used;
    } metal;
-   /* Pending timestamp resolves (struct kk_ts_resolve), flushed at cs_end. */
    struct util_dynarray ts_resolves;
    /* Timestamps already sampled by the current render encoder. (struct
     * kk_ts_stage_entry). */
@@ -295,6 +294,8 @@ struct kk_cmd_buffer {
    struct util_dynarray post_render_writes;
 
    void *drawable;
+   bool wsi_signal_only;
+   struct util_dynarray wsi_direct_images;
    mtl_argument_table *argument_table;
    bool no_stitch;
 
@@ -314,12 +315,15 @@ struct kk_cmd_buffer {
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
+   struct util_dynarray diagnostic_sets;
+   uint32_t diagnostic_target_draws;
 
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
    /* Set at vkBeginCommandBuffer. One-time-submit buffers skip command
     * enqueueing in the trampolines since they can never be replayed. */
    bool one_time_submit;
+   bool defer_encoding;
    /* Metal command buffers are single-shot: a resubmission must re-record
     * by replaying the enqueued commands (see rerecord_cmd_buffer). */
    bool submitted;
@@ -364,6 +368,7 @@ void kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep);
 
 void kk_encoder_stat(const char *what, bool broke_render);
 void cs_end(struct kk_cmd_buffer *cmd);
+void kk_flush_timestamp_resolves(struct kk_cmd_buffer *cmd);
 void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
                                         uint64_t addr);
 

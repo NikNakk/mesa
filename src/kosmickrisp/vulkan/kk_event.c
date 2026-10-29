@@ -12,6 +12,7 @@
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
 #include "kk_entrypoints.h"
+#include "kosmickrisp/bridge/mtl_encoder.h"
 
 #define KK_EVENT_MEM_SIZE sizeof(VkResult)
 
@@ -96,6 +97,12 @@ kk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(kk_event, event, _event);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0) {
+      cs_end(cmd);
+      kk_flush_timestamp_resolves(cmd);
+      mtl_compute_encoder *encoder = cs_get_compute(cmd);
+      mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
+   }
    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_SET});
 }
 
@@ -105,6 +112,12 @@ kk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 {
    VK_FROM_HANDLE(kk_event, event, _event);
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0) {
+      cs_end(cmd);
+      kk_flush_timestamp_resolves(cmd);
+      mtl_compute_encoder *encoder = cs_get_compute(cmd);
+      mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
+   }
    kk_cmd_write(cmd, (struct libkk_imm_write){event->addr, VK_EVENT_RESET});
 }
 
@@ -115,6 +128,11 @@ kk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
 {
    /* We do nothing, event should already be set by the time we are here. */
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+   if (cmd->metal.render == NULL &&
+       util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0) {
+      cs_end(cmd);
+      kk_flush_timestamp_resolves(cmd);
+   }
    if (KK_EXPERIMENTAL(LIGHT_BARRIERS)) {
       for (uint32_t i = 0; i < eventCount; i++)
          kk_cmd_barrier(cmd, &pDependencyInfos[i]);

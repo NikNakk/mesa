@@ -48,6 +48,9 @@ struct kk_descriptor_set {
    uint64_t addr;
    uint32_t size;
 
+   const void *diagnostic_cpu;
+   uint64_t diagnostic_addr;
+
    struct kk_buffer_address dynamic_buffers[];
 };
 
@@ -67,6 +70,8 @@ struct kk_push_descriptor_set {
    uint8_t data[KK_PUSH_DESCRIPTOR_SET_SIZE];
    struct kk_descriptor_set_layout *layout;
 };
+
+void kk_descriptor_diagnostic_submit(struct kk_descriptor_set *set);
 
 void kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
                                    uint32_t write_count,

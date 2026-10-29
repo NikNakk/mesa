@@ -56,6 +56,8 @@ struct kk_image {
    bool wsi_opaque_alpha;
 
    bool metal_imported;
+   bool wsi_direct;
+   void *wsi_drawable;
 
    struct {
       uint8_t *cpu;
