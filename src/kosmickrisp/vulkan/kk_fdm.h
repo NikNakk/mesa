@@ -11,6 +11,8 @@
 #include "kosmickrisp/bridge/mtl_types.h"
 
 struct kk_cmd_buffer;
+struct vk_cmd_queue;
+void kk_fdm_execute_commands(struct kk_cmd_buffer *cmd, struct vk_cmd_queue *queue);
 
 void kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
                             const VkRenderingInfo *pRenderingInfo,

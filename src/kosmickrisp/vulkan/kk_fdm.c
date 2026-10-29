@@ -21,12 +21,56 @@
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
 #include "vk_util.h"
+#include "vk_cmd_queue.h"
 
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+
+void
+kk_fdm_execute_commands(struct kk_cmd_buffer *cmd, struct vk_cmd_queue *queue)
+{
+   if (kk_cmd_buffer_device(cmd)->vk.enabled_extensions.EXT_fragment_density_map_offset &&
+       debug_get_bool_option("KK_FDM_OFFSET_DEFER", true)) {
+      cmd->fdm_scan_head = &queue->cmds;
+      cmd->fdm_scan_next = queue->cmds.next;
+   }
+   vk_cmd_queue_execute(queue, kk_cmd_buffer_to_handle(cmd),
+                        &kk_cmd_buffer_device(cmd)->vk.dispatch_table);
+   cmd->fdm_scan_head = NULL;
+   cmd->fdm_scan_next = NULL;
+}
+
+static void
+kk_fdm_scan_offsets(struct kk_cmd_buffer *cmd)
+{
+   memset(cmd->fdm_offsets, 0, sizeof(cmd->fdm_offsets));
+   if (!cmd->fdm_scan_next)
+      return;
+   const struct list_head *p = cmd->fdm_scan_next;
+   while (p != cmd->fdm_scan_head) {
+      const struct vk_cmd_queue_entry *entry =
+         list_entry(p, const struct vk_cmd_queue_entry, cmd_link);
+      p = p->next;
+      if (entry->type == VK_CMD_END_RENDERING2_KHR) {
+         const VkRenderingEndInfoKHR *end = entry->u.end_rendering2_khr.rendering_end_info;
+         const VkRenderPassFragmentDensityMapOffsetEndInfoEXT *offset =
+            vk_find_struct_const(end->pNext, RENDER_PASS_FRAGMENT_DENSITY_MAP_OFFSET_END_INFO_EXT);
+         if (offset) {
+            uint32_t count = MIN2(offset->fragmentDensityOffsetCount, ARRAY_SIZE(cmd->fdm_offsets));
+            memcpy(cmd->fdm_offsets, offset->pFragmentDensityOffsets,
+                   count * sizeof(VkOffset2D));
+         }
+         break;
+      }
+      if (entry->type == VK_CMD_END_RENDERING)
+         break;
+   }
+   cmd->fdm_scan_next = p;
+}
 
 static simple_mtx_t kk_fdm_lock = SIMPLE_MTX_INITIALIZER;
 
@@ -309,11 +353,15 @@ kk_fdm_shift_profile(float *profile, uint32_t n, float target)
 }
 
 static float
-kk_fdm_density(const struct kk_image *density, uint32_t layer, uint32_t x,
-               uint32_t y, uint32_t channel)
+kk_fdm_density(const struct kk_image *density, uint32_t layer, int32_t x,
+               int32_t y, uint32_t channel, const VkOffset2D *offset)
 {
-   x = MIN2(x, density->fdm.width - 1);
-   y = MIN2(y, density->fdm.height - 1);
+   if (offset) {
+      x -= offset->x / KK_FDM_TEXEL_SIZE;
+      y -= offset->y / KK_FDM_TEXEL_SIZE;
+   }
+   x = CLAMP(x, 0, (int32_t)density->fdm.width - 1);
+   y = CLAMP(y, 0, (int32_t)density->fdm.height - 1);
    const uint8_t *texel =
       density->fdm.cpu +
       (((size_t)layer * density->fdm.height + y) * density->fdm.width + x) * 2;
@@ -321,9 +369,11 @@ kk_fdm_density(const struct kk_image *density, uint32_t layer, uint32_t x,
 }
 
 static void *
-kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
+kk_fdm_get_map(struct kk_cmd_buffer *cmd, struct kk_image *density,
                VkExtent2D screen, VkRect2D area)
 {
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   bool app_offset = dev->vk.enabled_extensions.EXT_fragment_density_map_offset;
    if (density->fdm.cpu == NULL)
       return NULL;
 
@@ -340,6 +390,7 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
    }
 
    for (uint32_t l = 0; l < layers; l++) {
+      const VkOffset2D *offset = app_offset ? &cmd->fdm_offsets[l] : NULL;
       for (uint32_t i = 0; i < nh; i++) {
          uint32_t a = i / 2, b = i / 2;
          if (!(i & 1)) {
@@ -348,8 +399,8 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
          }
          float q = 0;
          for (uint32_t y = 0; y < mh; y++) {
-            q = MAX2(q, kk_fdm_density(density, l, a, y, 0));
-            q = MAX2(q, kk_fdm_density(density, l, b, y, 0));
+            q = MAX2(q, kk_fdm_density(density, l, a, y, 0, offset));
+            q = MAX2(q, kk_fdm_density(density, l, b, y, 0, offset));
          }
          horizontal[l * nh + i] = q;
       }
@@ -361,8 +412,8 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
          }
          float q = 0;
          for (uint32_t x = 0; x < mw; x++) {
-            q = MAX2(q, kk_fdm_density(density, l, x, a, 1));
-            q = MAX2(q, kk_fdm_density(density, l, x, b, 1));
+            q = MAX2(q, kk_fdm_density(density, l, x, a, 1, offset));
+            q = MAX2(q, kk_fdm_density(density, l, x, b, 1, offset));
          }
          vertical[l * nv + i] = q;
       }
@@ -370,6 +421,11 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
 
    int16_t shift[KK_RATE_PARAMS_MAX_LAYERS][2] = {{0}};
    for (uint32_t l = 0; l < layers; l++) {
+      if (app_offset) {
+         shift[l][0] = cmd->fdm_offsets[l].x / 16;
+         shift[l][1] = cmd->fdm_offsets[l].y / 16;
+         continue;
+      }
       float gx, gy;
       if (!kk_fdm_get_gaze(l, &gx, &gy))
          continue;
@@ -406,7 +462,7 @@ kk_fdm_get_map(struct kk_device *dev, struct kk_image *density,
    /* Earlier parameter blocks may still be read by work in flight. Maps
     * change at most once a frame, so the oldest of a short ring is free. */
    struct kk_bo *params = NULL;
-   if (density->fdm.old_params_count >= KK_FDM_PARAMS_RING) {
+   if (!app_offset && density->fdm.old_params_count >= KK_FDM_PARAMS_RING) {
       params = density->fdm.old_params[0];
       memmove(density->fdm.old_params, density->fdm.old_params + 1,
               (density->fdm.old_params_count - 1) * sizeof(params));
@@ -588,6 +644,7 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    struct kk_rendering_state *render = &gfx->render;
    struct kk_image *density = NULL;
+   kk_fdm_scan_offsets(cmd);
 
    if (KK_EXPERIMENTAL(FDM_RATE)) {
       const VkRenderingFragmentDensityMapAttachmentInfoEXT *fdm_info =
@@ -619,7 +676,7 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    }
 
    simple_mtx_lock(&kk_fdm_lock);
-   void *map = density ? kk_fdm_get_map(dev, density, screen, render->area) : NULL;
+   void *map = density ? kk_fdm_get_map(cmd, density, screen, render->area) : NULL;
    if (map && !kk_fdm_all_subsampled(render)) {
       static uint32_t logged;
       if (kk_fdm_debug() && logged++ < 8)

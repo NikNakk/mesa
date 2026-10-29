@@ -208,8 +208,7 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    if (cmd->defer_encoding)
       rerecord->no_stitch = true;
 
-   vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
-                        &dev->vk.dispatch_table);
+   kk_fdm_execute_commands(rerecord, &cmd->vk.cmd_queue);
 
    result = kk_EndCommandBuffer(rerecord_handle);
    if (result != VK_SUCCESS)
@@ -285,8 +284,7 @@ rerecord_cmd_buffer(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
    if (cmd->defer_encoding)
       rerecord->no_stitch = true;
 
-   vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
-                        &dev->vk.dispatch_table);
+   kk_fdm_execute_commands(rerecord, &cmd->vk.cmd_queue);
 
    result = kk_EndCommandBuffer(rerecord_handle);
    if (result != VK_SUCCESS)

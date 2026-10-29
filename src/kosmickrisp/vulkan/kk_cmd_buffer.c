@@ -8,6 +8,8 @@
 #include "kk_cmd_buffer.h"
 
 #include "kk_buffer.h"
+#include "kk_device.h"
+#include "vk_cmd_queue.h"
 #include "kk_cmd_pool.h"
 #include "kk_debug.h"
 #include "kk_fdm.h"
@@ -217,6 +219,11 @@ kk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    kk_reset_cmd_buffer_internal(cmd);
    vk_command_buffer_reset(&cmd->vk);
    cmd->submitted = false;
+   cmd->fdm_offset_deferred = false;
+   cmd->defer_encoding = false;
+   cmd->fdm_scan_head = NULL;
+   cmd->fdm_scan_next = NULL;
+   memset(cmd->fdm_offsets, 0, sizeof(cmd->fdm_offsets));
    cmd->one_time_submit = false;
 }
 
@@ -250,6 +257,13 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->defer_encoding =
       debug_get_bool_option("KK_WSI_DEFER_ENCODING", false) &&
       debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false);
+   cmd->fdm_offset_deferred =
+      kk_cmd_buffer_device(cmd)->vk.enabled_extensions.EXT_fragment_density_map_offset &&
+      debug_get_bool_option("KK_FDM_OFFSET_DEFER", true);
+   cmd->defer_encoding |= cmd->fdm_offset_deferred;
+   cmd->fdm_scan_head = NULL;
+   cmd->fdm_scan_next = NULL;
+   memset(cmd->fdm_offsets, 0, sizeof(cmd->fdm_offsets));
    cmd->one_time_submit =
       (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) &&
       !debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false);
@@ -280,6 +294,10 @@ kk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
+   if (cmd->fdm_offset_deferred && cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+      cmd->defer_encoding = false;
+      kk_fdm_execute_commands(cmd, &cmd->vk.cmd_queue);
+   }
    end_recording(cmd);
 
    return vk_command_buffer_end(&cmd->vk);

@@ -20,6 +20,7 @@
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
 #include "util/disk_cache.h"
+#include "util/u_debug.h"
 #include "util/mesa-blake3.h"
 #include "git_sha1.h"
 
@@ -182,6 +183,8 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
       .EXT_fragment_density_map = KK_EXPERIMENTAL(FDM),
+      .EXT_fragment_density_map_offset = KK_EXPERIMENTAL(FDM_RATE) &&
+         debug_get_bool_option("KK_FDM_OFFSET_PROBE", false),
 #ifdef VK_USE_PLATFORM_METAL_EXT
       .EXT_metal_objects = true,
 #endif
@@ -459,6 +462,7 @@ kk_get_device_features(
       /* VK_EXT_fragment_density_map */
       .fragmentDensityMap = supported_extensions->EXT_fragment_density_map,
       .fragmentDensityMapDynamic = false,
+      .fragmentDensityMapOffset = supported_extensions->EXT_fragment_density_map_offset,
       .fragmentDensityMapNonSubsampledImages =
          supported_extensions->EXT_fragment_density_map,
 
@@ -857,6 +861,7 @@ kk_get_device_properties(
       .minFragmentDensityTexelSize = {32, 32},
       .maxFragmentDensityTexelSize = {1024, 1024},
       .fragmentDensityInvocations = false,
+      .fragmentDensityOffsetGranularity = {32, 32},
 
       /* VK_EXT_nested_command_buffer */
       .maxCommandBufferNestingLevel = UINT32_MAX,
