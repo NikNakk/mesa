@@ -13,6 +13,10 @@
 #include <Metal/MTL4Counters.h>
 #include <Metal/MTLCaptureManager.h>
 #include <Metal/MTLDevice.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 /* Device creation */
 mtl_device *
@@ -36,8 +40,20 @@ mtl_device_create()
 }
 
 /* Device operations */
-void
-mtl_start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory)
+static bool capture_window_attempted;
+static bool capture_window_active;
+static double capture_window_end;
+
+static double
+capture_time(void)
+{
+   struct timespec now;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   return now.tv_sec + now.tv_nsec / 1e9;
+}
+
+static bool
+start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory)
 {
    @autoreleasepool {
       id<MTLDevice> mtl_dev = (id<MTLDevice>)mtl_dev_handle;
@@ -59,6 +75,72 @@ mtl_start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory)
       if (![captureMgr startCaptureWithDescriptor:captureDesc error:&err]) {
          fprintf(stderr, "Failed to automatically start GPU capture session (Error code %li) using startCaptureWithDescriptor: %s\n",
                  (long)err.code, err.localizedDescription.UTF8String);
+         return false;
+      }
+      fprintf(stderr, "kk-capture: started directory=%s\n", directory ? directory : "Xcode");
+      return true;
+   }
+}
+
+void
+mtl_start_gpu_capture(mtl_device *device, const char *directory)
+{
+   @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+      if (getenv("KK_CAPTURE_TRIGGER_FILE")) {
+         fprintf(stderr, "kk-capture: armed trigger=%s\n", getenv("KK_CAPTURE_TRIGGER_FILE"));
+      } else {
+         start_gpu_capture(device, directory);
+      }
+   }
+}
+
+bool
+mtl_trigger_gpu_capture(mtl_device *device)
+{
+   bool started = false;
+   @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+      if (!capture_window_attempted && !capture_window_active) {
+         capture_window_attempted = true;
+         capture_window_active = start_gpu_capture(
+            device, getenv("MESA_KK_GPU_CAPTURE_DIRECTORY"));
+         capture_window_end = 0.0;
+         started = capture_window_active;
+      }
+   }
+   return started;
+}
+
+bool
+mtl_gpu_capture_active(void)
+{
+   bool active;
+   @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+      active = capture_window_active;
+   }
+   return active;
+}
+
+void
+mtl_poll_gpu_capture(mtl_device *device)
+{
+   const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
+   if (!trigger)
+      return;
+   @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+      if (capture_window_active && capture_window_end > 0.0 &&
+          capture_time() >= capture_window_end) {
+         [[MTLCaptureManager sharedCaptureManager] stopCapture];
+         capture_window_active = false;
+         fprintf(stderr, "kk-capture: stopped\n");
+      }
+      if (!capture_window_attempted && access(trigger, F_OK) == 0) {
+         capture_window_attempted = true;
+         fprintf(stderr, "kk-capture: trigger observed\n");
+         capture_window_active = start_gpu_capture(device,
+                            getenv("MESA_KK_GPU_CAPTURE_DIRECTORY"));
+         const char *seconds = getenv("KK_CAPTURE_SECONDS");
+         double duration = seconds ? atof(seconds) : 0.25;
+         capture_window_end = capture_time() + (duration > 0 && duration <= 5 ? duration : 0.25);
       }
    }
 }
@@ -67,7 +149,10 @@ void
 mtl_stop_gpu_capture()
 {
    @autoreleasepool {
-      [[MTLCaptureManager sharedCaptureManager] stopCapture];
+      @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+         [[MTLCaptureManager sharedCaptureManager] stopCapture];
+         capture_window_active = false;
+      }
    }
 }
 

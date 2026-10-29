@@ -660,7 +660,8 @@ kk_get_device_properties(
       .sampledImageStencilSampleCounts = sample_counts,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
-      .timestampComputeAndGraphics = true,
+      .timestampComputeAndGraphics =
+         !debug_get_bool_option("KK_CAPTURE_NO_TIMESTAMPS", false),
       .timestampPeriod = timestamp_period,
       .maxClipDistances = 8,
       .maxCullDistances = 8,
@@ -1382,7 +1383,8 @@ kk_GetPhysicalDeviceQueueFamilyProperties2(
       {
          p->queueFamilyProperties.queueFlags = queue_family->queue_flags;
          p->queueFamilyProperties.queueCount = queue_family->queue_count;
-         p->queueFamilyProperties.timestampValidBits = 64;
+         p->queueFamilyProperties.timestampValidBits =
+            debug_get_bool_option("KK_CAPTURE_NO_TIMESTAMPS", false) ? 0 : 64;
          p->queueFamilyProperties.minImageTransferGranularity =
             (VkExtent3D){1, 1, 1};
 

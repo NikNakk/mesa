@@ -18,6 +18,8 @@ void kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
                             VkExtent2D screen);
 
 void kk_fdm_carry_to_next_rendering(struct kk_cmd_buffer *cmd);
+struct kk_image;
+void kk_fdm_clear_image_mapping(struct kk_cmd_buffer *cmd, struct kk_image *image);
 
 /* Gaze point per view, in [0, 1] across the render area, for gaze-centred
  * rate maps. Exported for the OpenXR layer in the same process. */

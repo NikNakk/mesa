@@ -8,6 +8,9 @@
 
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
+#include <objc/message.h>
+#include "util/u_debug.h"
+#include "util/log.h"
 
 /* MTL4CommitOptions */
 mtl_commit_options *
@@ -50,7 +53,31 @@ mtl_new_command_queue(mtl_device *device)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
-      return [dev newMTL4CommandQueue];
+      id<MTL4CommandQueue> queue = [dev newMTL4CommandQueue];
+      long priority = debug_get_num_option("KK_GPU_QUEUE_PRIORITY", -1);
+      if (priority >= 0 && priority <= 2) {
+         SEL set_fg = sel_registerName("setGPUPriority:");
+         SEL set_bg = sel_registerName("setBackgroundGPUPriority:");
+         SEL get_fg = sel_registerName("getGPUPriority");
+         SEL get_bg = sel_registerName("getBackgroundGPUPriority");
+         if ([queue respondsToSelector:set_fg] &&
+             [queue respondsToSelector:set_bg] &&
+             [queue respondsToSelector:get_fg] &&
+             [queue respondsToSelector:get_bg]) {
+            ((void (*)(id, SEL, long))objc_msgSend)(queue, set_fg, priority);
+            ((void (*)(id, SEL, long))objc_msgSend)(queue, set_bg, priority);
+            mesa_logi("kk: GPU queue priority requested=%ld foreground=%ld "
+                      "background=%ld", priority,
+                      ((long (*)(id, SEL))objc_msgSend)(queue, get_fg),
+                      ((long (*)(id, SEL))objc_msgSend)(queue, get_bg));
+         } else {
+            mesa_logw("kk: GPU queue priority selectors unavailable");
+         }
+      } else if (priority != -1) {
+         mesa_logw("kk: invalid KK_GPU_QUEUE_PRIORITY=%ld; expected -1..2",
+                   priority);
+      }
+      return queue;
    }
 }
 

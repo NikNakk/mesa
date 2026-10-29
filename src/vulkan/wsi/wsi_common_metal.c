@@ -365,6 +365,7 @@ struct wsi_metal_swapchain {
 
    /* VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR */
    bool opaque_composition;
+   bool direct_rendering;
 
    struct wsi_metal_image images[0];
 };
@@ -477,7 +478,18 @@ wsi_cmd_blit_image_to_image(const struct wsi_swapchain *chain,
       const VkCommandBufferBeginInfo begin_info = {
          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       };
-      wsi->BeginCommandBuffer(image->blit.cmd_buffers[i], &begin_info);
+      result = wsi->BeginCommandBuffer(image->blit.cmd_buffers[i], &begin_info);
+      if (result != VK_SUCCESS)
+         return result;
+
+      if (metal_chain->direct_rendering) {
+         result = wsi->EndCommandBuffer(image->blit.cmd_buffers[i]);
+         if (result != VK_SUCCESS)
+            return result;
+         wsi->metal.encode_drawable_present(image->blit.cmd_buffers[i],
+                                             metal_image->drawable, true);
+         continue;
+      }
 
       VkImageMemoryBarrier img_mem_barriers[] = {
          {
@@ -581,7 +593,7 @@ wsi_cmd_blit_image_to_image(const struct wsi_swapchain *chain,
 
       result = wsi->EndCommandBuffer(image->blit.cmd_buffers[i]);
 
-      wsi->metal.encode_drawable_present(image->blit.cmd_buffers[i], metal_image->drawable);
+      wsi->metal.encode_drawable_present(image->blit.cmd_buffers[i], metal_image->drawable, false);
    }
 
    return result;
@@ -611,11 +623,23 @@ wsi_metal_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
          *image_index = i;
          image->drawable = drawable;
          if (!wsi_chain->wsi->sw) {
-            chain->base.wsi->metal.bind_drawable_to_vkimage(image->base.blit.image,
-                                                            image->drawable);
+            VkResult result = chain->base.wsi->metal.bind_drawable_to_vkimage(
+               chain->direct_rendering ? image->base.image : image->base.blit.image,
+               image->drawable);
+            if (result != VK_SUCCESS) {
+               wsi_metal_release_drawable(image->drawable);
+               image->drawable = NULL;
+               return result;
+            }
             /* Since present images will only be backed by MTLTextures after acquisition,
              * we need to re-record the command buffer so it uses the new drawable. */
-            wsi_cmd_blit_image_to_image(wsi_chain, &wsi_chain->image_info, &image->base);
+            result = wsi_cmd_blit_image_to_image(wsi_chain, &wsi_chain->image_info,
+                                                 &image->base);
+            if (result != VK_SUCCESS) {
+               wsi_metal_release_drawable(image->drawable);
+               image->drawable = NULL;
+               return result;
+            }
          }
          return VK_SUCCESS;
       }
@@ -826,6 +850,11 @@ wsi_metal_create_image(const struct wsi_metal_swapchain *metal_chain,
    if (wsi->sw || result != VK_SUCCESS)
       return result;
 
+   if (metal_chain->direct_rendering) {
+      wsi->metal.set_direct_image(image->image);
+      return VK_SUCCESS;
+   }
+
    /* We perform blit through rendering */
    VkImageCreateInfo blit_create = chain->image_info.create;
    blit_create.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -900,7 +929,16 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
     * set the framebuffer only usage.
     */
    const bool layer_opaque = opaque_composition && wsi_device->sw;
-   const bool framebuffer_only = !wsi_device->sw;
+   const bool direct_rendering =
+      !wsi_device->sw && wsi_device->metal.set_direct_image &&
+      opaque_composition &&
+      !(pCreateInfo->flags & ~(VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR |
+                               VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR)) &&
+      pCreateInfo->imageArrayLayers == 1 &&
+      (pCreateInfo->imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+      !(pCreateInfo->imageUsage & ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT));
+   const bool framebuffer_only = !wsi_device->sw && !direct_rendering;
 
    VkResult result = wsi_metal_layer_configure(metal_surface->pLayer,
       pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
@@ -950,6 +988,11 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->surface = metal_surface;
    chain->current_image_index = 0;
    chain->opaque_composition = opaque_composition;
+   chain->direct_rendering = direct_rendering;
+   if (wsi_device->metal.set_direct_image)
+      fprintf(stderr, "wsi-metal: direct-alpha-one=%u usage=0x%x flags=0x%x layers=%u alpha=%u\n",
+              direct_rendering, pCreateInfo->imageUsage, pCreateInfo->flags,
+              pCreateInfo->imageArrayLayers, pCreateInfo->compositeAlpha);
 
    chain->present_info = wsi_metal_create_present_info();
    if (chain->present_info == NULL) {

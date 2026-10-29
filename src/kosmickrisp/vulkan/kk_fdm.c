@@ -168,8 +168,12 @@ kk_fdm_note_view(const struct vk_image_view *view, const char *what)
 VkResult
 kk_fdm_image_init(struct kk_device *dev, struct kk_image *image)
 {
+   bool discard_depth = debug_get_bool_option("KK_FDM_DISCARD_DEPTH", false) &&
+                        image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+                        (image->vk.aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
    if (!KK_EXPERIMENTAL(FDM_RATE) ||
-       !(image->vk.create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT))
+       (!(image->vk.create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT) &&
+        !discard_depth))
       return VK_SUCCESS;
 
    VkResult result = kk_alloc_bo(dev, &image->vk.base, KK_RATE_PARAMS_SIZE_B, 0,
@@ -472,6 +476,33 @@ kk_fdm_subsampled(const struct kk_image_view *iview)
 }
 
 static bool
+kk_fdm_depth_compatible(const struct kk_rendering_state *render,
+                        const struct kk_attachment *attachment)
+{
+   if (kk_fdm_subsampled(attachment->iview))
+      return true;
+   if (!debug_get_bool_option("KK_FDM_DISCARD_DEPTH", false) ||
+       !(attachment->iview->vk.image->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ||
+       attachment->iview->vk.image->samples != VK_SAMPLE_COUNT_1_BIT ||
+       (attachment->load_op != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+        attachment->load_op != VK_ATTACHMENT_LOAD_OP_DONT_CARE) ||
+       attachment->store_op != VK_ATTACHMENT_STORE_OP_DONT_CARE ||
+       attachment->resolve_mode != VK_RESOLVE_MODE_SAMPLE_ZERO_BIT ||
+       !attachment->resolve_iview ||
+       !kk_fdm_subsampled(attachment->resolve_iview))
+      return false;
+   const struct vk_image_view *view = &attachment->iview->vk;
+   return view->base_mip_level == 0 && view->base_array_layer == 0 &&
+          view->layer_count == view->image->array_layers &&
+          render->area.offset.x == 0 && render->area.offset.y == 0 &&
+          render->area.extent.width == view->image->extent.width &&
+          render->area.extent.height == view->image->extent.height &&
+          (render->view_mask
+              ? render->view_mask == BITFIELD64_MASK(view->layer_count)
+              : render->layer_count == view->layer_count);
+}
+
+static bool
 kk_fdm_all_subsampled(const struct kk_rendering_state *render)
 {
    for (uint32_t i = 0; i < render->color_att_count; i++) {
@@ -480,8 +511,8 @@ kk_fdm_all_subsampled(const struct kk_rendering_state *render)
            !kk_fdm_subsampled(render->color_att[i].resolve_iview)))
          return false;
    }
-   return kk_fdm_subsampled(render->depth_att.iview) &&
-          kk_fdm_subsampled(render->stencil_att.iview) &&
+   return kk_fdm_depth_compatible(render, &render->depth_att) &&
+          kk_fdm_depth_compatible(render, &render->stencil_att) &&
           (render->depth_att.resolve_mode == VK_RESOLVE_MODE_NONE ||
            kk_fdm_subsampled(render->depth_att.resolve_iview)) &&
           (render->stencil_att.resolve_mode == VK_RESOLVE_MODE_NONE ||
@@ -505,12 +536,20 @@ kk_fdm_log_view(const char *what, uint32_t i, const struct kk_image_view *iview)
 static void
 kk_fdm_log_pass(const struct kk_rendering_state *render, const char *why)
 {
-   mesa_logi("kk-fdm: %s", why);
+   mesa_logi("kk-fdm: %s flags=0x%x depth load=%u store=%u resolve=0x%x",
+             why, render->flags, render->depth_att.load_op,
+             render->depth_att.store_op, render->depth_att.resolve_mode);
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       kk_fdm_log_view("color", i, render->color_att[i].iview);
       if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE)
          kk_fdm_log_view("color resolve", i, render->color_att[i].resolve_iview);
    }
+   if (render->color_att_count && render->color_att[0].iview)
+      mesa_logi("kk-fdm: color image %p load=%u store=%u depth image %p",
+                (void *)render->color_att[0].iview->vk.image,
+                render->color_att[0].load_op, render->color_att[0].store_op,
+                render->depth_att.iview
+                   ? (void *)render->depth_att.iview->vk.image : NULL);
    kk_fdm_log_view("depth", 0, render->depth_att.iview);
    if (render->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE)
       kk_fdm_log_view("depth resolve", 0, render->depth_att.resolve_iview);
@@ -632,6 +671,9 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    }
 
    gfx->fdm.density = map ? density : NULL;
+   render->fdm_discard_depth = map &&
+      (!kk_fdm_subsampled(render->depth_att.iview) ||
+       !kk_fdm_subsampled(render->stencil_att.iview));
    if (map && render->stitch) {
       if (gfx->stitch.fdm_serial && gfx->stitch.fdm_serial != density->fdm.serial)
          gfx->stitch.fdm_mixed = true;
@@ -675,6 +717,18 @@ kk_seq_log(struct kk_cmd_buffer *cmd, const char *fmt, ...)
    vsnprintf(buf, sizeof(buf), fmt, ap);
    va_end(ap);
    mesa_logi("kk-seq %p: %s", (void *)cmd, buf);
+}
+
+void
+kk_fdm_clear_image_mapping(struct kk_cmd_buffer *cmd, struct kk_image *image)
+{
+   if (!image || !image->rate_params)
+      return;
+   kk_cmd_write(cmd, (struct libkk_imm_write){image->rate_params->gpu, 0});
+   mtl_barrier_after_encoder_stages(cs_get_compute(cmd), MTL_STAGE_DISPATCH,
+                                    MTL_STAGE_DISPATCH);
+   image->rate_params_owner = NULL;
+   image->rate_params_serial = 0;
 }
 
 void

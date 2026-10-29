@@ -18,6 +18,8 @@
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
 #include "kk_query_table.h"
+#include "util/u_debug.h"
+#include "util/log.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
@@ -197,7 +199,8 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
          remap_index[pool->oq.queries++] = index;
       }
    } else if (kk_pool_is_ts(pool)) {
-      if (!pdev->settings.gpu_capture_enabled) {
+      if (!pdev->settings.gpu_capture_enabled &&
+          !debug_get_bool_option("KK_CAPTURE_NO_TIMESTAMPS", false)) {
          /* Timestamps are sampled into a Metal counter heap (one entry per query)
           * and resolved into `bo` after the GPU writes them. */
          pool->ts.heap = mtl_new_timestamp_counter_heap(dev->mtl_handle,
@@ -296,8 +299,12 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    /* A prior timestamp write may have a resolve still pending. Land it before
     * the reset zeroes the pool BO, otherwise the deferred resolve would clobber
     * the reset and leave the query spuriously available. */
-   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0)
+   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0) {
       cs_end(cmd);
+      kk_flush_timestamp_resolves(cmd);
+      mtl_compute_encoder *encoder = cs_get_compute(cmd);
+      mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
+   }
 
    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
 }
@@ -367,6 +374,23 @@ kk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    struct kk_physical_device *pdev = kk_device_physical(dev);
    assert(kk_pool_is_ts(pool));
+   /* KK_CAPTURE_NO_TIMESTAMPS without a Metal capture: no heap was created.
+    * (A Metal capture without a heap is handled below.) */
+   if (!pool->ts.heap && !pdev->settings.gpu_capture_enabled) {
+      if (!debug_get_bool_option("KK_CAPTURE_STUB_TIMESTAMPS", false)) {
+         mesa_loge("kk-capture: timestamp command used while timestamps disabled");
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      uint64_t value = os_time_get_nano();
+      uint32_t count = kk_mv_query_count(cmd);
+      for (uint32_t i = 0; i < count; i++) {
+         uint64_t addr = kk_query_report_addr(dev, pool, query + i);
+         kk_cmd_write(cmd, (struct libkk_imm_write){addr, (uint32_t)value});
+         kk_cmd_write(cmd, (struct libkk_imm_write){addr + 4, value >> 32});
+      }
+      return;
+   }
 
    if (pdev->settings.gpu_capture_enabled) {
       /* There is no counter heap because we are capturing. */
@@ -585,8 +609,10 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
    /* Timestamp results are resolved into the pool BO on a deferred command
     * buffer; make sure any pending resolve lands before this copy reads it.
     * This also gives VK_QUERY_RESULT_WAIT_BIT its meaning for timestamps. */
-   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0)
+   if (util_dynarray_num_elements(&cmd->ts_resolves, struct kk_ts_resolve) > 0) {
       cs_end(cmd);
+      kk_flush_timestamp_resolves(cmd);
+   }
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    /* The resolveCounterHeap runs on the blit stage and it needs to be available

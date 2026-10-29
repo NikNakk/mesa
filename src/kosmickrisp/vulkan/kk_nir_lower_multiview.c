@@ -64,22 +64,30 @@ kk_nir_lower_vs_multiview(nir_shader *nir, uint32_t view_mask)
                                         nir_imm_int(&b, 0u));
    }
 
-   /* Create array and initialize */
-   nir_variable *view_indices = nir_local_variable_create(
-      entrypoint, glsl_array_type(glsl_uint_type(), view_count, 0),
-      "view_indices");
-   nir_deref_instr *view_indices_deref = nir_build_deref_var(&b, view_indices);
-   uint32_t count = 0u;
-   u_foreach_bit(index, view_mask) {
-      nir_store_deref(
-         &b, nir_build_deref_array_imm(&b, view_indices_deref, count++),
-         nir_imm_int(&b, index), 1);
-   }
+   nir_def *view_index;
+   uint32_t first_view = ffs(view_mask) - 1;
+   uint32_t shifted_mask = view_mask >> first_view;
+   if (view_count == 1u) {
+      view_index = nir_imm_int(&b, first_view);
+   } else if ((shifted_mask & (shifted_mask + 1u)) == 0u) {
+      view_index = nir_iadd_imm(&b, nir_load_amplification_id_kk(&b), first_view);
+   } else {
+      nir_variable *view_indices = nir_local_variable_create(
+         entrypoint, glsl_array_type(glsl_uint_type(), view_count, 0),
+         "view_indices");
+      nir_deref_instr *view_indices_deref = nir_build_deref_var(&b, view_indices);
+      uint32_t count = 0u;
+      u_foreach_bit(index, view_mask) {
+         nir_store_deref(
+            &b, nir_build_deref_array_imm(&b, view_indices_deref, count++),
+            nir_imm_int(&b, index), 1);
+      }
 
-   /* Access array based on the amplification id */
-   nir_def *amplification_id = nir_load_amplification_id_kk(&b);
-   nir_def *view_index = nir_load_deref(
-      &b, nir_build_deref_array(&b, view_indices_deref, amplification_id));
+      /* Access array based on the amplification id */
+      nir_def *amplification_id = nir_load_amplification_id_kk(&b);
+      view_index = nir_load_deref(
+         &b, nir_build_deref_array(&b, view_indices_deref, amplification_id));
+   }
 
    bool progress = nir_shader_intrinsics_pass(
       nir, replace_view_id_with_value, nir_metadata_control_flow, view_index);

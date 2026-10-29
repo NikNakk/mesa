@@ -39,6 +39,10 @@
 #include "kk_image.h"
 #include "kosmickrisp/libkk/kk_query.h"
 
+DEBUG_GET_ONCE_BOOL_OPTION(kk_target_submit_log, "KK_TARGET_SUBMIT_LOG", false);
+DEBUG_GET_ONCE_BOOL_OPTION(kk_target_draw_log, "KK_TARGET_DRAW_LOG", false);
+DEBUG_GET_ONCE_BOOL_OPTION(kk_descriptor_diag, "KK_DESCRIPTOR_DIAG", false);
+
 static void
 kk_cmd_buffer_dirty_render_pass(struct kk_cmd_buffer *cmd)
 {
@@ -138,8 +142,11 @@ kk_fill_common_attachment_description(
    const struct kk_image_view *iview = info->iview;
    assert(iview->plane_count ==
           1); /* TODO_KOSMICKRISP Handle multiplanar images? */
+   const struct kk_image *image =
+      container_of(iview->vk.image, struct kk_image, vk);
    mtl_render_pass_attachment_descriptor_set_texture(
-      descriptor, iview->planes[0].mtl_handle_render);
+      descriptor, image->wsi_direct ? image->planes[0].mtl_handle
+                                    : iview->planes[0].mtl_handle_render);
    /* If a view is being used e.g. for format change, it already points to the
     * required slice and level */
    if (!iview->planes[0].render_is_view) {
@@ -167,8 +174,12 @@ kk_fill_common_attachment_description(
       descriptor, MTL_STORE_ACTION_UNKNOWN);
 
    if (attach_resolve_texture) {
+      const struct kk_image *resolve_image =
+         container_of(info->resolve_iview->vk.image, struct kk_image, vk);
       mtl_render_pass_attachment_descriptor_set_resolve_texture(
-         descriptor, info->resolve_iview->planes[0].mtl_handle_render);
+         descriptor, resolve_image->wsi_direct
+                        ? resolve_image->planes[0].mtl_handle
+                        : info->resolve_iview->planes[0].mtl_handle_render);
 
       if (!info->resolve_iview->planes[0].render_is_view) {
          mtl_render_pass_attachment_descriptor_set_resolve_level(
@@ -260,6 +271,38 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
    }
 }
 
+static bool
+kk_can_clear_subsampled_attachments(const struct kk_rendering_state *render)
+{
+   if (!KK_EXPERIMENTAL(TILE_RESOLVE) ||
+       !(render->flags & VK_RENDERING_CUSTOM_RESOLVE_BIT_EXT) ||
+       (render->flags & VK_RENDERING_RESUMING_BIT) ||
+       render->area.offset.x || render->area.offset.y)
+      return false;
+
+   bool any = false;
+   for (uint32_t i = 0; i < render->color_att_count + 2; i++) {
+      const struct kk_attachment *attachment =
+         i < render->color_att_count ? &render->color_att[i]
+         : i == render->color_att_count ? &render->depth_att
+                                         : &render->stencil_att;
+      if (!attachment->iview)
+         continue;
+      const struct vk_image_view *view = &attachment->iview->vk;
+      bool all_layers = render->view_mask
+                           ? render->view_mask == BITFIELD64_MASK(view->layer_count)
+                           : render->layer_count == view->layer_count;
+      if (!(view->image->create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT) ||
+          view->image->samples == VK_SAMPLE_COUNT_1_BIT || !all_layers ||
+          (attachment->load_op != VK_ATTACHMENT_LOAD_OP_CLEAR &&
+           attachment->load_op != VK_ATTACHMENT_LOAD_OP_DONT_CARE) ||
+          attachment->store_op != VK_ATTACHMENT_STORE_OP_DONT_CARE)
+         return false;
+      any = true;
+   }
+   return any;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                      const VkRenderingInfo *pRenderingInfo)
@@ -290,6 +333,17 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       kk_attachment_init(&render->color_att[i],
                          &pRenderingInfo->pColorAttachments[i]);
+      struct kk_image_view *views[] = {
+         render->color_att[i].iview, render->color_att[i].resolve_iview,
+      };
+      for (unsigned v = 0; v < ARRAY_SIZE(views); v++) {
+         if (!views[v])
+            continue;
+         struct kk_image *image =
+            container_of(views[v]->vk.image, struct kk_image, vk);
+         if (image->wsi_direct)
+            util_dynarray_append(&cmd->wsi_direct_images, image);
+      }
       kk_merge_render_iview(&framebuffer_extent, render->color_att[i].iview);
       does_any_attachment_clear |=
          (pRenderingInfo->pColorAttachments[i].loadOp ==
@@ -404,7 +458,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    render->depth_att.resolve_in_pass = ds_in_pass;
    render->stencil_att.resolve_in_pass = ds_in_pass;
    bool force_attachment_load =
-      !is_whole_framebuffer ||
+      (!is_whole_framebuffer && !kk_can_clear_subsampled_attachments(render)) ||
       ((render->flags & VK_RENDERING_RESUMING_BIT) && !render->stitch);
 
    render->force_attachment_store =
@@ -923,11 +977,44 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          : NULL;
    VkRect2D pass_area = render->area;
 
+   bool full_rate_depth_resolve = render->fdm_discard_depth &&
+      !(render->flags & VK_RENDERING_SUSPENDING_BIT);
+   struct kk_image *discard_depth = NULL;
+   struct kk_image *discard_stencil = NULL;
+   struct kk_image *resolved_depth = NULL;
+   struct kk_image *resolved_stencil = NULL;
+   if (full_rate_depth_resolve) {
+      if (render->depth_att.resolve_iview)
+         resolved_depth = container_of(render->depth_att.resolve_iview->vk.image,
+                                      struct kk_image, vk);
+      if (render->stencil_att.resolve_iview)
+         resolved_stencil = container_of(render->stencil_att.resolve_iview->vk.image,
+                                        struct kk_image, vk);
+      if (render->depth_att.iview &&
+          !(render->depth_att.iview->vk.image->create_flags &
+            VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT))
+         discard_depth = container_of(render->depth_att.iview->vk.image,
+                                       struct kk_image, vk);
+      if (render->stencil_att.iview &&
+          !(render->stencil_att.iview->vk.image->create_flags &
+            VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT))
+         discard_stencil = container_of(render->stencil_att.iview->vk.image,
+                                         struct kk_image, vk);
+   }
+
    memset(render, 0, sizeof(*render));
 
    if (need_meta_resolve) {
+      if (full_rate_depth_resolve)
+         cmd->state.gfx.fdm.carry = false;
       kk_meta_resolve_rendering(cmd, &vk_render);
    }
+   kk_fdm_clear_image_mapping(cmd, resolved_depth);
+   if (resolved_stencil != resolved_depth)
+      kk_fdm_clear_image_mapping(cmd, resolved_stencil);
+   kk_fdm_clear_image_mapping(cmd, discard_depth);
+   if (discard_stencil != discard_depth)
+      kk_fdm_clear_image_mapping(cmd, discard_stencil);
 
    if (cmd->state.gfx.custom_resolve_debug.active) {
       cmd->state.gfx.custom_resolve_debug.active = false;
@@ -2056,6 +2143,28 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
       kk_cmd_buffer_flush_push_descriptors(cmd, desc);
 
    kk_flush_dynamic_state(cmd);
+
+   if (debug_get_option_kk_target_submit_log()) {
+      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+      if (vs && vs->msl_data[MESA_SHADER_FRAGMENT].code &&
+          kk_is_turning_target_shader(_mesa_hash_string(vs->msl_data[MESA_SHADER_FRAGMENT].code))) {
+         cmd->diagnostic_target_draws++;
+         if (debug_get_option_kk_target_draw_log())
+            mesa_logi("kk-target-record: FS-0e188069 draw=%u", cmd->diagnostic_target_draws);
+      }
+   }
+
+   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   if (debug_get_option_kk_descriptor_diag() && fs &&
+       fs->diagnostic_msl_hash == 0x0e188069) {
+      static_assert(offsetof(struct kk_root_descriptor_table, sets[0]) == 928, "set 0");
+      struct kk_descriptor_set *set = desc->sets[0];
+      bool found = false;
+      util_dynarray_foreach(&cmd->diagnostic_sets, struct kk_descriptor_set *, prev)
+         found |= *prev == set;
+      if (!found)
+         util_dynarray_append(&cmd->diagnostic_sets, set);
+   }
 
    cmd->state.dirty_shaders = 0u;
    cmd->state.gfx.dirty = 0u;

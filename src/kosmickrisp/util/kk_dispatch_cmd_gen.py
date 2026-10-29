@@ -83,6 +83,10 @@ ${e.prefixed_name('kk_cmd_tramp')}(${e.decl_params()})
       return;
     }
 
+    if (cmd->defer_encoding) {
+      vk_cmd_enqueue_device_entrypoints.${e.name}(${e.call_params()});
+      return;
+    }
     dev->vk.dispatch_table.${e.name}(${e.call_params()});
     if (!cmd->one_time_submit) {
       vk_cmd_enqueue_device_entrypoints.${e.name}(${e.call_params()});
@@ -92,6 +96,8 @@ ${e.prefixed_name('kk_cmd_tramp')}(${e.decl_params()})
       return vk_cmd_enqueue_unless_primary_device_entrypoints.${e.name}(${e.call_params()});
     }
 
+    if (cmd->defer_encoding)
+      return vk_cmd_enqueue_device_entrypoints.${e.name}(${e.call_params()});
     VkResult result = dev->vk.dispatch_table.${e.name}(${e.call_params()});
     if (result != VK_SUCCESS)
       return result;

@@ -157,9 +157,11 @@ struct wsi_device {
        * make it possible. */
       void *(*get_mtl4_command_queue)(VkDevice device);
       VkResult (*bind_drawable_to_vkimage)(VkImage image, void *drawable);
+      void (*set_direct_image)(VkImage image);
       /* Does not transfer the ownership to the command buffer. The command
        * buffer must retain the drawable to ensure lifespan. */
-      void (*encode_drawable_present)(VkCommandBuffer cmd, void *drawable);
+      void (*encode_drawable_present)(VkCommandBuffer cmd, void *drawable,
+                                      bool signal_only);
       /* Required to work around Metal4 presentation bug. */
       void (*cmd_blit_image)(VkCommandBuffer cmd,
                              const VkBlitImageInfo2 *blit_info,

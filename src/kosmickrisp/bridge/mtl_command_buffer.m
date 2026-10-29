@@ -5,6 +5,7 @@
  */
 
 #include "mtl_command_buffer.h"
+#include "mtl_device.h"
 
 #include <Metal/MTL4BufferRange.h>
 #include <Metal/MTL4CommandAllocator.h>
@@ -27,6 +28,7 @@ mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)command_buffer;
       id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
+      mtl_poll_gpu_capture((mtl_device *)cmd_buf.device);
       [cmd_buf beginCommandBufferWithAllocator:alloc];
    }
 }

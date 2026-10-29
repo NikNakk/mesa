@@ -19,8 +19,25 @@ mtl_start_gpu_capture(mtl_device *mtl_dev_handle, const char *directory)
 {
 }
 
+bool
+mtl_trigger_gpu_capture(mtl_device *mtl_dev_handle)
+{
+   return false;
+}
+
+bool
+mtl_gpu_capture_active(void)
+{
+   return false;
+}
+
 void
 mtl_stop_gpu_capture(void)
+{
+}
+
+void
+mtl_poll_gpu_capture(mtl_device *device)
 {
 }
 

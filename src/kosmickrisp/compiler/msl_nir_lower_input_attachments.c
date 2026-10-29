@@ -13,6 +13,7 @@
 struct lower_ia_state {
    const struct vk_input_attachment_location_state *ial;
    const struct vk_color_attachment_location_state *cal;
+   const struct vk_render_pass_state *rp;
    bool fetch_multisampled;
 };
 
@@ -36,10 +37,14 @@ lower_ia(nir_builder *b, nir_intrinsic_instr *intrin,
       if (ial->depth_att != ia_index && ial->stencil_att != ia_index) {
          uint32_t location = FRAG_RESULT_DATA0;
          bool found = false;
-         for (uint32_t i = 0u; i < ial->color_attachment_count; ++i) {
-            if (ial->color_map[i] == ia_index) {
+         uint32_t count = MIN3(ial->color_attachment_count,
+                               state->rp->color_attachment_count,
+                               MESA_VK_MAX_COLOR_ATTACHMENTS);
+         for (uint32_t i = 0u; i < count; ++i) {
+            if (ial->color_map[i] == ia_index &&
+                state->rp->color_attachment_formats[i] != VK_FORMAT_UNDEFINED) {
                uint8_t slot = state->cal ? state->cal->color_map[i] : i;
-               if (slot != MESA_VK_ATTACHMENT_UNUSED) {
+               if (slot < MESA_VK_MAX_COLOR_ATTACHMENTS) {
                   location += slot;
                   found = true;
                }
@@ -92,7 +97,7 @@ void
 msl_nir_lower_input_attachments(
    nir_shader *nir, const struct vk_input_attachment_location_state *ial,
    const struct vk_color_attachment_location_state *cal,
-   bool fetch_multisampled)
+   const struct vk_render_pass_state *rp, bool fetch_multisampled)
 {
    assert(nir->info.stage == MESA_SHADER_FRAGMENT);
 
@@ -100,6 +105,7 @@ msl_nir_lower_input_attachments(
       struct lower_ia_state state = {
          .ial = ial,
          .cal = cal,
+         .rp = rp,
          .fetch_multisampled = fetch_multisampled,
       };
       NIR_PASS(_, nir, msl_nir_lower_frag_input_attachments, &state);

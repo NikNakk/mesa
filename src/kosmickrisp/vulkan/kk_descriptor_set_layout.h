@@ -40,6 +40,7 @@ struct kk_descriptor_set_binding_layout {
 
    /* Index into the dynamic buffer binding array */
    uint8_t dynamic_buffer_index;
+   uint32_t next_immutable_binding;
 
    /* Immutable samplers (or NULL if no immutable samplers) */
    struct kk_sampler **immutable_samplers;
@@ -65,6 +66,7 @@ struct kk_descriptor_set_layout {
 
    /* Number of descriptors in the layout */
    uint32_t descriptor_count;
+   uint32_t first_immutable_binding;
 
    /* Address to the embedded sampler descriptor buffer.
     *

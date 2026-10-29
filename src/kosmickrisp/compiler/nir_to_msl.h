@@ -12,6 +12,7 @@
 
 enum pipe_format;
 struct vk_input_attachment_location_state;
+struct vk_render_pass_state;
 struct vk_color_attachment_location_state;
 
 struct nir_to_msl_options {
@@ -79,7 +80,7 @@ bool msl_nir_fs_remove_depth_write(nir_shader *s);
 void msl_nir_lower_input_attachments(
    nir_shader *nir, const struct vk_input_attachment_location_state *ial,
    const struct vk_color_attachment_location_state *cal,
-   bool fetch_multisampled);
+   const struct vk_render_pass_state *rp, bool fetch_multisampled);
 bool msl_lower_textures(nir_shader *s, bool lower_lod_bias);
 
 bool msl_lower_robustness2_images(nir_shader *s);

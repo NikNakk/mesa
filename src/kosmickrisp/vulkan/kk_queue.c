@@ -10,9 +10,11 @@
 #include "kk_fdm.h"
 #include "kk_debug.h"
 #include "util/log.h"
+#include "kosmickrisp/bridge/mtl_sync.h"
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
+#include "kk_image.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
 #include "kk_sync.h"
@@ -58,6 +60,42 @@ check_device_lost(struct kk_device *dev, struct mtl_feedback_data *data)
    }
 }
 
+struct kk_queue_timing {
+   uint32_t command_buffers;
+   bool wsi_present;
+};
+
+static void
+kk_queue_timing_callback(struct mtl_feedback_data *data)
+{
+   struct kk_queue_timing *timing = data->user_data;
+   mesa_logi("kk-queue-timing: kind=%s buffers=%u start_s=%.9f end_s=%.9f "
+             "gpu_ms=%.6f error=%u",
+             timing->wsi_present ? "wsi-present" : "work",
+             timing->command_buffers, data->gpu_start, data->gpu_end,
+             (data->gpu_end - data->gpu_start) * 1000.0,
+             (unsigned)data->error);
+   free(timing);
+}
+
+static void
+kk_queue_add_timing_handler(mtl_commit_options *options, uint32_t count,
+                            bool wsi_present)
+{
+   if (!debug_get_bool_option("KK_QUEUE_TIMING", false))
+      return;
+
+   struct kk_queue_timing *timing = calloc(1, sizeof(*timing));
+   if (!timing) {
+      mesa_logw("kk-queue-timing: allocation failed");
+      return;
+   }
+   timing->command_buffers = count;
+   timing->wsi_present = wsi_present;
+   mtl_commit_options_add_feedback_handler(options, kk_queue_timing_callback,
+                                            timing);
+}
+
 static void
 commit_callback(struct mtl_feedback_data *data)
 {
@@ -94,6 +132,16 @@ rerecord_commit_callback(struct mtl_feedback_data *data)
    vk_free(&dev->vk.alloc, commit);
 }
 
+static void
+kk_wait_for_render_drawables(struct kk_queue *queue, struct kk_cmd_buffer *cmd)
+{
+   util_dynarray_foreach(&cmd->wsi_direct_images, struct kk_image *, image) {
+      if ((*image)->wsi_drawable)
+         mtl_command_queue_wait_for_drawable(queue->mtl_handle,
+                                             (*image)->wsi_drawable);
+   }
+}
+
 static bool
 kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
 {
@@ -102,12 +150,17 @@ kk_cmd_buffer_has_work(struct kk_cmd_buffer *cmd)
 
 static void
 kk_queue_commit(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
-                mtl_feedback_handler_callback callback, void *user_data)
+                mtl_feedback_handler_callback callback, void *user_data,
+                bool wsi_present)
 {
    assert(kk_cmd_buffer_has_work(cmd));
 
+   if (cmd->diagnostic_target_draws && debug_get_bool_option("KK_TARGET_SUBMIT_LOG", false))
+      mesa_logi("kk-target-submit: FS-0e188069 draws=%u", cmd->diagnostic_target_draws);
+
    mtl_commit_options *options = mtl_new_commit_options();
    mtl_commit_options_add_feedback_handler(options, callback, user_data);
+   kk_queue_add_timing_handler(options, 1, wsi_present);
 
    mtl_command_queue_commit(queue->mtl_handle, &cmd->metal.cmd_buf, 1u,
                             options);
@@ -152,12 +205,18 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    if (result != VK_SUCCESS)
       goto release;
 
+   if (cmd->defer_encoding)
+      rerecord->no_stitch = true;
+
    vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
                         &dev->vk.dispatch_table);
 
    result = kk_EndCommandBuffer(rerecord_handle);
    if (result != VK_SUCCESS)
       goto release;
+
+   if (cmd->defer_encoding)
+      kk_wait_for_render_drawables(queue, rerecord);
 
    if (!kk_cmd_buffer_has_work(rerecord))
       goto release;
@@ -176,7 +235,8 @@ rerecord_and_commit_cmd_buffer(struct kk_queue *queue,
    kk_device_make_resources_resident(dev);
 
    queue->commits_in_flight++;
-   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit);
+   kk_queue_commit(queue, rerecord, rerecord_commit_callback, commit,
+                    cmd->drawable != NULL);
 
    mtx_unlock(&queue->mutex);
    return VK_SUCCESS;
@@ -222,12 +282,18 @@ rerecord_cmd_buffer(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
    if (result != VK_SUCCESS)
       goto release;
 
+   if (cmd->defer_encoding)
+      rerecord->no_stitch = true;
+
    vk_cmd_queue_execute(&cmd->vk.cmd_queue, rerecord_handle,
                         &dev->vk.dispatch_table);
 
    result = kk_EndCommandBuffer(rerecord_handle);
    if (result != VK_SUCCESS)
       goto release;
+
+   if (cmd->defer_encoding)
+      kk_wait_for_render_drawables(queue, rerecord);
 
    if (!kk_cmd_buffer_has_work(rerecord))
       goto release;
@@ -260,6 +326,7 @@ struct kk_commit_group {
    mtl_command_allocator *held[32];
    uint32_t count;
    uint32_t held_count;
+   bool wsi_present;
 };
 
 struct kk_held_allocators {
@@ -304,11 +371,13 @@ kk_commit_group_flush(struct kk_queue *queue, struct kk_commit_group *group)
             options, kk_held_allocators_callback, held);
       }
    }
+   kk_queue_add_timing_handler(options, group->count, group->wsi_present);
    mtl_command_queue_commit(queue->mtl_handle, group->bufs, group->count,
                             options);
    mtl_release(options);
    group->count = 0;
    group->held_count = 0;
+   group->wsi_present = false;
 }
 
 static void
@@ -345,7 +414,11 @@ kk_submit_unstitched(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
 
    struct kk_cmd_buffer *committed = cmd;
    struct kk_commit_data *commit = NULL;
-   if (cmd->submitted || rerecord) {
+   if (cmd->wsi_signal_only) {
+      committed = NULL;
+   } else if (cmd->submitted || rerecord ||
+              (debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false) &&
+               !list_is_empty(&cmd->vk.cmd_queue.cmds))) {
       VkResult result = rerecord_cmd_buffer(queue, cmd, rerecord, &commit);
       if (result != VK_SUCCESS)
          return result;
@@ -356,7 +429,7 @@ kk_submit_unstitched(struct kk_queue *queue, struct kk_cmd_buffer *cmd,
    cmd->submitted = true;
 
    if (committed) {
-      struct kk_commit_group group = {0};
+      struct kk_commit_group group = {.wsi_present = cmd->drawable != NULL};
       kk_commit_group_add(queue, &group, committed->metal.cmd_buf, commit,
                           committed);
       kk_commit_group_flush(queue, &group);
@@ -456,7 +529,9 @@ kk_submit_pending(struct kk_queue *queue, struct kk_pending *pending)
       struct kk_cmd_buffer *cmd = chain[i];
       struct kk_cmd_buffer *committed = cmd;
       struct kk_commit_data *commit = NULL;
-      if (cmd->submitted) {
+      if (cmd->submitted ||
+          (debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false) &&
+               !list_is_empty(&cmd->vk.cmd_queue.cmds))) {
          result = rerecord_cmd_buffer(queue, cmd, false, &commit);
          if (result != VK_SUCCESS)
             goto done;
@@ -565,6 +640,72 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct kk_queue *queue = container_of(vk_queue, struct kk_queue, vk);
    struct kk_device *dev = kk_queue_device(queue);
 
+   if (debug_get_bool_option("KK_CAPTURE_TARGET_SUBMITS", false) &&
+       !mtl_gpu_capture_active()) {
+      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+         struct kk_cmd_buffer *cmd =
+            container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+         if (cmd->diagnostic_target_draws) {
+            if (mtl_trigger_gpu_capture(dev->mtl_handle))
+               mesa_logi("kk-capture: target submissions active");
+            break;
+         }
+      }
+   }
+
+   bool tripwire = !strcmp(debug_get_option("KK_TURN_PROBE", ""), "tripwire");
+   if (dev->diagnostic_bo && tripwire && (++dev->diagnostic_submits % 60 == 0)) {
+      uint32_t d[320];
+      memcpy(d, dev->diagnostic_bo->cpu, sizeof(d));
+      static unsigned printed;
+      if (dev->diagnostic_submits % 600 == 0)
+         mesa_logi("kk-tripwire-status: events=%u", d[0]);
+      if (d[0] > printed) {
+         mesa_logi("kk-tripwire: events=%u", d[0]);
+         for (unsigned i = printed; i < MIN2(d[0], 16); i++) {
+            uint32_t *p = &d[64 + i * 16];
+            if (d[32 + i] != 0x4b4b1234 ||
+                (p[15] != 1000 && !(debug_get_bool_option("KK_TRIPWIRE_CONTROL", false) && p[15] == 0)))
+               break;
+            float xy[2];
+            memcpy(xy, &p[9], sizeof(xy));
+            mesa_logi("kk-tripwire-record: count=%d base=%llx set=%llx desc=%08x,%08x,%08x,%08x frag=%g,%g helper=%u root=%llx index=%u iteration=%u",
+                      (int32_t)p[0], ((uint64_t)p[2]<<32)|p[1], ((uint64_t)p[4]<<32)|p[3],
+                      p[5],p[6],p[7],p[8], xy[0],xy[1], p[11],
+                      ((uint64_t)p[13]<<32)|p[12],p[14],p[15]);
+            printed = i + 1;
+         }
+         if (printed >= 16)
+            printed = d[0];
+      }
+   }
+   if (dev->diagnostic_bo && !tripwire && (++dev->diagnostic_submits % 600 == 0)) {
+      uint32_t d[320];
+      memcpy(d, dev->diagnostic_bo->cpu, sizeof(d));
+      mesa_logi("kk-gpu-diag: samples=%u desc=%u count=%u done=%u bad=%u exhausted=%u hist=%u,%u,%u,%u,%u,%u,%u,%u,%u other=%u",
+                d[0],d[1],d[2],d[3],d[4],d[5],
+                d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],d[24],d[31]);
+      static unsigned dumped;
+      if ((d[2] && !dumped) || d[4] > dumped) {
+         dumped = MAX2(1, d[4]);
+         for (unsigned i = 0; i < 32; i++) {
+            if (i % 16 >= MIN2(d[i < 16 ? 6 : 7], 16))
+               continue;
+            uint32_t *p = &d[64 + i * 8];
+            mesa_logi("kk-gpu-record: bad=%u root=%llx set=%llx base=%llx count=%d size=%u",
+                      i >= 16, ((uint64_t)p[1]<<32)|p[0], ((uint64_t)p[3]<<32)|p[2],
+                      ((uint64_t)p[5]<<32)|p[4], (int32_t)p[6], p[7]);
+         }
+      }
+   }
+   if (debug_get_bool_option("KK_DESCRIPTOR_DIAG", false)) {
+      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+         struct kk_cmd_buffer *cmd = container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+         util_dynarray_foreach(&cmd->diagnostic_sets, struct kk_descriptor_set *, set)
+            kk_descriptor_diagnostic_submit(*set);
+      }
+   }
+
    if (vk_queue_is_lost(&queue->vk))
       return VK_ERROR_DEVICE_LOST;
 
@@ -597,6 +738,13 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       }
    }
 
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      struct kk_cmd_buffer *cmd =
+         container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+      if (!cmd->defer_encoding)
+         kk_wait_for_render_drawables(queue, cmd);
+   }
+
    if (KK_EXPERIMENTAL(STITCH_PASSES)) {
       VkResult result = kk_queue_submit_stitched(queue, submit);
       if (result != VK_SUCCESS)
@@ -615,12 +763,17 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 
       /* Metal's command buffers are one time use, re-record multiple
        * submissions. */
-      if (cmd_buffer->submitted) {
+      if (!cmd_buffer->wsi_signal_only &&
+          (cmd_buffer->submitted || mtl_gpu_capture_active() ||
+           (debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false) &&
+            !list_is_empty(&cmd_buffer->vk.cmd_queue.cmds)))) {
          VkResult result = rerecord_and_commit_cmd_buffer(queue, cmd_buffer);
          if (result != VK_SUCCESS)
             return result;
-      } else if (kk_cmd_buffer_has_work(cmd_buffer)) {
-         kk_queue_commit(queue, cmd_buffer, commit_callback, dev);
+      } else if (!cmd_buffer->wsi_signal_only &&
+                 kk_cmd_buffer_has_work(cmd_buffer)) {
+         kk_queue_commit(queue, cmd_buffer, commit_callback, dev,
+                         cmd_buffer->drawable != NULL);
       }
 
       cmd_buffer->submitted = true;
@@ -640,6 +793,16 @@ signal:
          container_of(signal->sync, struct kk_sync_timeline, base);
       mtl_signal_event(queue->mtl_handle, sync->mtl_handle,
                        signal->signal_value);
+   }
+
+   if (debug_get_bool_option("KK_SUBMIT_SYNC", false)) {
+      if (!queue->stitch_event)
+         queue->stitch_event =
+            mtl_new_shared_event(kk_queue_device(queue)->mtl_handle);
+      mtl_signal_event(queue->mtl_handle, queue->stitch_event,
+                       ++queue->stitch_value);
+      mtl_shared_event_wait_until_signaled_value(queue->stitch_event,
+                                                 queue->stitch_value, 20000);
    }
 
    return VK_SUCCESS;

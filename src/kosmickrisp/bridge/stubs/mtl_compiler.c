@@ -81,6 +81,19 @@ mtl_render_pipeline_descriptor_set_color_attachment_write_mask(
 }
 
 void
+mtl_render_pipeline_descriptor_set_color_attachment_blend(
+   mtl_render_pipeline_descriptor *descriptor, uint8_t index,
+   const struct mtl_color_blend_state *blend)
+{
+}
+
+void
+mtl_render_pipeline_descriptor_set_multisample_alpha(
+   mtl_render_pipeline_descriptor *descriptor, bool coverage, bool one)
+{
+}
+
+void
 mtl_render_pipeline_descriptor_set_raster_sample_count(
    mtl_render_pipeline_descriptor *descriptor, uint32_t sample_count)
 {
