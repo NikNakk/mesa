@@ -7,6 +7,11 @@
 #include "mtl_compiler.h"
 #include "mtl_format.h"
 
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include <Metal/MTL4ComputePipeline.h>
 #include <Metal/MTL4LibraryDescriptor.h>
 #include <Metal/MTL4LibraryFunctionDescriptor.h>
@@ -42,10 +47,47 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
 {
    @autoreleasepool {
       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
+      static int no_half = -1;
+      if (no_half < 0) {
+         const char *env = getenv("KK_NO_HALF");
+         no_half = env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+      }
+      char *widened = NULL;
+      if (no_half) {
+         size_t len = strlen(src);
+         widened = malloc(len + len / 4 + 1);
+         if (widened != NULL) {
+            const char *in = src;
+            char *out = widened;
+            while (*in) {
+               bool word_start = in == src || !(isalnum((unsigned char)in[-1]) || in[-1] == '_');
+               if (word_start && strncmp(in, "half", 4) == 0 &&
+                   !(isalnum((unsigned char)in[4]) || in[4] == '_')) {
+                  memcpy(out, "float", 5);
+                  out += 5;
+                  in += 4;
+               } else {
+                  *out++ = *in++;
+               }
+            }
+            *out = '\0';
+            src = widened;
+         }
+      }
       NSString *ns_src = [NSString stringWithCString:src encoding:NSASCIIStringEncoding];
+      free(widened);
 
       MTLCompileOptions *opts = [[MTLCompileOptions new] autorelease];
       opts.languageVersion = (MTLLanguageVersion)msl_version;
+      static int safe_math = -1;
+      if (safe_math < 0) {
+         const char *env = getenv("KK_SAFE_MATH");
+         safe_math = env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+      }
+      if (safe_math) {
+         math_mode = MTL_MATH_MODE_SAFE;
+         math_fp_fns = MTL_MATH_FLOATING_POINT_FUNCTIONS_PRECISE;
+      }
       opts.mathMode = (MTLMathMode)math_mode;
       opts.mathFloatingPointFunctions = (MTLMathFloatingPointFunctions)math_fp_fns;
 
