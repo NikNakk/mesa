@@ -20,6 +20,14 @@ void kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
                             VkExtent2D screen);
 
 void kk_fdm_carry_to_next_rendering(struct kk_cmd_buffer *cmd);
+
+struct kk_fdm_params {
+   struct kk_device *dev;
+   struct kk_bo *bo;
+   uint32_t refs;
+};
+
+void kk_fdm_cmd_release(struct kk_cmd_buffer *cmd);
 struct kk_image;
 void kk_fdm_clear_image_mapping(struct kk_cmd_buffer *cmd, struct kk_image *image);
 

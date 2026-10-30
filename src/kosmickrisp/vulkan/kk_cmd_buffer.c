@@ -63,6 +63,7 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
       kk_destroy_bo(dev, *bo);
    }
    util_dynarray_clear(&cmd->large_bos);
+   kk_fdm_cmd_release(cmd);
    util_dynarray_clear(&cmd->wsi_direct_images);
    cmd->wsi_signal_only = false;
    util_dynarray_clear(&cmd->diagnostic_sets);
@@ -119,6 +120,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    kk_cmd_release_resources(dev, cmd);
    util_dynarray_fini(&cmd->large_bos);
+   util_dynarray_fini(&cmd->fdm_params);
    util_dynarray_fini(&cmd->wsi_direct_images);
    util_dynarray_fini(&cmd->diagnostic_sets);
    util_dynarray_fini(&cmd->post_render_writes);
@@ -167,6 +169,7 @@ kk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    }
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
+   cmd->fdm_params = UTIL_DYNARRAY_INIT;
    cmd->wsi_direct_images = UTIL_DYNARRAY_INIT;
    cmd->diagnostic_sets = UTIL_DYNARRAY_INIT;
 
