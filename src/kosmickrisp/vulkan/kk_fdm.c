@@ -228,23 +228,62 @@ kk_fdm_image_init(struct kk_device *dev, struct kk_image *image)
    return VK_SUCCESS;
 }
 
+static void
+kk_fdm_params_unref(struct kk_fdm_params *params)
+{
+   assert(params->refs > 0);
+   if (--params->refs)
+      return;
+   kk_destroy_bo(params->dev, params->bo);
+   free(params);
+}
+
+void
+kk_fdm_cmd_release(struct kk_cmd_buffer *cmd)
+{
+   if (!util_dynarray_num_elements(&cmd->fdm_params, struct kk_fdm_params *))
+      return;
+   simple_mtx_lock(&kk_fdm_lock);
+   util_dynarray_foreach(&cmd->fdm_params, struct kk_fdm_params *, params)
+      kk_fdm_params_unref(*params);
+   simple_mtx_unlock(&kk_fdm_lock);
+   util_dynarray_clear(&cmd->fdm_params);
+}
+
+static void
+kk_fdm_cmd_ref(struct kk_cmd_buffer *cmd, struct kk_fdm_params *params)
+{
+   util_dynarray_foreach(&cmd->fdm_params, struct kk_fdm_params *, held) {
+      if (*held == params)
+         return;
+   }
+   struct kk_fdm_params **slot =
+      util_dynarray_grow(&cmd->fdm_params, struct kk_fdm_params *, 1);
+   if (slot == NULL) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   *slot = params;
+   params->refs++;
+}
+
 void
 kk_fdm_image_finish(struct kk_device *dev, struct kk_image *image)
 {
    if (image->rate_params)
       kk_destroy_bo(dev, image->rate_params);
-   if (image->fdm.params)
-      kk_destroy_bo(dev, image->fdm.params);
-   for (uint32_t i = 0; i < image->fdm.old_params_count; i++)
-      kk_destroy_bo(dev, image->fdm.old_params[i]);
-   free(image->fdm.old_params);
+   if (image->fdm.params) {
+      simple_mtx_lock(&kk_fdm_lock);
+      kk_fdm_params_unref(image->fdm.params);
+      simple_mtx_unlock(&kk_fdm_lock);
+      image->fdm.params = NULL;
+   }
    if (image->fdm.map)
       mtl_release(image->fdm.map);
    free(image->fdm.cpu);
 }
 
 #define KK_FDM_TEXEL_SIZE 32
-#define KK_FDM_PARAMS_RING 8
 
 static struct {
    bool valid;
@@ -459,40 +498,30 @@ kk_fdm_get_map(struct kk_cmd_buffer *cmd, struct kk_image *density,
       mtl_release(map);
       return NULL;
    }
-   /* Earlier parameter blocks may still be read by work in flight. Maps
-    * change at most once a frame, so the oldest of a short ring is free. */
-   struct kk_bo *params = NULL;
-   if (!app_offset && density->fdm.old_params_count >= KK_FDM_PARAMS_RING) {
-      params = density->fdm.old_params[0];
-      memmove(density->fdm.old_params, density->fdm.old_params + 1,
-              (density->fdm.old_params_count - 1) * sizeof(params));
-      density->fdm.old_params_count--;
-   } else if (kk_alloc_bo(dev, &density->vk.base, KK_RATE_PARAMS_SIZE_B, 0,
-                          &params) != VK_SUCCESS) {
+   struct kk_fdm_params *params = calloc(1, sizeof(*params));
+   if (params == NULL) {
       mtl_release(map);
       return NULL;
    }
-   if (density->fdm.params) {
-      struct kk_bo **old =
-         realloc(density->fdm.old_params,
-                 (density->fdm.old_params_count + 1) * sizeof(*old));
-      if (old == NULL) {
-         kk_destroy_bo(dev, params);
-         mtl_release(map);
-         return NULL;
-      }
-      old[density->fdm.old_params_count++] = density->fdm.params;
-      density->fdm.old_params = old;
+   if (kk_alloc_bo(dev, &density->vk.base, KK_RATE_PARAMS_SIZE_B, 0,
+                   &params->bo) != VK_SUCCESS) {
+      free(params);
+      mtl_release(map);
+      return NULL;
    }
+   params->dev = dev;
+   params->refs = 1;
+   if (density->fdm.params)
+      kk_fdm_params_unref(density->fdm.params);
    density->fdm.params = params;
    density->fdm.serial = ++kk_fdm_serial;
    density->fdm.params_bytes =
       KK_RATE_PARAMS_HEADER_B + mtl_rate_map_parameter_size(map);
    memcpy(density->fdm.map_shift, shift, sizeof(shift));
 
-   struct kk_rate_params_header *header = density->fdm.params->cpu;
+   struct kk_rate_params_header *header = density->fdm.params->bo->cpu;
    memset(header, 0, KK_RATE_PARAMS_HEADER_B);
-   mtl_rate_map_copy_parameters(map, density->fdm.params->map,
+   mtl_rate_map_copy_parameters(map, density->fdm.params->bo->map,
                                 KK_RATE_PARAMS_HEADER_B);
    header->layers = layers;
    header->screen[0] = screen.width;
@@ -626,10 +655,10 @@ kk_fdm_publish(struct kk_cmd_buffer *cmd, struct kk_image *density,
     * command buffer holding an earlier copy may be re-recorded or dropped. */
    uint32_t bytes = MIN2(density->fdm.params_bytes, KK_RATE_PARAMS_SIZE_B);
    if (cmd->metal.render == NULL)
-      mtl_copy_from_buffer_to_buffer(cs_get_compute(cmd), density->fdm.params->map,
+      mtl_copy_from_buffer_to_buffer(cs_get_compute(cmd), density->fdm.params->bo->map,
                                      0, image->rate_params->map, 0, bytes);
    else
-      memcpy(image->rate_params->cpu, density->fdm.params->cpu, bytes);
+      memcpy(image->rate_params->cpu, density->fdm.params->bo->cpu, bytes);
    image->rate_params_owner = density;
    image->rate_params_serial = density->fdm.serial;
 }
@@ -742,7 +771,8 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    bool publish = !(render->flags & VK_RENDERING_RESUMING_BIT);
    if (map) {
       mtl_render_pass_descriptor_set_rate_map(descriptor, map);
-      params = density->fdm.params->gpu;
+      kk_fdm_cmd_ref(cmd, density->fdm.params);
+      params = density->fdm.params->bo->gpu;
       for (uint32_t i = 0; publish && i < render->color_att_count; i++) {
          kk_fdm_publish(cmd, density, render->color_att[i].iview);
          kk_fdm_publish(cmd, density, render->color_att[i].resolve_iview);

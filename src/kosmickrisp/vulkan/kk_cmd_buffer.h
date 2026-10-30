@@ -328,6 +328,7 @@ struct kk_cmd_buffer {
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
+   struct util_dynarray fdm_params;
    struct util_dynarray diagnostic_sets;
    uint32_t diagnostic_target_draws;
 

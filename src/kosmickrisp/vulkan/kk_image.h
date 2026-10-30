@@ -44,6 +44,8 @@ struct kk_image_plane {
    uint64_t addr;
 };
 
+struct kk_fdm_params;
+
 struct kk_image {
    struct vk_image vk;
 
@@ -68,9 +70,7 @@ struct kk_image {
       int16_t map_shift[8][2];
       uint64_t serial;
       uint32_t params_bytes;
-      struct kk_bo *params;
-      struct kk_bo **old_params;
-      uint32_t old_params_count;
+      struct kk_fdm_params *params;
    } fdm;
 
    struct kk_bo *rate_params;
