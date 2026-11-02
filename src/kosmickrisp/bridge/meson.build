@@ -13,6 +13,7 @@ if host_machine.system() == 'darwin'
     'mtl_argument_table.m',
     'mtl_bridge.m',
     'mtl_buffer.m',
+    'mtl_alloc_check.m',
     'mtl_command_buffer.m',
     'mtl_command_queue.m',
     'mtl_compiler.m',
