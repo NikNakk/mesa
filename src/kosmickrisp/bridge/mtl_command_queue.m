@@ -5,6 +5,7 @@
  */
 
 #include "mtl_command_queue.h"
+#include "mtl_alloc_check.h"
 
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
@@ -132,6 +133,7 @@ mtl_command_queue_commit(mtl_command_queue *queue,
       id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
       id<MTL4CommandBuffer> *cmds = (id<MTL4CommandBuffer> *)command_buffers;
       MTL4CommitOptions *opt = (MTL4CommitOptions *)options;
+      mtl_alloc_check_commit(options, (void *const *)command_buffers, count);
       [q commit:cmds count:count options:opt];
    }
 }

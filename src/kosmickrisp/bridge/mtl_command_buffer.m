@@ -6,6 +6,7 @@
 
 #include "mtl_command_buffer.h"
 #include "mtl_device.h"
+#include "mtl_alloc_check.h"
 
 #include <Metal/MTL4BufferRange.h>
 #include <Metal/MTL4CommandAllocator.h>
@@ -17,6 +18,7 @@ mtl_command_allocator_reset(mtl_command_allocator *allocator)
 {
    @autoreleasepool {
       id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
+      mtl_alloc_check_reset(allocator);
       [alloc reset];
    }
 }
@@ -29,6 +31,7 @@ mtl_begin_command_buffer(mtl_command_buffer *command_buffer,
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)command_buffer;
       id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
       mtl_poll_gpu_capture((mtl_device *)cmd_buf.device);
+      mtl_alloc_check_begin(command_buffer, allocator);
       [cmd_buf beginCommandBufferWithAllocator:alloc];
    }
 }
@@ -39,6 +42,7 @@ mtl_end_command_buffer(mtl_command_buffer *command_buffer)
    @autoreleasepool {
       id<MTL4CommandBuffer> cmd_buf = (id<MTL4CommandBuffer>)command_buffer;
       [cmd_buf endCommandBuffer];
+      mtl_alloc_check_end(command_buffer);
    }
 }
 
