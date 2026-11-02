@@ -12,6 +12,201 @@
 #include <Metal/MTL4LibraryFunctionDescriptor.h>
 #include <Metal/MTL4RenderPipeline.h>
 #include <Metal/MTLDevice.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <objc/runtime.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+enum {
+   KK_LIBRARY_CACHE_ENTRIES = 128,
+   KK_LIBRARY_CACHE_SOURCE_BYTES = 8 * 1024 * 1024,
+   KK_LIBRARY_CACHE_PENDING = 16,
+};
+
+static _Atomic uint64_t kk_library_scope;
+
+typedef struct {
+   id<MTLLibrary> library;
+   bool complete;
+   size_t source_bytes;
+   uint64_t serial;
+} KKLibraryEntry;
+
+typedef struct {
+   NSCondition *condition;
+   NSMutableDictionary *entries;
+   size_t source_bytes;
+   unsigned pending;
+   uint64_t scope, serial, hits, waits, misses, bypasses;
+} KKLibraryCache;
+
+static char kk_library_cache_key;
+
+static bool
+kk_library_option(const char *name)
+{
+   const char *value = getenv(name);
+   return value && strcmp(value, "1") == 0;
+}
+
+static KKLibraryCache *
+kk_library_cache(id<MTL4Compiler> compiler)
+{
+   @synchronized (compiler) {
+      NSDictionary *storage = objc_getAssociatedObject(compiler, &kk_library_cache_key);
+      if (!storage) {
+         NSMutableData *state = [NSMutableData dataWithLength:sizeof(KKLibraryCache)];
+         KKLibraryCache *cache = state.mutableBytes;
+         cache->scope = atomic_fetch_add(&kk_library_scope, 1) + 1;
+         cache->condition = [[NSCondition new] autorelease];
+         cache->entries = [NSMutableDictionary dictionary];
+         storage = @{ @"state": state, @"condition": cache->condition,
+                       @"entries": cache->entries };
+         objc_setAssociatedObject(compiler, &kk_library_cache_key, storage,
+                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+      }
+      return (KKLibraryCache *)[[storage objectForKey:@"state"] mutableBytes];
+   }
+}
+
+static id<MTLLibrary>
+kk_compile_library(id<MTL4Compiler> compiler, NSString *source,
+                   enum mtl_language_version msl_version,
+                   enum mtl_math_mode math_mode,
+                   enum mtl_math_floating_point_functions math_fp_fns)
+{
+   MTLCompileOptions *opts = [[MTLCompileOptions new] autorelease];
+   opts.languageVersion = (MTLLanguageVersion)msl_version;
+   opts.mathMode = (MTLMathMode)math_mode;
+   opts.mathFloatingPointFunctions = (MTLMathFloatingPointFunctions)math_fp_fns;
+
+   MTL4LibraryDescriptor *desc = [[MTL4LibraryDescriptor new] autorelease];
+   desc.source = source;
+   desc.options = opts;
+
+   NSError *error = nil;
+   id<MTLLibrary> lib = [compiler newLibraryWithDescriptor:desc error:&error];
+   if (lib == nil)
+      fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
+   return lib;
+}
+
+static id<MTLLibrary>
+kk_cached_library(KKLibraryCache *cache, id<MTL4Compiler> compiler,
+                  NSString *source, size_t bytes,
+                  enum mtl_language_version msl_version,
+                  enum mtl_math_mode math_mode,
+                  enum mtl_math_floating_point_functions math_fp_fns,
+                  const char **outcome)
+{
+   NSArray *key = @[source, @(msl_version), @(math_mode), @(math_fp_fns)];
+   [cache->condition lock];
+   NSMutableDictionary *entry_storage = [[cache->entries objectForKey:key] retain];
+   KKLibraryEntry *entry = (KKLibraryEntry *)[[entry_storage objectForKey:@"state"] mutableBytes];
+   if (entry) {
+      if (!entry->complete) {
+         cache->waits++;
+         *outcome = "wait";
+         while (!entry->complete)
+            [cache->condition wait];
+      } else {
+         cache->hits++;
+         *outcome = "hit";
+      }
+      entry->serial = ++cache->serial;
+      id<MTLLibrary> lib = [entry->library retain];
+      [cache->condition unlock];
+      [entry_storage release];
+      return lib;
+   }
+
+   if (bytes <= KK_LIBRARY_CACHE_SOURCE_BYTES &&
+       cache->pending < KK_LIBRARY_CACHE_PENDING) {
+      while (cache->entries.count >= KK_LIBRARY_CACHE_ENTRIES ||
+             cache->source_bytes + bytes > KK_LIBRARY_CACHE_SOURCE_BYTES) {
+         NSArray *old_key = nil;
+         KKLibraryEntry *oldest = nil;
+         for (NSArray *candidate in cache->entries) {
+            NSDictionary *storage = [cache->entries objectForKey:candidate];
+            KKLibraryEntry *value = (KKLibraryEntry *)[[storage objectForKey:@"state"] mutableBytes];
+            if (value->complete && (!oldest || value->serial < oldest->serial)) {
+               old_key = candidate;
+               oldest = value;
+            }
+         }
+         if (!oldest)
+            break;
+         cache->source_bytes -= oldest->source_bytes;
+         [cache->entries removeObjectForKey:old_key];
+      }
+   }
+
+   if (bytes > KK_LIBRARY_CACHE_SOURCE_BYTES ||
+       cache->pending >= KK_LIBRARY_CACHE_PENDING ||
+       cache->entries.count >= KK_LIBRARY_CACHE_ENTRIES ||
+       cache->source_bytes + bytes > KK_LIBRARY_CACHE_SOURCE_BYTES) {
+      cache->bypasses++;
+      [cache->condition unlock];
+      *outcome = "bypass";
+      return kk_compile_library(compiler, source, msl_version, math_mode, math_fp_fns);
+   }
+
+   NSMutableData *state = [NSMutableData dataWithLength:sizeof(KKLibraryEntry)];
+   entry_storage = [[NSMutableDictionary alloc] initWithObjectsAndKeys:state, @"state", nil];
+   entry = state.mutableBytes;
+   entry->source_bytes = bytes;
+   [cache->entries setObject:entry_storage forKey:key];
+   cache->source_bytes += bytes;
+   cache->pending++;
+   cache->misses++;
+   [cache->condition unlock];
+
+   *outcome = "compile";
+   id<MTLLibrary> lib = kk_compile_library(compiler, source, msl_version,
+                                          math_mode, math_fp_fns);
+   [cache->condition lock];
+   if (lib)
+      [entry_storage setObject:lib forKey:@"library"];
+   entry->library = lib;
+   entry->serial = ++cache->serial;
+   entry->complete = true;
+   cache->pending--;
+   if (!lib) {
+      cache->source_bytes -= entry->source_bytes;
+      [cache->entries removeObjectForKey:key];
+   }
+   [cache->condition broadcast];
+   [cache->condition unlock];
+   [entry_storage release];
+   return lib;
+}
+
+static void
+kk_library_trace(mtl_compiler *compiler, uint64_t scope, const char *source, uint64_t start_ns,
+                  enum mtl_language_version msl_version,
+                  enum mtl_math_mode math_mode,
+                  enum mtl_math_floating_point_functions math_fp_fns,
+                  const char *outcome, bool success)
+{
+   uint64_t end_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+   uint64_t tid = 0;
+   pthread_threadid_np(NULL, &tid);
+   unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+   CC_SHA256(source, (CC_LONG)strlen(source), digest);
+   char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+   for (unsigned i = 0; i < sizeof(digest); i++)
+      snprintf(hex + 2 * i, 3, "%02x", digest[i]);
+   fprintf(stderr, "kk-library: pid=%d compiler=%p scope=%llu start_ns=%llu end_ns=%llu thread=%llu source=%s "
+                   "msl=%u math=%u fp=%u outcome=%s success=%u\n",
+           getpid(), compiler, (unsigned long long)scope,
+           (unsigned long long)start_ns, (unsigned long long)end_ns,
+           (unsigned long long)tid, hex, (unsigned)msl_version,
+           (unsigned)math_mode, (unsigned)math_fp_fns, outcome, success);
+}
 
 /* Compiler */
 mtl_compiler *
@@ -43,23 +238,21 @@ mtl_new_library(mtl_compiler *compiler, const char *src,
    @autoreleasepool {
       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
       NSString *ns_src = [NSString stringWithCString:src encoding:NSASCIIStringEncoding];
-
-      MTLCompileOptions *opts = [[MTLCompileOptions new] autorelease];
-      opts.languageVersion = (MTLLanguageVersion)msl_version;
-      opts.mathMode = (MTLMathMode)math_mode;
-      opts.mathFloatingPointFunctions = (MTLMathFloatingPointFunctions)math_fp_fns;
-
-      MTL4LibraryDescriptor *desc = [[MTL4LibraryDescriptor new] autorelease];
-      desc.source = ns_src;
-      desc.options = opts;
-
-      NSError *error;
-      id<MTLLibrary> lib = [comp newLibraryWithDescriptor:desc error:&error];
-
-      if (lib == nil) {
-         fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
-      }
-
+      bool trace = kk_library_option("KK_MTL_LIBRARY_TRACE");
+      bool enabled = kk_library_option("KK_MTL_LIBRARY_CACHE");
+      uint64_t start_ns = trace ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+      const char *outcome = "uncached";
+      KKLibraryCache *cache = comp && (trace || enabled) ? kk_library_cache(comp) : NULL;
+      id<MTLLibrary> lib;
+      if (ns_src && cache && enabled)
+         lib = kk_cached_library(cache, comp, ns_src, strlen(src) + 1,
+                                  msl_version, math_mode, math_fp_fns, &outcome);
+      else
+         lib = kk_compile_library(comp, ns_src, msl_version, math_mode, math_fp_fns);
+      if (trace)
+         kk_library_trace(compiler, cache ? cache->scope : 0, src, start_ns,
+                           msl_version, math_mode, math_fp_fns,
+                           outcome, lib != nil);
       return lib;
    }
 }
