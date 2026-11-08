@@ -115,3 +115,36 @@ stw_interop_flush_objects(struct stw_context *ctx,
    return st_interop_flush_objects(ctx->st, count, objects, out);
 }
 
+
+static uint32_t
+dxgi_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM: return 28;      /* DXGI_FORMAT_R8G8B8A8_UNORM */
+   case PIPE_FORMAT_R8G8B8A8_SRGB: return 29;       /* DXGI_FORMAT_R8G8B8A8_UNORM_SRGB */
+   case PIPE_FORMAT_B8G8R8A8_UNORM: return 87;      /* DXGI_FORMAT_B8G8R8A8_UNORM */
+   case PIPE_FORMAT_B8G8R8A8_SRGB: return 91;       /* DXGI_FORMAT_B8G8R8A8_UNORM_SRGB */
+   case PIPE_FORMAT_R10G10B10A2_UNORM: return 24;   /* DXGI_FORMAT_R10G10B10A2_UNORM */
+   case PIPE_FORMAT_R16G16B16A16_FLOAT: return 10;  /* DXGI_FORMAT_R16G16B16A16_FLOAT */
+   default: return 0;
+   }
+}
+
+int
+wglExportMetalTextureMWXR(unsigned texture, struct wgl_metal_texture_mwxr *out)
+{
+   struct stw_context *ctx = stw_current_context();
+   struct st_interop_metal_texture metal;
+
+   if (!ctx || !out ||
+       st_interop_export_metal_texture(ctx->st, texture, &metal) != MESA_GLINTEROP_SUCCESS)
+      return FALSE;
+
+   out->mtl_texture = metal.mtl_texture;
+   out->dxgi_format = dxgi_format(metal.format);
+   out->width = metal.width;
+   out->height = metal.height;
+   out->levels = metal.levels;
+   out->samples = metal.samples;
+   return TRUE;
+}

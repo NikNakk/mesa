@@ -377,6 +377,23 @@ MesaGLInteropEGLExportObject(EGLDisplay dpy, EGLContext context,
 * Same as MesaGLInteropGLXExportObject except that it accepts
 * HDC and HGLRC.
 */
+/* In-process only: the Metal texture behind a 2D texture of the current context,
+ * when the driver renders with Metal (Zink over a Metal Vulkan driver). The texture
+ * object is borrowed and stays valid while the GL texture keeps its storage. The
+ * caller orders access (for example with glFinish). dxgi_format is the matching
+ * DXGI_FORMAT, or 0 if there is none. Returns FALSE when unavailable. */
+struct wgl_metal_texture_mwxr {
+   uint64_t mtl_texture;
+   uint32_t dxgi_format;
+   uint32_t width;
+   uint32_t height;
+   uint32_t levels;
+   uint32_t samples;
+};
+
+int
+wglExportMetalTextureMWXR(unsigned texture, struct wgl_metal_texture_mwxr *out);
+
 int
 wglMesaGLInteropExportObject(HDC dpy, HGLRC context,
                              struct mesa_glinterop_export_in *in,

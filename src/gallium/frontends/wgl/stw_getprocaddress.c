@@ -88,6 +88,7 @@ static const struct stw_extension_entry stw_extension_entries[] = {
    /* Unnamed */
    STW_EXTENSION_ENTRY( wglMesaGLInteropQueryDeviceInfo ),
    STW_EXTENSION_ENTRY( wglMesaGLInteropExportObject ),
+   STW_EXTENSION_ENTRY( wglExportMetalTextureMWXR ),
    STW_EXTENSION_ENTRY( wglMesaGLInteropFlushObjects ),
    { NULL, NULL }
 };

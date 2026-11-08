@@ -357,6 +357,48 @@ st_interop_export_object(struct st_context *st,
    return MESA_GLINTEROP_SUCCESS;
 }
 
+int
+st_interop_export_metal_texture(struct st_context *st, unsigned texture,
+                                struct st_interop_metal_texture *out)
+{
+   struct pipe_screen *screen = st->pipe->screen;
+   struct gl_context *ctx = st->ctx;
+   struct mesa_glinterop_export_in in = {
+      .version = 2,
+      .target = GL_TEXTURE_2D,
+      .obj = texture,
+   };
+   struct pipe_resource *res = NULL;
+   struct winsys_handle whandle;
+
+   if (!screen->resource_get_handle)
+      return MESA_GLINTEROP_UNSUPPORTED;
+
+   _mesa_glthread_finish(ctx);
+   simple_mtx_lock(&ctx->Shared->Mutex);
+   int ret = lookup_object(ctx, &in, NULL, &res);
+   if (ret == MESA_GLINTEROP_SUCCESS) {
+      memset(&whandle, 0, sizeof(whandle));
+      whandle.type = WINSYS_HANDLE_TYPE_METAL_TEXTURE;
+      if (screen->resource_get_handle(screen, st->pipe, res, &whandle, 0)) {
+#ifdef _WIN32
+         out->mtl_texture = (uint64_t)(uintptr_t)whandle.handle;
+#else
+         out->mtl_texture = (uint64_t)(uintptr_t)whandle.com_obj;
+#endif
+         out->format = res->format;
+         out->width = res->width0;
+         out->height = res->height0;
+         out->levels = res->last_level + 1;
+         out->samples = MAX2(1, res->nr_samples);
+      } else {
+         ret = MESA_GLINTEROP_UNSUPPORTED;
+      }
+   }
+   simple_mtx_unlock(&ctx->Shared->Mutex);
+   return ret;
+}
+
 static int
 flush_object(struct gl_context *ctx,
                         struct mesa_glinterop_export_in *in)
