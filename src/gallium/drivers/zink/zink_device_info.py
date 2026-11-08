@@ -103,6 +103,7 @@ EXTENSIONS = [
               alias="sync2",
               features=True),
     Extension("VK_KHR_external_memory_win32"),
+    Extension("VK_EXT_metal_objects"),
     Extension("VK_KHR_external_semaphore_win32"),
     Extension("VK_EXT_external_memory_dma_buf"),
     Extension("VK_KHR_buffer_device_address",
@@ -429,6 +430,8 @@ header_code = """
 #include <windows.h>
 #include <vulkan/vulkan_win32.h>
 #endif
+/* VK_EXT_metal_objects, also for Windows builds over a Metal-backed driver. */
+#include <vulkan/vulkan_metal.h>
 
 struct zink_screen;
 
@@ -871,7 +874,8 @@ zink_verify_device_extensions(struct zink_screen *screen)
             #ifndef NDEBUG
                      screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_${cmd.name()};
             #else
-                     screen->vk.${cmd.name()} = (PFN_${cmd.full_name})zink_stub_function_not_loaded;
+                     /* void *: platform entries are generic function pointers where the platform is off */
+                     screen->vk.${cmd.name()} = (void *)zink_stub_function_not_loaded;
             #endif
                   }
             %if cmd.name().find("Win32") != -1:

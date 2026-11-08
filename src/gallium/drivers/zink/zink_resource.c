@@ -228,6 +228,7 @@ zink_destroy_resource_object(struct zink_screen *screen, struct zink_resource_ob
    if (!obj->dt)
       zink_destroy_resource_surface_cache(screen, &obj->surface_cache, obj->is_buffer);
    VKSCR(DestroyImageView)(screen->dev, obj->video_view, NULL);
+   VKSCR(DestroyImageView)(screen->dev, obj->metal_view, NULL);
    simple_mtx_destroy(&obj->surface_mtx);
    if (!obj->dt && zink_debug & ZINK_DEBUG_MEM)
       zink_debug_mem_del(screen, obj->bo);
@@ -2447,6 +2448,67 @@ zink_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
    return true;
 }
 
+/* The MTLTexture behind a 2D texture on a Metal-backed driver (VK_EXT_metal_objects):
+ * that of a 2D view of its first level and layer, since drivers may store single-layer
+ * images as arrays (KosmicKrisp does for input attachments). The view shares the
+ * image's storage. Borrowed, and valid while the resource keeps its current storage. */
+static bool
+get_metal_texture(struct zink_screen *screen, struct pipe_resource *tex,
+                  struct winsys_handle *whandle)
+{
+   struct zink_resource *res = zink_resource(tex);
+   struct zink_resource_object *obj = res->obj;
+   if (tex->target != PIPE_TEXTURE_2D || !screen->info.have_EXT_metal_objects ||
+       obj->image == VK_NULL_HANDLE)
+      return false;
+   PFN_vkExportMetalObjectsEXT export_objects = (PFN_vkExportMetalObjectsEXT)
+      VKSCR(GetDeviceProcAddr)(screen->dev, "vkExportMetalObjectsEXT");
+   if (!export_objects)
+      return false;
+
+   simple_mtx_lock(&obj->surface_mtx);
+   if (!obj->metal_view) {
+      VkImageViewCreateInfo ivci = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = obj->image,
+         .viewType = VK_IMAGE_VIEW_TYPE_2D,
+         .format = zink_get_format(screen, tex->format),
+         .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1,
+         },
+      };
+      if (VKSCR(CreateImageView)(screen->dev, &ivci, NULL, &obj->metal_view) != VK_SUCCESS)
+         obj->metal_view = VK_NULL_HANDLE;
+   }
+   VkImageView view = obj->metal_view;
+   simple_mtx_unlock(&obj->surface_mtx);
+   if (!view)
+      return false;
+
+   VkExportMetalTextureInfoEXT texture = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+      .imageView = view,
+      .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
+   };
+   VkExportMetalObjectsInfoEXT info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+      .pNext = &texture,
+   };
+   export_objects(screen->dev, &info);
+   if (!texture.mtlTexture)
+      return false;
+#ifdef _WIN32
+   whandle->handle = (HANDLE)texture.mtlTexture;
+#else
+   whandle->com_obj = (void *)texture.mtlTexture;
+#endif
+   whandle->format = tex->format;
+   whandle->size = res->obj->size;
+   return true;
+}
+
 static bool
 zink_resource_get_handle(struct pipe_screen *pscreen,
                          struct pipe_context *context,
@@ -2454,6 +2516,8 @@ zink_resource_get_handle(struct pipe_screen *pscreen,
                          struct winsys_handle *whandle,
                          unsigned usage)
 {
+   if (whandle->type == WINSYS_HANDLE_TYPE_METAL_TEXTURE)
+      return get_metal_texture(zink_screen(pscreen), tex, whandle);
    if (tex->target == PIPE_BUFFER)
       tc_buffer_disable_cpu_storage(tex);
 #ifdef HAVE_LIBDRM
@@ -4061,6 +4125,9 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
    if (screen->info.have_KHR_external_memory_fd || screen->info.have_KHR_external_memory_win32) {
       pscreen->resource_get_handle = zink_resource_get_handle;
       pscreen->resource_from_handle = zink_resource_from_handle;
+   } else if (screen->info.have_EXT_metal_objects) {
+      /* Only WINSYS_HANDLE_TYPE_METAL_TEXTURE can be exported. */
+      pscreen->resource_get_handle = zink_resource_get_handle;
    }
    if (screen->info.have_EXT_external_memory_host) {
       pscreen->resource_from_user_memory = zink_resource_from_user_memory;

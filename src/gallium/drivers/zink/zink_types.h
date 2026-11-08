@@ -1287,6 +1287,7 @@ struct zink_resource_object {
    struct set surface_cache;
    simple_mtx_t surface_mtx;
    VkImageView video_view; //video decode picture view, protected by surface_mtx
+   VkImageView metal_view; //2D view of layer 0 exported as a Metal texture, protected by surface_mtx
 
    VkSampleLocationsInfoEXT zs_evaluate;
    bool needs_zs_evaluate;
