@@ -33,6 +33,8 @@
 
 #include "buffers.h"
 #include "context.h"
+#include "util/log.h"
+#include "version.h"
 #include "draw_validate.h"
 #include "hash.h"
 #include "macros.h"
@@ -326,6 +328,20 @@ get_xfb_source(struct gl_context *ctx)
 }
 
 
+/* MESA_GL_VERSION_OVERRIDE can expose transform feedback the driver lacks,
+ * and the application gets no error: say so once. */
+static void
+warn_unsupported_transform_feedback(struct gl_context *ctx, const char *call)
+{
+   static bool warned;
+   if (warned || ctx->Const.MaxTransformFeedbackBuffers != 0 ||
+       !_mesa_gl_version_overridden(ctx->API))
+      return;
+   warned = true;
+   mesa_logw("the application uses transform feedback (%s), which the driver "
+             "lacks (exposed by MESA_GL_VERSION_OVERRIDE)", call);
+}
+
 static ALWAYS_INLINE void
 begin_transform_feedback(struct gl_context *ctx, GLenum mode, bool no_error)
 {
@@ -334,6 +350,8 @@ begin_transform_feedback(struct gl_context *ctx, GLenum mode, bool no_error)
    struct gl_program *source;
    GLuint i;
    unsigned vertices_per_prim;
+
+   warn_unsupported_transform_feedback(ctx, "glBeginTransformFeedback");
 
    obj = ctx->TransformFeedback.CurrentObject;
 
@@ -869,6 +887,9 @@ transform_feedback_varyings(struct gl_context *ctx,
                             const GLchar *const *varyings, GLenum bufferMode)
 {
    GLint i;
+
+   if (count > 0)
+      warn_unsupported_transform_feedback(ctx, "glTransformFeedbackVaryings");
 
    /* free existing varyings, if any */
    for (i = 0; i < (GLint) shProg->TransformFeedback.NumVarying; i++) {

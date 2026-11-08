@@ -61,7 +61,9 @@
 #include "util/crc32.h"
 #include "util/os_file.h"
 #include "util/list.h"
+#include "pipe/p_screen.h"
 #include "util/log.h"
+#include "version.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_process.h"
 #include "util/u_string.h"
@@ -402,6 +404,17 @@ create_shader(struct gl_context *ctx, GLenum type)
 {
    struct gl_shader *sh;
    GLuint name;
+
+   /* MESA_GL_VERSION_OVERRIDE can expose geometry shaders the driver lacks,
+    * and the application gets no error: say so once. */
+   static bool warned_geometry;
+   if (type == GL_GEOMETRY_SHADER && !warned_geometry &&
+       !ctx->screen->shader_caps[MESA_SHADER_GEOMETRY].max_instructions &&
+       _mesa_gl_version_overridden(ctx->API)) {
+      warned_geometry = true;
+      mesa_logw("the application creates a geometry shader, which the driver "
+                "lacks (exposed by MESA_GL_VERSION_OVERRIDE)");
+   }
 
    _mesa_HashLockMutex(&ctx->Shared->ShaderObjects);
    name = _mesa_HashFindFreeKeyBlock(&ctx->Shared->ShaderObjects, 1);

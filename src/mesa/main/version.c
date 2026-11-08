@@ -192,6 +192,20 @@ _mesa_override_gl_version_contextless(struct gl_constants *consts,
    return false;
 }
 
+/**
+ * Whether MESA_GL_VERSION_OVERRIDE sets the version for this API, which can
+ * expose features the driver lacks.
+ */
+bool
+_mesa_gl_version_overridden(gl_api api)
+{
+   int version;
+   bool fwd_context, compat_context;
+
+   get_gl_override(api, &version, &fwd_context, &compat_context);
+   return version > 0;
+}
+
 void
 _mesa_override_gl_version(struct gl_context *ctx)
 {
