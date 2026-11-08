@@ -38,6 +38,17 @@ st_interop_export_object(struct st_context *st,
                          struct mesa_glinterop_export_in *in,
                          struct mesa_glinterop_export_out *out);
 
+/* The driver's native Metal texture behind a GL texture, for in-process sharing. */
+struct st_interop_metal_texture {
+   uint64_t mtl_texture;
+   enum pipe_format format;
+   unsigned width, height, levels, samples;
+};
+
+int
+st_interop_export_metal_texture(struct st_context *st, unsigned texture,
+                                struct st_interop_metal_texture *out);
+
 int
 st_interop_flush_objects(struct st_context *st,
                          unsigned count, struct mesa_glinterop_export_in *objects,
