@@ -325,11 +325,22 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
                          UTIL_QUEUE_INIT_RESIZE_IF_FULL, NULL);
    }
 
+   /* Device-level pipeline cache: backs pipelines created without an
+    * application cache, and through it the physical device's disk cache. */
+   struct vk_pipeline_cache_create_info cache_info = {
+      .weak_ref = true,
+   };
+   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &cache_info, NULL);
+   if (dev->vk.mem_cache == NULL) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_mem_cache;
+   }
+
    kk_shader_set_sync_compiles(true);
    result = kk_device_init_meta(dev);
    kk_shader_set_sync_compiles(false);
    if (result != VK_SUCCESS)
-      goto fail_mem_cache;
+      goto fail_destroy_mem_cache;
 
    result = kk_query_table_init(dev, &dev->occlusion_queries,
                                 KK_MAX_OCCLUSION_QUERIES);
@@ -369,6 +380,9 @@ fail_query_table:
    kk_query_table_finish(dev, &dev->occlusion_queries);
 fail_meta:
    kk_device_finish_meta(dev);
+fail_destroy_mem_cache:
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+   dev->vk.mem_cache = NULL;
 fail_mem_cache:
    if (dev->has_queue) {
       kk_queue_finish(dev, &dev->queue);
@@ -410,6 +424,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);
    kk_device_finish_lib(dev);
+   vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+   dev->vk.mem_cache = NULL;
    kk_query_table_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);
 
