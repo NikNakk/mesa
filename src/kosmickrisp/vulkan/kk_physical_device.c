@@ -1043,6 +1043,37 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    STATIC_ASSERT(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
    memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
    memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
+
+#ifdef ENABLE_SHADER_CACHE
+   /* The on-disk cache holds serialized shaders (MSL and its metadata), which
+    * depend on the driver build, the GPU, the workarounds and debug flags in
+    * use, and on experimental KK_* / MESA_KK_* options read while compiling.
+    * All of those go into the cache identity so a change never reuses a
+    * shader built under different settings. */
+   blake3_hasher id_ctx;
+   _mesa_blake3_init(&id_ctx);
+   _mesa_blake3_update(&id_ctx, instance->driver_build_sha,
+                       sizeof(instance->driver_build_sha));
+   _mesa_blake3_update(&id_ctx, pdev->vk.properties.deviceName,
+                       strlen(pdev->vk.properties.deviceName));
+   _mesa_blake3_update(&id_ctx, &pdev->settings.disabled_workarounds,
+                       sizeof(pdev->settings.disabled_workarounds));
+   _mesa_blake3_update(&id_ctx, &kk_mesa_debug_flags,
+                       sizeof(kk_mesa_debug_flags));
+   _mesa_blake3_update(&id_ctx, &kk_mesa_experimental_flags,
+                       sizeof(kk_mesa_experimental_flags));
+   extern char **environ;
+   for (char **env = environ; env && *env; env++) {
+      if (!strncmp(*env, "KK_", 3) || !strncmp(*env, "MESA_KK_", 8))
+         _mesa_blake3_update(&id_ctx, *env, strlen(*env) + 1);
+   }
+   unsigned char id[BLAKE3_KEY_LEN];
+   _mesa_blake3_final(&id_ctx, id);
+
+   char timestamp[BLAKE3_HEX_LEN];
+   _mesa_blake3_format(timestamp, id);
+   pdev->vk.disk_cache = disk_cache_create("kosmickrisp", timestamp, 0);
+#endif
 }
 
 static void
