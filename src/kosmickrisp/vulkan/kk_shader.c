@@ -924,6 +924,8 @@ static _Thread_local struct {
    char reason[24];
    uint8_t count;
    struct { uint8_t set; uint8_t reads; uint16_t index; uint32_t binding; } image[4];
+   bool own_texel;
+   uint16_t samples;
 } kk_cs_compact_pending;
 
 static const char *
@@ -958,6 +960,9 @@ kk_cs_compact_gather(nir_shader *nir)
       KK_CS_REJECT("shared");
    nir_variable *loaded[32];
    unsigned loaded_count = 0;
+   nir_def *coord = NULL;
+   kk_cs_compact_pending.own_texel = true;
+   kk_cs_compact_pending.samples = 0;
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -970,6 +975,7 @@ kk_cs_compact_gather(nir_shader *nir)
             }
             if (instr->type == nir_instr_type_tex) {
                nir_tex_instr *tex = nir_instr_as_tex(instr);
+               kk_cs_compact_pending.samples++;
                if (nir_tex_instr_has_implicit_derivative(tex))
                   KK_CS_REJECT("implicit lod");
                continue;
@@ -989,6 +995,10 @@ kk_cs_compact_gather(nir_shader *nir)
                   loaded[loaded_count++] = var;
                else if (var)
                   KK_CS_REJECT("many loads");
+               if (!coord)
+                  coord = intr->src[1].ssa;
+               else if (coord != intr->src[1].ssa)
+                  kk_cs_compact_pending.own_texel = false;
                continue;
             }
             /* Image atomics on a written 2D image count as stores that also read: on a
@@ -997,6 +1007,10 @@ kk_cs_compact_gather(nir_shader *nir)
             const bool image_atomic = intr->intrinsic == nir_intrinsic_image_deref_atomic ||
                                       intr->intrinsic == nir_intrinsic_image_deref_atomic_swap;
             if (intr->intrinsic == nir_intrinsic_image_deref_store || image_atomic) {
+               if (!coord)
+                  coord = intr->src[1].ssa;
+               else if (coord != intr->src[1].ssa)
+                  kk_cs_compact_pending.own_texel = false;
                if (image_atomic) {
                   nir_variable *v = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
                   if (v && loaded_count < ARRAY_SIZE(loaded))
@@ -1478,6 +1492,8 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
          for (unsigned i = 0; i < kk_cs_compact_pending.count; i++) {
             shader->info.cs.compact[i].set = kk_cs_compact_pending.image[i].set;
             shader->info.cs.compact[i].reads = kk_cs_compact_pending.image[i].reads;
+            shader->info.cs.compact_own_texel = kk_cs_compact_pending.own_texel;
+            shader->info.cs.compact_samples = kk_cs_compact_pending.samples;
             shader->info.cs.compact[i].index = kk_cs_compact_pending.image[i].index;
             shader->info.cs.compact[i].binding = kk_cs_compact_pending.image[i].binding;
          }

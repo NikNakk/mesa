@@ -82,8 +82,10 @@ static void
 kk_queue_add_timing_handler(mtl_commit_options *options, uint32_t count,
                             bool wsi_present)
 {
-   if (wsi_present)
+   if (wsi_present) {
       kk_pass_timing_frame();
+      kk_fdm_runtime_poll();
+   }
    if (!debug_get_bool_option("KK_QUEUE_TIMING", false))
       return;
 

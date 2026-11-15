@@ -64,6 +64,8 @@ bool kk_implicit_storage_enabled(void);
  * foveated image and only writes foveated storage images runs one invocation per
  * physical texel; each finds the screen texel it stands for (kk_shader.c). */
 bool kk_implicit_compact_enabled(void);
+/* KK_IMPLICIT_COMPACT_FILE: re-read the run-time switches (called at presents). */
+void kk_fdm_runtime_poll(void);
 struct kk_shader;
 /* Rate parameters to remap the dispatch with, shrinking the group counts to the
  * physical size, or 0 to run it as recorded. */

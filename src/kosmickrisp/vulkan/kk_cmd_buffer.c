@@ -1205,6 +1205,11 @@ kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
       mtl_barrier_after_encoder_stages(cmd->metal.compute,
                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+      /* With light barriers a render encoder starts with only the accumulated
+       * barrier: carry this one over too, or a pass after the compute encoder can
+       * read its results before they are written (NMS's sky and clouds). */
+      if (KK_EXPERIMENTAL(LIGHT_BARRIERS))
+         kk_accumulate_barrier(cmd, dep);
    } else {
       kk_encoder_stat("barrier with no encoder open", false);
       kk_barrier_histogram(dep);
