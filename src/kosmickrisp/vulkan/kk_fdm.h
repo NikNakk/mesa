@@ -60,6 +60,15 @@ void kk_implicit_match_pass(struct kk_cmd_buffer *cmd, struct kk_rendering_state
  * keeps the warped layout, so it is neither translated nor rate mapped. */
 bool kk_implicit_raw_active(void);
 bool kk_implicit_storage_enabled(void);
+/* KK_IMPLICIT_COMPACT=1 (with KK_IMPLICIT_STORAGE): a compute dispatch that covers a
+ * foveated image and only writes foveated storage images runs one invocation per
+ * physical texel; each finds the screen texel it stands for (kk_shader.c). */
+bool kk_implicit_compact_enabled(void);
+struct kk_shader;
+/* Rate parameters to remap the dispatch with, shrinking the group counts to the
+ * physical size, or 0 to run it as recorded. */
+uint64_t kk_implicit_compact_dispatch(struct kk_cmd_buffer *cmd, const struct kk_shader *cs,
+                                      uint32_t *group_x, uint32_t *group_y, uint32_t group_z);
 void kk_implicit_set_raw(bool raw);
 /* KK_IMPLICIT_FDM=auto: the view size and profile come from the OpenXR layer. */
 PUBLIC void kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t count,

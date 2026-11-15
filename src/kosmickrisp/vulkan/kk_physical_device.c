@@ -999,7 +999,7 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    /* Implicit foveation changes how shaders are lowered; an application's saved
     * pipeline cache from one mode must not be used in another. */
    const char *implicit_mode[] = {"KK_IMPLICIT_FDM", "KK_IMPLICIT_SINGLE", "KK_IMPLICIT_HALF",
-                                  "KK_IMPLICIT_STORAGE", "KK_IMPLICIT_SCALED", "KK_IMPLICIT_NO_FRAGCOORD",
+                                  "KK_IMPLICIT_STORAGE", "KK_IMPLICIT_SCALED", "KK_IMPLICIT_COMPACT", "KK_IMPLICIT_NO_FRAGCOORD",
                                   "KK_IMPLICIT_NO_SAMPLE", "KK_IMPLICIT_NO_FETCH",
                                   "KK_IMPLICIT_NO_FETCH_APP", "MESA_KK_EXPERIMENTAL"};
    for (unsigned i = 0; i < ARRAY_SIZE(implicit_mode); i++) {

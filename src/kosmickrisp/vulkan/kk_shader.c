@@ -24,6 +24,7 @@
 #include "util/os_time.h"
 #include "util/os_file.h"
 #include "util/hash_table.h"
+#include "util/u_dynarray.h"
 #include <pthread.h>
 #include "kosmickrisp/bridge/ns_process_info.h"
 #include "kosmickrisp/bridge/vk_to_mtl_map.h"
@@ -910,6 +911,265 @@ kk_lower_fdm_frag_coord(nir_builder *b, nir_instr *instr, UNUSED void *data)
    return nir_if_phi(b, mapped, phys);
 }
 
+/* KK_IMPLICIT_COMPACT: a compute shader whose invocations are independent (no shared
+ * memory, barriers, subgroup or derivative operations, buffer stores or atomics) and
+ * that writes only 2D storage images can run one invocation per physical texel of a
+ * foveated image. The dispatch then shrinks to the physical size, and a prologue
+ * maps each invocation to the screen texel at its physical texel's centre, so the
+ * shader sees the IDs that texel's invocation would have had. Its loads and stores
+ * at that screen texel translate back to the same physical texel. The prologue runs
+ * only when the dispatch sets cs.compact_params (kk_implicit_compact_dispatch). */
+static _Thread_local struct {
+   bool valid;
+   char reason[24];
+   uint8_t count;
+   struct { uint8_t set; uint8_t reads; uint16_t index; uint32_t binding; } image[4];
+} kk_cs_compact_pending;
+
+static const char *
+kk_cs_compact_name_denied(const char *n)
+{
+   static const char *const denied[] = {
+      "atomic", "store_global", "store_ssbo", "store_shared", "load_shared", "shared_",
+      "vote", "ballot", "shuffle", "quad", "reduce", "scan", "subgroup",
+      "read_invocation", "read_first_invocation", "elect", "load_global_invocation_index",
+      "global_invocation_id_zero_base", "base_global_invocation", "demote", "terminate",
+      "ddx", "ddy", "derivative",
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(denied); i++)
+      if (strstr(n, denied[i]))
+         return denied[i];
+   return NULL;
+}
+
+#define KK_CS_REJECT(why) do { snprintf(kk_cs_compact_pending.reason, sizeof(kk_cs_compact_pending.reason), "%s", why); return false; } while (0)
+
+static bool
+kk_cs_compact_gather(nir_shader *nir)
+{
+   kk_cs_compact_pending.count = 0;
+   if (nir->info.workgroup_size_variable)
+      KK_CS_REJECT("variable size");
+   if (nir->info.shared_size)
+      KK_CS_REJECT("shared");
+   if (nir->info.workgroup_size[0] * nir->info.workgroup_size[1] < 2)
+      KK_CS_REJECT("1d");
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_shared)
+      KK_CS_REJECT("shared");
+   nir_variable *loaded[32];
+   unsigned loaded_count = 0;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               const char *n = nir_op_infos[nir_instr_as_alu(instr)->op].name;
+               if (n[0] == 'f' && n[1] == 'd' && (n[2] == 'x' || n[2] == 'y'))
+                  KK_CS_REJECT("derivative");
+               continue;
+            }
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (nir_tex_instr_has_implicit_derivative(tex))
+                  KK_CS_REJECT("implicit lod");
+               continue;
+            }
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_barrier) {
+               if (nir_intrinsic_execution_scope(intr) != SCOPE_NONE)
+                  KK_CS_REJECT("barrier");
+               continue;
+            }
+            if (intr->intrinsic == nir_intrinsic_image_deref_load ||
+                intr->intrinsic == nir_intrinsic_image_deref_sparse_load) {
+               nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+               if (var && loaded_count < ARRAY_SIZE(loaded))
+                  loaded[loaded_count++] = var;
+               else if (var)
+                  KK_CS_REJECT("many loads");
+               continue;
+            }
+            /* Image atomics on a written 2D image count as stores that also read: on a
+             * foveated image they are already translated, so screen invocations that
+             * share a physical texel repeat them; one invocation per texel does not. */
+            const bool image_atomic = intr->intrinsic == nir_intrinsic_image_deref_atomic ||
+                                      intr->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+            if (intr->intrinsic == nir_intrinsic_image_deref_store || image_atomic) {
+               if (image_atomic) {
+                  nir_variable *v = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+                  if (v && loaded_count < ARRAY_SIZE(loaded))
+                     loaded[loaded_count++] = v;
+                  else
+                     KK_CS_REJECT("many loads");
+               }
+               if (nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_2D ||
+                   nir_intrinsic_image_array(intr))
+                  KK_CS_REJECT("non-2d store");
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               uint32_t index = 0;
+               if (deref->deref_type == nir_deref_type_array) {
+                  if (!nir_src_is_const(deref->arr.index))
+                     KK_CS_REJECT("indexed store");
+                  index = nir_src_as_uint(deref->arr.index);
+               }
+               nir_variable *var = nir_deref_instr_get_variable(deref);
+               if (!var || index > UINT16_MAX)
+                  KK_CS_REJECT("store var");
+               bool seen = false;
+               for (unsigned i = 0; i < kk_cs_compact_pending.count; i++)
+                  seen |= kk_cs_compact_pending.image[i].set == var->data.descriptor_set &&
+                          kk_cs_compact_pending.image[i].binding == var->data.binding &&
+                          kk_cs_compact_pending.image[i].index == index;
+               if (!seen) {
+                  if (kk_cs_compact_pending.count == ARRAY_SIZE(kk_cs_compact_pending.image))
+                     KK_CS_REJECT("many stores");
+                  kk_cs_compact_pending.image[kk_cs_compact_pending.count++] =
+                     (__typeof__(kk_cs_compact_pending.image[0])){
+                        .set = var->data.descriptor_set,
+                        .index = index,
+                        .binding = var->data.binding,
+                     };
+               }
+               continue;
+            }
+            if (intr->intrinsic == nir_intrinsic_store_deref) {
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               if (!nir_deref_mode_is(deref, nir_var_function_temp) &&
+                   !nir_deref_mode_is(deref, nir_var_shader_temp))
+                  KK_CS_REJECT("store deref");
+               continue;
+            }
+            const char *denied = kk_cs_compact_name_denied(nir_intrinsic_infos[intr->intrinsic].name);
+            if (denied)
+               KK_CS_REJECT(nir_intrinsic_infos[intr->intrinsic].name);
+         }
+      }
+   }
+   if (!kk_cs_compact_pending.count)
+      KK_CS_REJECT("no image store");
+   for (unsigned i = 0; i < kk_cs_compact_pending.count; i++)
+      for (unsigned j = 0; j < loaded_count; j++)
+         if (loaded[j]->data.descriptor_set == kk_cs_compact_pending.image[i].set &&
+             loaded[j]->data.binding == kk_cs_compact_pending.image[i].binding)
+            kk_cs_compact_pending.image[i].reads = 1;
+   return true;
+}
+
+static void
+kk_cs_compact_lower(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   const uint32_t sx = nir->info.workgroup_size[0], sy = nir->info.workgroup_size[1],
+                  sz = nir->info.workgroup_size[2];
+
+   struct util_dynarray loads;
+   util_dynarray_init(&loads, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+         case nir_intrinsic_load_workgroup_id:
+         case nir_intrinsic_load_local_invocation_id:
+         case nir_intrinsic_load_local_invocation_index:
+         case nir_intrinsic_load_global_invocation_id:
+         case nir_intrinsic_load_num_workgroups:
+            util_dynarray_append(&loads, nir_instr_as_intrinsic(instr));
+            break;
+         default:
+            break;
+         }
+      }
+   }
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *wg = nir_load_workgroup_id(&b);
+   nir_def *lid = nir_load_local_invocation_id(&b);
+   nir_def *groups = nir_load_num_workgroups(&b);
+   nir_def *root = nir_load_buffer_ptr_kk(&b, 1, 64, .binding = 0);
+   nir_def *params = nir_build_load_global_constant(
+      &b, 1, 64,
+      nir_iadd_imm(&b, root, offsetof(struct kk_root_descriptor_table, cs.compact_params)),
+      .align_mul = 8);
+
+   nir_push_if(&b, nir_ine_imm(&b, params, 0));
+   nir_def *phys_size = nir_build_load_global_constant(
+      &b, 2, 32, nir_iadd_imm(&b, params, offsetof(struct kk_rate_params_header, physical)),
+      .align_mul = 4);
+   nir_def *screen_size = nir_build_load_global_constant(
+      &b, 2, 32, nir_iadd_imm(&b, params, offsetof(struct kk_rate_params_header, screen)),
+      .align_mul = 4);
+   nir_def *phys = nir_vec2(&b,
+                            nir_iadd(&b, nir_imul_imm(&b, nir_channel(&b, wg, 0), sx),
+                                     nir_channel(&b, lid, 0)),
+                            nir_iadd(&b, nir_imul_imm(&b, nir_channel(&b, wg, 1), sy),
+                                     nir_channel(&b, lid, 1)));
+   /* Invocations past the physical size repeat the last texel's work. */
+   phys = nir_umin(&b, phys, nir_iadd_imm(&b, phys_size, -1));
+   nir_def *centre = nir_fadd_imm(&b, nir_u2f32(&b, phys), 0.5f);
+   nir_def *screen = nir_rate_map_physical_to_screen_kk(
+      &b, nir_iadd_imm(&b, params, KK_RATE_PARAMS_HEADER_B), centre, nir_imm_int(&b, 0));
+   screen = nir_f2u32(&b, nir_ffloor(&b, nir_fmax(&b, screen, nir_imm_float(&b, 0.0f))));
+   screen = nir_umin(&b, screen, nir_iadd_imm(&b, screen_size, -1));
+   nir_def *sx_ = nir_channel(&b, screen, 0), *sy_ = nir_channel(&b, screen, 1);
+   nir_def *new_wg = nir_vec3(&b, nir_udiv_imm(&b, sx_, sx), nir_udiv_imm(&b, sy_, sy),
+                              nir_channel(&b, wg, 2));
+   nir_def *new_lid = nir_vec3(&b, nir_umod_imm(&b, sx_, sx), nir_umod_imm(&b, sy_, sy),
+                               nir_channel(&b, lid, 2));
+   nir_def *new_groups = nir_build_load_global_constant(
+      &b, 3, 32,
+      nir_iadd_imm(&b, root, offsetof(struct kk_root_descriptor_table, cs.compact_groups)),
+      .align_mul = 4);
+   nir_pop_if(&b, NULL);
+   wg = nir_if_phi(&b, new_wg, wg);
+   lid = nir_if_phi(&b, new_lid, lid);
+   groups = nir_if_phi(&b, new_groups, groups);
+
+   nir_def *index = nir_iadd(
+      &b, nir_imul_imm(&b, nir_channel(&b, lid, 2), sx * sy),
+      nir_iadd(&b, nir_imul_imm(&b, nir_channel(&b, lid, 1), sx), nir_channel(&b, lid, 0)));
+   nir_def *size = nir_imm_ivec3(&b, sx, sy, sz);
+   nir_def *global =
+      nir_iadd(&b, nir_imul(&b, nir_iadd(&b, wg, nir_load_base_workgroup_id(&b, 32)), size), lid);
+
+   util_dynarray_foreach(&loads, nir_intrinsic_instr *, it) {
+      nir_intrinsic_instr *intr = *it;
+      nir_def *v;
+      switch (intr->intrinsic) {
+      case nir_intrinsic_load_workgroup_id: v = wg; break;
+      case nir_intrinsic_load_local_invocation_id: v = lid; break;
+      case nir_intrinsic_load_local_invocation_index: v = index; break;
+      case nir_intrinsic_load_global_invocation_id: v = global; break;
+      default: v = groups; break;
+      }
+      b.cursor = nir_before_instr(&intr->instr);
+      v = nir_u2uN(&b, nir_trim_vector(&b, v, intr->def.num_components), intr->def.bit_size);
+      nir_def_rewrite_uses(&intr->def, v);
+      nir_instr_remove(&intr->instr);
+   }
+   util_dynarray_fini(&loads);
+   nir_progress(true, impl, nir_metadata_none);
+}
+
+static void
+kk_cs_compact(nir_shader *nir)
+{
+   kk_cs_compact_pending.valid = false;
+   kk_cs_compact_pending.reason[0] = 0;
+   if (nir->info.stage != MESA_SHADER_COMPUTE || nir->info.internal ||
+       !kk_implicit_fdm_enabled() || !kk_implicit_storage_enabled() ||
+       !kk_implicit_compact_enabled())
+      return;
+   kk_cs_compact_pending.valid = true;
+   if (!kk_cs_compact_gather(nir)) {
+      kk_cs_compact_pending.count = 0;
+      return;
+   }
+   kk_cs_compact_lower(nir);
+}
+
 static void
 kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
              const struct vk_pipeline_robustness_state *rs,
@@ -1047,6 +1307,8 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
        state->rp->custom_resolve)
       NIR_PASS(_, nir, nir_shader_tex_pass, kk_lower_custom_resolve_input,
                nir_metadata_control_flow, (void *)state->ial);
+
+   kk_cs_compact(nir);
 
    NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts);
@@ -1209,6 +1471,18 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
       shader->info.cs.local_size.z = nir->info.workgroup_size[2];
+      if (kk_cs_compact_pending.valid) {
+         shader->info.cs.compact_count = kk_cs_compact_pending.count;
+         memcpy(shader->info.cs.compact_reject, kk_cs_compact_pending.reason,
+                sizeof(shader->info.cs.compact_reject));
+         for (unsigned i = 0; i < kk_cs_compact_pending.count; i++) {
+            shader->info.cs.compact[i].set = kk_cs_compact_pending.image[i].set;
+            shader->info.cs.compact[i].reads = kk_cs_compact_pending.image[i].reads;
+            shader->info.cs.compact[i].index = kk_cs_compact_pending.image[i].index;
+            shader->info.cs.compact[i].binding = kk_cs_compact_pending.image[i].binding;
+         }
+         kk_cs_compact_pending.valid = false;
+      }
    }
 }
 

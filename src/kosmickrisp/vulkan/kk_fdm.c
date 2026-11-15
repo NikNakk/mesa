@@ -12,6 +12,10 @@
 #include "kk_image.h"
 #include "kk_image_view.h"
 #include "kk_entrypoints.h"
+#include "kk_descriptor_set.h"
+#include "kk_descriptor_set_layout.h"
+#include "kk_descriptor_types.h"
+#include "kk_shader.h"
 #include "vk_format.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
@@ -76,6 +80,52 @@ kk_fdm_scan_offsets(struct kk_cmd_buffer *cmd)
 }
 
 static simple_mtx_t kk_fdm_lock = SIMPLE_MTX_INITIALIZER;
+
+
+/* Images with rate parameters, by the parameters' GPU address, so a dispatch can tell
+ * from a storage descriptor which image it writes (KK_IMPLICIT_COMPACT). */
+static simple_mtx_t kk_rate_registry_lock = SIMPLE_MTX_INITIALIZER;
+static struct kk_image **kk_rate_registry;
+static uint32_t kk_rate_registry_count, kk_rate_registry_cap;
+
+static void
+kk_rate_registry_add(struct kk_image *image)
+{
+   simple_mtx_lock(&kk_rate_registry_lock);
+   if (kk_rate_registry_count == kk_rate_registry_cap) {
+      uint32_t cap = MAX2(64, kk_rate_registry_cap * 2);
+      struct kk_image **grown = realloc(kk_rate_registry, cap * sizeof(*grown));
+      if (grown) {
+         kk_rate_registry = grown;
+         kk_rate_registry_cap = cap;
+      }
+   }
+   if (kk_rate_registry_count < kk_rate_registry_cap)
+      kk_rate_registry[kk_rate_registry_count++] = image;
+   simple_mtx_unlock(&kk_rate_registry_lock);
+}
+
+static void
+kk_rate_registry_remove(struct kk_image *image)
+{
+   simple_mtx_lock(&kk_rate_registry_lock);
+   for (uint32_t i = 0; i < kk_rate_registry_count; i++) {
+      if (kk_rate_registry[i] == image) {
+         kk_rate_registry[i] = kk_rate_registry[--kk_rate_registry_count];
+         break;
+      }
+   }
+   simple_mtx_unlock(&kk_rate_registry_lock);
+}
+
+static struct kk_image *
+kk_rate_registry_find_locked(uint64_t gpu)
+{
+   for (uint32_t i = 0; i < kk_rate_registry_count; i++)
+      if (kk_rate_registry[i]->rate_params->gpu == gpu)
+         return kk_rate_registry[i];
+   return NULL;
+}
 
 static bool
 kk_fdm_debug(void)
@@ -570,6 +620,7 @@ kk_fdm_image_init(struct kk_device *dev, struct kk_image *image)
    if (result != VK_SUCCESS)
       return result;
    memset(image->rate_params->cpu, 0, KK_RATE_PARAMS_HEADER_B);
+   kk_rate_registry_add(image);
    return VK_SUCCESS;
 }
 
@@ -615,8 +666,10 @@ kk_fdm_cmd_ref(struct kk_cmd_buffer *cmd, struct kk_fdm_params *params)
 void
 kk_fdm_image_finish(struct kk_device *dev, struct kk_image *image)
 {
-   if (image->rate_params)
+   if (image->rate_params) {
+      kk_rate_registry_remove(image);
       kk_destroy_bo(dev, image->rate_params);
+   }
    if (image->fdm.params) {
       simple_mtx_lock(&kk_fdm_lock);
       kk_fdm_params_unref(image->fdm.params);
@@ -1448,4 +1501,218 @@ kk_implicit_match_pass(struct kk_cmd_buffer *cmd, struct kk_rendering_state *ren
          kk_fdm_clear_image_mapping(cmd, image);
       }
    }
+}
+
+bool
+kk_implicit_compact_enabled(void)
+{
+   static int compact = -1;
+   if (compact < 0)
+      compact = debug_get_bool_option("KK_IMPLICIT_COMPACT", false);
+   return compact;
+}
+
+static void
+kk_compact_log(const struct kk_shader *cs, const char *fmt, ...)
+{
+   static uint32_t logged;
+   if (!debug_get_bool_option("KK_IMPLICIT_COMPACT_LOG", false) || logged >= 200)
+      return;
+   /* Once per shader and outcome. */
+   static struct { const void *cs; char what[96]; } seen[256];
+   char buf[96];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   for (uint32_t i = 0; i < MIN2(logged, ARRAY_SIZE(seen)); i++)
+      if (seen[i].cs == cs && !strcmp(seen[i].what, buf))
+         return;
+   if (logged < ARRAY_SIZE(seen)) {
+      seen[logged].cs = cs;
+      snprintf(seen[logged].what, sizeof(seen[logged].what), "%s", buf);
+   }
+   logged++;
+   mesa_logi("kk: compact dispatch, shader %p (%ux%u): %s", (const void *)cs,
+             (unsigned)cs->info.cs.local_size.x, (unsigned)cs->info.cs.local_size.y, buf);
+}
+
+/* KK_IMPLICIT_COMPACT_FILE=path (diagnostic): the file's first word, read at most once
+ * a second, picks the mode while the application runs: "off", "map" (map the images
+ * but dispatch at full size) or anything else, or no file, for compaction. */
+static int
+kk_compact_mode(void)
+{
+   static const char *path;
+   static int init, mode = 2;
+   static uint64_t last_ns;
+   if (!init) {
+      path = getenv("KK_IMPLICIT_COMPACT_FILE");
+      init = 1;
+   }
+   if (!path)
+      return 2;
+   uint64_t now = os_time_get_nano();
+   if (now - last_ns > 1000000000ull) {
+      last_ns = now;
+      char word[16] = {0};
+      FILE *f = fopen(path, "r");
+      int m = 2;
+      if (f) {
+         if (fscanf(f, "%15s", word) == 1)
+            m = !strcmp(word, "off") ? 0 : !strcmp(word, "map") ? 1 : 2;
+         fclose(f);
+      }
+      if (m != mode)
+         mesa_logi("kk: compact mode %s", m == 0 ? "off" : m == 1 ? "map" : "compact");
+      mode = m;
+   }
+   return mode;
+}
+
+uint64_t
+kk_implicit_compact_dispatch(struct kk_cmd_buffer *cmd, const struct kk_shader *cs,
+                             uint32_t *group_x, uint32_t *group_y, uint32_t group_z)
+{
+   if (!cs || !cs->info.cs.compact_count || !kk_implicit_compact_enabled() ||
+       group_z * cs->info.cs.local_size.z != 1)
+      return 0;
+   const int mode = kk_compact_mode();
+   if (mode == 0)
+      return 0;
+   const struct kk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   uint64_t params[4];
+   bool reads[4];
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < cs->info.cs.compact_count; i++) {
+      const uint32_t set = cs->info.cs.compact[i].set;
+      const uint32_t binding = cs->info.cs.compact[i].binding;
+      const uint32_t index = cs->info.cs.compact[i].index;
+      const uint8_t *base = NULL;
+      const struct kk_descriptor_set_layout *layout = NULL;
+      if (set < KK_MAX_SETS && desc->sets[set]) {
+         base = desc->sets[set]->mapped_ptr;
+         layout = desc->sets[set]->layout;
+      } else if (set < KK_MAX_SETS && desc->push[set]) {
+         base = desc->push[set]->data;
+         layout = desc->push[set]->layout;
+      }
+      if (!base || !layout || binding >= layout->binding_count)
+         return 0;
+      const struct kk_descriptor_set_binding_layout *bl = &layout->binding[binding];
+      if (bl->type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || index >= bl->array_size)
+         return 0;
+      const struct kk_storage_image_descriptor *d =
+         (const void *)(base + bl->offset + index * bl->stride);
+      if (!d->rate_params) {
+         kk_compact_log(cs, "writes an ordinary image (set %u binding %u)", set, binding);
+         return 0;
+      }
+      uint32_t j;
+      for (j = 0; j < count && params[j] != d->rate_params; j++)
+         ;
+      if (j == count) {
+         params[count] = d->rate_params;
+         reads[count++] = false;
+      }
+      reads[j] |= cs->info.cs.compact[i].reads;
+   }
+
+   /* Every written image must hold the same map (the same density map and serial),
+    * so one invocation per physical texel covers each of them. */
+   uint32_t screen[2] = {0}, physical[2] = {0};
+   const struct kk_image *shared_density = NULL;
+   uint64_t shared_serial = 0;
+   const struct kk_image *image = NULL;
+   simple_mtx_lock(&kk_rate_registry_lock);
+   for (uint32_t i = 0; i < count; i++) {
+      struct kk_image *img = kk_rate_registry_find_locked(params[i]);
+      image = img;
+      const struct kk_image *density = img ? img->rate_params_owner : NULL;
+      /* A foveated image with no map yet, which the dispatch rewrites whole without
+       * reading: give it the profile's map here, as a pass that does not load its
+       * target would. Its readers translate through the published parameters. */
+      if (img && !density && !reads[i] && kk_implicit_fdm_match(img) &&
+          *group_x == DIV_ROUND_UP(img->vk.extent.width, cs->info.cs.local_size.x) &&
+          *group_y == DIV_ROUND_UP(img->vk.extent.height, cs->info.cs.local_size.y)) {
+         struct kk_device *dev = kk_cmd_buffer_device(cmd);
+         simple_mtx_lock(&kk_fdm_lock);
+         struct kk_image *d = kk_implicit_density(dev, img, true);
+         const VkExtent2D extent = {img->vk.extent.width, img->vk.extent.height};
+         const VkRect2D area = {{0, 0}, extent};
+         void *map = d ? kk_fdm_get_map(cmd, d, extent, area) : NULL;
+         if (map && d->fdm.params) {
+            kk_fdm_cmd_ref(cmd, d->fdm.params);
+            mtl_compute_encoder *encoder = cs_get_compute(cmd);
+            uint32_t bytes = MIN2(d->fdm.params_bytes, KK_RATE_PARAMS_SIZE_B);
+            mtl_copy_from_buffer_to_buffer(encoder, d->fdm.params->bo->map, 0,
+                                           img->rate_params->map, 0, bytes);
+            mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
+            img->rate_params_owner = d;
+            img->rate_params_serial = d->fdm.serial;
+            density = d;
+            kk_compact_log(cs, "maps %ux%u", extent.width, extent.height);
+         }
+         simple_mtx_unlock(&kk_fdm_lock);
+      }
+      const char *why = NULL;
+      if (!img)
+         why = "unknown";
+      else if (!density)
+         why = "has no map yet";
+      else if (i && (density != shared_density || img->rate_params_serial != shared_serial))
+         why = "has a different map from another written image";
+      else {
+         simple_mtx_lock(&kk_fdm_lock);
+         if (density->fdm.params && img->rate_params_serial == density->fdm.serial) {
+            const struct kk_rate_params_header *h = density->fdm.params->bo->cpu;
+            if (h->valid && h->layers == 1) {
+               screen[0] = h->screen[0];
+               screen[1] = h->screen[1];
+               physical[0] = h->physical[0][0];
+               physical[1] = h->physical[0][1];
+               shared_density = density;
+               shared_serial = density->fdm.serial;
+            } else {
+               why = "has a layered map";
+            }
+         } else {
+            why = "has an old map";
+         }
+         simple_mtx_unlock(&kk_fdm_lock);
+      }
+      if (why) {
+         simple_mtx_unlock(&kk_rate_registry_lock);
+         kk_compact_log(cs, "image %ux%u %s", img ? img->vk.extent.width : 0,
+                        img ? img->vk.extent.height : 0, why);
+         return 0;
+      }
+   }
+   simple_mtx_unlock(&kk_rate_registry_lock);
+   if (count > 1)
+      kk_compact_log(cs, "writes %u foveated images with one map", count);
+   /* A shader that also reads what it writes (loads or atomics) is often temporal
+    * accumulation; at one invocation per physical texel NMS's showed ghosting and
+    * banding. KK_IMPLICIT_COMPACT_READS=1 compacts it anyway (diagnostic). */
+   bool any_reads = false;
+   for (uint32_t i = 0; i < count; i++)
+      any_reads |= reads[i];
+   if (any_reads && !debug_get_bool_option("KK_IMPLICIT_COMPACT_READS", false)) {
+      kk_compact_log(cs, "reads an image it writes");
+      return 0;
+   }
+
+   const uint32_t lx = cs->info.cs.local_size.x, ly = cs->info.cs.local_size.y;
+   if (*group_x != DIV_ROUND_UP(screen[0], lx) || *group_y != DIV_ROUND_UP(screen[1], ly)) {
+      kk_compact_log(cs, "grid %ux%u does not cover %ux%u (image %ux%u)", *group_x * lx,
+                     *group_y * ly, screen[0], screen[1], image->vk.extent.width,
+                     image->vk.extent.height);
+      return 0;
+   }
+   if (mode == 1)
+      return 0;
+   kk_compact_log(cs, "%ux%u -> %ux%u", screen[0], screen[1], physical[0], physical[1]);
+   *group_x = DIV_ROUND_UP(physical[0], lx);
+   *group_y = DIV_ROUND_UP(physical[1], ly);
+   return params[0];
 }

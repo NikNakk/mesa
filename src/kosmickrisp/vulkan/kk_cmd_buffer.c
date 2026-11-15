@@ -98,7 +98,8 @@ static struct {
    struct kk_pt_pending *pending;
    struct { char label[KK_PT_LABEL]; uint64_t ticks, count; } stats[256];
    uint32_t stat_count;
-   uint64_t frames, last_print_ns, dropped;
+   uint64_t frames, last_print_ns, dropped, buffers;
+   struct kk_device *dev;
 } kk_pt = {.lock = SIMPLE_MTX_INITIALIZER};
 
 static bool
@@ -110,11 +111,41 @@ kk_pass_timing_enabled(void)
    return enabled;
 }
 
+static void kk_pt_collect_locked(bool all);
+static void kk_pt_stamp(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder, bool render,
+                        const char *label);
+
+/* KK_PASS_TIMING_DISPATCH=1 (with KK_PASS_TIMING): a stamp after every dispatch,
+ * labelled by shader and grid. */
+bool
+kk_pass_timing_dispatch_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = kk_pass_timing_enabled() &&
+                debug_get_bool_option("KK_PASS_TIMING_DISPATCH", false);
+   return enabled;
+}
+
+void
+kk_pass_timing_dispatch(struct kk_cmd_buffer *cmd, const char *label)
+{
+   if (kk_pass_timing_dispatch_enabled() && cmd->metal.compute)
+      kk_pt_stamp(cmd, cmd->metal.compute, false, label);
+}
+static void kk_pt_print_locked(struct kk_device *dev);
+
 void
 kk_pass_timing_frame(void)
 {
-   if (kk_pass_timing_enabled())
-      p_atomic_inc(&kk_pt.frames);
+   if (!kk_pass_timing_enabled())
+      return;
+   p_atomic_inc(&kk_pt.frames);
+   simple_mtx_lock(&kk_pt.lock);
+   kk_pt_collect_locked(false);
+   if (kk_pt.dev)
+      kk_pt_print_locked(kk_pt.dev);
+   simple_mtx_unlock(&kk_pt.lock);
 }
 
 static void
@@ -225,9 +256,10 @@ kk_pt_print_locked(struct kk_device *dev)
       double total = 0;
       for (uint32_t i = 0; i < kk_pt.stat_count; i++)
          total += kk_pt.stats[i].ticks;
-      mesa_logi("kk-pass-timing: %llu frames, %.2f ms GPU per frame between stamps (%llu dropped)",
+      mesa_logi("kk-pass-timing: %llu frames, %.2f ms GPU per frame between stamps "
+                "(%llu command buffers, %llu dropped)",
                 (unsigned long long)frames, total / freq * 1000.0 / frames,
-                (unsigned long long)kk_pt.dropped);
+                (unsigned long long)kk_pt.buffers, (unsigned long long)kk_pt.dropped);
       for (uint32_t i = 0; i < MIN2(kk_pt.stat_count, 30); i++) {
          const __typeof__(kk_pt.stats[0]) *e = &kk_pt.stats[order[i]];
          mesa_logi("kk-pass-timing: %7.3f ms %6.1f/frame  %s", e->ticks / freq * 1000.0 / frames,
@@ -237,6 +269,7 @@ kk_pt_print_locked(struct kk_device *dev)
    memset(kk_pt.stats, 0, sizeof(kk_pt.stats));
    kk_pt.stat_count = 0;
    kk_pt.dropped = 0;
+   kk_pt.buffers = 0;
    kk_pt.last_print_ns = now;
 }
 
@@ -259,6 +292,8 @@ kk_pass_timing_end_cmdbuf(struct kk_cmd_buffer *cmd)
          p->recorded_ns = os_time_get_nano();
          simple_mtx_lock(&kk_pt.lock);
          p->next = kk_pt.pending; kk_pt.pending = p;
+         kk_pt.dev = dev;
+         kk_pt.buffers++;
          simple_mtx_unlock(&kk_pt.lock);
          pt->heap = NULL; /* owned by the pending record until the GPU is done */
       } else {
@@ -268,10 +303,6 @@ kk_pass_timing_end_cmdbuf(struct kk_cmd_buffer *cmd)
       }
    }
    pt->count = 0;
-   simple_mtx_lock(&kk_pt.lock);
-   kk_pt_collect_locked(false);
-   kk_pt_print_locked(dev);
-   simple_mtx_unlock(&kk_pt.lock);
 }
 
 void

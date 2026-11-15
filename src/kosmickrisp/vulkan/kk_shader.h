@@ -120,6 +120,16 @@ struct kk_shader_info {
 
       struct {
          struct mtl_size local_size;
+         /* KK_IMPLICIT_COMPACT: the storage images the shader writes, when it can
+          * run one invocation per physical texel of a foveated image. */
+         uint8_t compact_count;
+         char compact_reject[24];
+         struct {
+            uint8_t set;
+            uint8_t reads; /* the shader also loads from this image */
+            uint16_t index;
+            uint32_t binding;
+         } compact[4];
       } cs;
    };
 };

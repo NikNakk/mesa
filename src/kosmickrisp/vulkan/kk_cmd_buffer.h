@@ -46,6 +46,11 @@ struct kk_root_descriptor_table {
       } draw;
       struct {
          uint32_t base_group[3];
+         /* KK_IMPLICIT_COMPACT: the application's group counts, and the rate
+          * parameters of the foveated image the dispatch covers (0 when the
+          * dispatch runs as recorded). */
+         uint32_t compact_groups[3];
+         uint64_t compact_params;
       } cs;
    };
 
@@ -487,6 +492,8 @@ void kk_cmd_buffer_set_label(struct kk_cmd_buffer *cb, const char *label);
 /* KK_PASS_TIMING=1 (diagnostic): per-encoder GPU time, summed by pass shape and
  * logged every five seconds per presented frame. */
 void kk_pass_timing_end_cmdbuf(struct kk_cmd_buffer *cmd);
+bool kk_pass_timing_dispatch_enabled(void);
+void kk_pass_timing_dispatch(struct kk_cmd_buffer *cmd, const char *label);
 void kk_pass_timing_frame(void);
 void kk_pass_timing_free(struct kk_cmd_buffer *cmd);
 
