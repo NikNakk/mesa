@@ -477,6 +477,25 @@ kk_implicit_fill(struct kk_image *density, uint32_t width, uint32_t height, uint
    density->fdm.version++;
 }
 
+static uint64_t kk_implicit_last_present_ns;
+static bool kk_implicit_frame_boundary;
+
+/* Called at every present (kk_queue.c), and by the OpenXR layer when the application
+ * releases its eye image (kk_implicit_fdm_frame_boundary): the next pass may take a new
+ * profile. */
+void
+kk_implicit_fdm_present(void)
+{
+   kk_implicit_last_present_ns = os_time_get_nano();
+   kk_implicit_frame_boundary = true;
+}
+
+PUBLIC void
+kk_implicit_fdm_frame_boundary(void)
+{
+   kk_implicit_fdm_present();
+}
+
 /* The driver-made density map for a target of this size. `new_frame`: the pass does
  * not load the target, so a new profile cannot leave it in two layouts. Called with
  * kk_fdm_lock held. */
@@ -486,8 +505,17 @@ kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool ne
    const uint32_t eyes = kk_implicit_eyes(image);
    if (!eyes || !kk_implicit.pending.serial)
       return NULL;
+   /* A new profile is taken only at the first pass after a present that does not load its
+    * target. Taken at any such pass, it changed the map in the middle of a frame: later
+    * passes loading targets drawn earlier in the frame rendered them in the new layout
+    * over content in the old one (NMS with a moving gaze: hard-edged rectangles). An
+    * application that never presents keeps the old rule. */
+   const bool presents = kk_implicit_last_present_ns &&
+                         os_time_get_nano() - kk_implicit_last_present_ns < 200000000ull;
+   const bool boundary = presents ? kk_implicit_frame_boundary : true;
    if (kk_implicit.latched.serial != kk_implicit.pending.serial &&
-       (new_frame || !kk_implicit.latched.serial)) {
+       ((new_frame && boundary) || !kk_implicit.latched.serial)) {
+      kk_implicit_frame_boundary = false;
       kk_implicit.latched = kk_implicit.pending;
       for (uint32_t i = 0; i < kk_implicit.target_count; i++)
          kk_implicit_fill(kk_implicit.targets[i].density, kk_implicit.targets[i].width,

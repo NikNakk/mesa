@@ -66,6 +66,11 @@ bool kk_implicit_storage_enabled(void);
 bool kk_implicit_compact_enabled(void);
 /* KK_IMPLICIT_COMPACT_FILE: re-read the run-time switches (called at presents). */
 void kk_fdm_runtime_poll(void);
+/* A present happened: implicit foveation may switch to a new profile at the next pass. */
+void kk_implicit_fdm_present(void);
+/* The OpenXR layer's frame boundary (the eye image released), for applications that do
+ * not present. */
+PUBLIC void kk_implicit_fdm_frame_boundary(void);
 struct kk_shader;
 /* Rate parameters to remap the dispatch with, shrinking the group counts to the
  * physical size, or 0 to run it as recorded. */
