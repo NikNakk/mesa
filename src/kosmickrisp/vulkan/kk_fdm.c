@@ -395,6 +395,15 @@ kk_implicit_eyes(const struct kk_image *image)
 {
    if (!kk_implicit.view_width)
       return 0;
+   /* KK_IMPLICIT_SKIP=WxH[,WxH...] (diagnostic): sizes never foveated. */
+   const char *skip = getenv("KK_IMPLICIT_SKIP");
+   if (skip) {
+      char want[32];
+      snprintf(want, sizeof(want), "%ux%u", image->vk.extent.width, image->vk.extent.height);
+      for (const char *p = skip; (p = strstr(p, want)); p++)
+         if ((p == skip || p[-1] == ',') && (p[strlen(want)] == 0 || p[strlen(want)] == ','))
+            return 0;
+   }
    /* KK_IMPLICIT_HALF=1 (single-sample route): half-size targets too, each with its own
     * map of the same profile (half-resolution effects; The Talos Principle VR). */
    static int half = -1;
