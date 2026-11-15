@@ -475,7 +475,14 @@ kk_implicit_fill(struct kk_image *density, uint32_t width, uint32_t height, uint
          uint32_t eye = MIN2((uint32_t)(px / eye_width), eyes - 1);
          uint32_t hi = MIN2((uint32_t)((px - eye * eye_width) / eye_width * p->count), p->count - 1);
          uint8_t *texel = density->fdm.cpu + ((size_t)y * w + x) * 2;
-         texel[0] = (uint8_t)lroundf(255.0f * p->horizontal[eye][hi]);
+         /* A one-eye target may hold either eye (Talos renders each eye to its own image
+          * of the same size), and the two eyes' fields of view are not mirror images:
+          * take the higher of the two eyes' rates, so neither eye's sharp region lands
+          * off its gaze. */
+         float hrate = p->horizontal[eye][hi];
+         if (eyes == 1)
+            hrate = MAX2(p->horizontal[0][hi], p->horizontal[1][hi]);
+         texel[0] = (uint8_t)lroundf(255.0f * hrate);
          texel[1] = (uint8_t)lroundf(255.0f * p->vertical[vi]);
       }
    }
@@ -498,7 +505,15 @@ kk_implicit_fdm_present(void)
 PUBLIC void
 kk_implicit_fdm_frame_boundary(void)
 {
-   kk_implicit_fdm_present();
+   /* KK_IMPLICIT_BOUNDARY=present (diagnostic): only the application's own presents end
+    * a frame, not the OpenXR layer's swapchain releases. */
+   static int present_only = -1;
+   if (present_only < 0) {
+      const char *v = getenv("KK_IMPLICIT_BOUNDARY");
+      present_only = v && !strcmp(v, "present");
+   }
+   if (!present_only)
+      kk_implicit_fdm_present();
 }
 
 /* The driver-made density map for a target of this size. `new_frame`: the pass does
@@ -1122,21 +1137,19 @@ kk_fdm_publish(struct kk_cmd_buffer *cmd, struct kk_image *density,
    if (image->rate_params == NULL)
       return;
    uint32_t bytes = MIN2(density->fdm.params_bytes, KK_RATE_PARAMS_SIZE_B);
-   if (image->rate_ref == params && cmd->metal.render != NULL) {
-      /* Same parameters as the image already has: rewriting the same bytes from the CPU
-       * is harmless, and covers a command buffer holding the first copy being dropped. */
-      memcpy(image->rate_params->cpu, params->bo->cpu, bytes);
-   } else {
-      /* New parameters change how every later reader sees the image, so they are written
-       * in GPU order: work recorded earlier still reads the old layout through the old
-       * parameters. Written from the CPU at record time, a moving gaze showed stretched
-       * content and hard-edged rectangles. */
-      if (cmd->metal.render != NULL)
-         cs_end(cmd);
-      mtl_copy_from_buffer_to_buffer(cs_get_compute(cmd), params->bo->map, 0,
-                                     image->rate_params->map, 0, bytes);
-      kk_fdm_order_for_next_encoder(cmd);
-   }
+   /* Always written in GPU order. Whether the image "already has" these parameters is
+    * known only at record time; rewriting them from the CPU then (even the same bytes)
+    * lands before a still-queued copy of other parameters takes effect, so work recorded
+    * in between reads the wrong map (Talos's right eye was unwarped through the map its
+    * left eye had moved on to). */
+   if (cmd->metal.render != NULL)
+      cs_end(cmd);
+   mtl_compute_encoder *encoder = cs_get_compute(cmd);
+   mtl_copy_from_buffer_to_buffer(encoder, params->bo->map, 0, image->rate_params->map, 0,
+                                  bytes);
+   /* Later work in this encoder (dispatches, the driver's blits) reads them too. */
+   mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+   kk_fdm_order_for_next_encoder(cmd);
    if (image->rate_ref != params) {
       params->refs++;
       if (image->rate_ref)
@@ -1351,9 +1364,14 @@ kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_im
       if (first == -2)
          first = debug_get_num_option("KK_IMPLICIT_SEQ", -1);
       uint32_t n = p_atomic_inc_return(&calls);
-      if (first >= 0 && n >= first && n < first + 60)
-         mesa_logi("kk-seqop %u: %s %p s%u %ux%u -> %p", n, what, (const void *)a, a ? a->samples : 0,
-                   a ? a->extent.width : 0, a ? a->extent.height : 0, (const void *)b);
+      if (first >= 0 && n >= first && n < first + 400) {
+         const struct kk_image *ka = a ? container_of(a, struct kk_image, vk) : NULL;
+         mesa_logi("kk-seqop %u: %s %p s%u %ux%u map %llu latched %llu -> %p", n, what,
+                   (const void *)a, a ? a->samples : 0, a ? a->extent.width : 0,
+                   a ? a->extent.height : 0,
+                   ka && ka->rate_ref ? (unsigned long long)ka->rate_ref->serial : 0ull,
+                   (unsigned long long)kk_implicit.latched.serial, (const void *)b);
+      }
    }
    static struct { const char *what; const void *a, *b; uint32_t n; } seen[512];
    static uint32_t count;
@@ -2044,4 +2062,30 @@ kk_vrs_frame(void)
       kk_vrs.last_ns = now;
    }
    simple_mtx_unlock(&kk_vrs.lock);
+}
+
+void
+kk_implicit_copy_map(struct kk_cmd_buffer *cmd, struct kk_image *src, struct kk_image *dst)
+{
+   if (!src->rate_ref || !dst->rate_params || !dst->implicit_fdm || src == dst)
+      return;
+   simple_mtx_lock(&kk_fdm_lock);
+   struct kk_fdm_params *params = src->rate_ref;
+   /* The destination now holds the source's texels, laid out in the source's map. */
+   mtl_compute_encoder *encoder = cs_get_compute(cmd);
+   mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_BLIT);
+   mtl_copy_from_buffer_to_buffer(encoder, params->bo->map, 0, dst->rate_params->map, 0,
+                                  KK_RATE_PARAMS_SIZE_B);
+   mtl_barrier_after_encoder_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+   kk_fdm_order_for_next_encoder(cmd);
+   kk_fdm_cmd_ref(cmd, params);
+   if (dst->rate_ref != params) {
+      params->refs++;
+      if (dst->rate_ref)
+         kk_fdm_params_unref(dst->rate_ref);
+      dst->rate_ref = params;
+   }
+   dst->rate_params_owner = src->rate_params_owner;
+   dst->rate_params_serial = params->serial;
+   simple_mtx_unlock(&kk_fdm_lock);
 }

@@ -395,6 +395,9 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    }
    kk_fdm_note_use(&src->vk, "copy source");
    kk_fdm_note_use(&dst->vk, "copy destination");
+   const bool carry_map = src->implicit_fdm && dst->implicit_fdm && level0 &&
+                          src->vk.extent.width == dst->vk.extent.width &&
+                          src->vk.extent.height == dst->vk.extent.height;
 
    size_t buffer_size = 0u;
 
@@ -443,4 +446,6 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
                                    buf.buffer, buffer_offset, region);
       }
    }
+   if (carry_map)
+      kk_implicit_copy_map(cmd, src, dst);
 }

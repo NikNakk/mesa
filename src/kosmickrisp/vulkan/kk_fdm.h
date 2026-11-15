@@ -98,6 +98,10 @@ struct kk_cmd_buffer;
 VkImage kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
                                     VkImageLayout src_layout, const struct kk_image *dst);
 
+/* A raw copy from one foveated image into another (Talos keeps a copy of an eye): the
+ * destination takes the source's map with its texels. */
+void kk_implicit_copy_map(struct kk_cmd_buffer *cmd, struct kk_image *src, struct kk_image *dst);
+
 struct vk_image;
 void kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_image *b);
 
