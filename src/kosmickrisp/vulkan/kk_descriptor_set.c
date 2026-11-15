@@ -97,13 +97,15 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          const struct kk_image *image =
             container_of(view->vk.image, struct kk_image, vk);
          desc[plane].rate_params =
-            image->rate_params && !is_input_attachment ? image->rate_params->gpu
-                                                       : 0;
+            image->rate_params && !is_input_attachment && !kk_implicit_raw_active()
+               ? image->rate_params->gpu : 0;
          desc[plane].rate_base_layer = view->vk.base_array_layer;
-         desc[plane].rate_image_size[0] =
-            u_minify(view->vk.image->extent.width, view->vk.base_mip_level);
-         desc[plane].rate_image_size[1] =
-            u_minify(view->vk.image->extent.height, view->vk.base_mip_level);
+         /* A foveated image keeps one normalised layout at every mip level, so its
+          * translation works in level-0 pixels whatever the view's base level. */
+         const uint32_t rate_level = image->implicit_candidate && image->vk.samples == 1
+                                        ? 0 : view->vk.base_mip_level;
+         desc[plane].rate_image_size[0] = u_minify(view->vk.image->extent.width, rate_level);
+         desc[plane].rate_image_size[1] = u_minify(view->vk.image->extent.height, rate_level);
          kk_fdm_note_view(&view->vk, is_input_attachment ? "input" : "sampled");
          if (is_input_attachment)
             kk_fdm_note_use(&image->vk, "input attachment");
@@ -208,6 +210,16 @@ get_storage_image_view_desc(
 
       assert(view->planes[plane].storage_gpu_resource_id);
       desc.image_gpu_resource_id = view->planes[plane].storage_gpu_resource_id;
+      const struct kk_image *image = container_of(view->vk.image, struct kk_image, vk);
+      if (image->rate_params && !kk_implicit_raw_active()) {
+         desc.rate_params = image->rate_params->gpu;
+         desc.rate_base_layer = view->vk.base_array_layer;
+         /* Level-0 pixels, as for sampled reads of a foveated image. */
+         const uint32_t level = image->implicit_candidate && image->vk.samples == 1
+                                   ? 0 : view->vk.base_mip_level;
+         desc.rate_image_size[0] = u_minify(image->vk.extent.width, level);
+         desc.rate_image_size[1] = u_minify(image->vk.extent.height, level);
+      }
    }
 
    assert(sizeof(desc) <= dst_size);

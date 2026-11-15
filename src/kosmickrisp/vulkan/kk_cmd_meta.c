@@ -84,6 +84,9 @@ struct kk_meta_save {
    struct kk_conditional_rendering_state cond_render;
    struct kk_descriptor_set *desc0;
    struct kk_push_descriptor_set *push_desc0;
+   /* The application's pushed descriptors: meta pushes into the same object, and an
+    * application need not push again after an operation it did not ask for. */
+   struct kk_push_descriptor_set *push_desc0_contents;
    struct kk_addr_range vb0;
    struct kk_buffer_address desc0_set_addr;
    bool has_push_desc0;
@@ -128,8 +131,13 @@ kk_meta_begin(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
 
    save->desc0 = desc->sets[0];
    save->has_push_desc0 = desc->push[0];
-   if (save->has_push_desc0)
+   save->push_desc0_contents = NULL;
+   if (save->has_push_desc0) {
       save->push_desc0 = desc->push[0];
+      save->push_desc0_contents = malloc(sizeof(*desc->push[0]));
+      if (save->push_desc0_contents)
+         memcpy(save->push_desc0_contents, desc->push[0], sizeof(*desc->push[0]));
+   }
 
    static_assert(sizeof(save->push) == sizeof(desc->root.push),
                  "Size mismatch for push in meta_save");
@@ -161,8 +169,13 @@ kk_meta_end_impl(struct kk_cmd_buffer *cmd, struct kk_meta_save *save,
       desc->push_dirty &= ~BITFIELD_BIT(0);
    } else if (save->has_push_desc0) {
       desc->push[0] = save->push_desc0;
+      if (save->push_desc0_contents)
+         memcpy(desc->push[0], save->push_desc0_contents, sizeof(*desc->push[0]));
+      desc->sets[0] = NULL;
       desc->push_dirty |= BITFIELD_BIT(0);
    }
+   free(save->push_desc0_contents);
+   save->push_desc0_contents = NULL;
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       /* Restore the dynamic state */
@@ -250,11 +263,20 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_implicit_trace("blit", vk_image_from_handle(pBlitImageInfo->srcImage), vk_image_from_handle(pBlitImageInfo->dstImage));
    kk_fdm_note_use(vk_image_from_handle(pBlitImageInfo->srcImage), "blit source");
    kk_fdm_note_use(vk_image_from_handle(pBlitImageInfo->dstImage), "blit destination");
+   /* A foveated image blitted into itself (mip generation) keeps its warped layout. */
+   const struct kk_image *blit_src =
+      container_of(vk_image_from_handle(pBlitImageInfo->srcImage), struct kk_image, vk);
+   const bool raw = blit_src->implicit_fdm && pBlitImageInfo->srcImage == pBlitImageInfo->dstImage;
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdBlitImage2");
+   if (raw)
+      kk_implicit_set_raw(true);
    vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
+   if (raw)
+      kk_implicit_set_raw(false);
    kk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
@@ -266,6 +288,11 @@ kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    struct kk_meta_save save;
+   kk_implicit_trace("resolve", vk_image_from_handle(pResolveImageInfo->srcImage), vk_image_from_handle(pResolveImageInfo->dstImage));
+   /* Diagnostic: leave only the resolve-attachment path, to look at its blit. */
+   if (container_of(vk_image_from_handle(pResolveImageInfo->srcImage), struct kk_image, vk)->implicit_fdm &&
+       debug_get_bool_option("KK_IMPLICIT_SKIP_EXPLICIT", false))
+      return;
    kk_fdm_note_use(vk_image_from_handle(pResolveImageInfo->srcImage), "resolve source");
    kk_fdm_note_use(vk_image_from_handle(pResolveImageInfo->dstImage), "resolve destination");
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,

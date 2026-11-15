@@ -333,6 +333,20 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       kk_attachment_init(&render->color_att[i],
                          &pRenderingInfo->pColorAttachments[i]);
+      /* The multisampled route needs the match before choosing the hidden resolve. */
+      if (render->color_att[i].iview && kk_implicit_fdm_enabled() &&
+          !debug_get_bool_option("KK_IMPLICIT_SINGLE", false))
+         kk_implicit_fdm_match(container_of(render->color_att[i].iview->vk.image, struct kk_image, vk));
+      if (render->color_att[i].iview && render->color_att[i].resolve_iview &&
+          render->color_att[i].resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT) {
+         struct kk_image_view *hidden = kk_implicit_resolve_view(
+            dev, container_of(render->color_att[i].iview->vk.image, struct kk_image, vk),
+            render->color_att[i].resolve_iview);
+         if (hidden) {
+            render->color_att[i].implicit_dst = render->color_att[i].resolve_iview;
+            render->color_att[i].resolve_iview = hidden;
+         }
+      }
       struct kk_image_view *views[] = {
          render->color_att[i].iview, render->color_att[i].resolve_iview,
       };
@@ -359,6 +373,8 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    kk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    kk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
+   if (kk_implicit_fdm_enabled())
+      kk_implicit_match_pass(cmd, render);
    kk_merge_render_iview(&framebuffer_extent,
                          render->depth_att.iview ?: render->stencil_att.iview);
 
@@ -960,6 +976,16 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       .pStencilAttachment = &vk_stencil_att,
    };
 
+   const VkRenderingFlags pass_flags_for_log = render->flags;
+   const int had_encoder_for_log = cmd->metal.render != NULL;
+   struct kk_image_view *implicit_src[KK_MAX_RTS] = {NULL}, *implicit_dst[KK_MAX_RTS] = {NULL};
+   for (uint32_t i = 0; i < render->color_att_count; i++) {
+      if (render->color_att[i].implicit_dst && !(render->flags & VK_RENDERING_SUSPENDING_BIT)) {
+         implicit_src[i] = render->color_att[i].resolve_iview;
+         implicit_dst[i] = render->color_att[i].implicit_dst;
+      }
+   }
+   const VkRect2D implicit_area = render->area;
    kk_apply_attachment_store_ops(cmd, false);
 
    /* Clean up previous encoder */
@@ -1003,6 +1029,58 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    }
 
    memset(render, 0, sizeof(*render));
+
+   if (kk_implicit_fdm_enabled() && vk_render.colorAttachmentCount &&
+       vk_color_att[0].resolveImageView != VK_NULL_HANDLE) {
+      static uint32_t logged;
+      if (logged++ < 6)
+         mesa_logi("kk-implicit: end rendering, meta resolve %d mode %d area %d,%d %ux%u layers %u views 0x%x flags 0x%x encoder %d",
+                   need_meta_resolve, (int)vk_color_att[0].resolveMode, vk_render.renderArea.offset.x,
+                   vk_render.renderArea.offset.y, vk_render.renderArea.extent.width,
+                   vk_render.renderArea.extent.height, vk_render.layerCount, vk_render.viewMask,
+                   (unsigned)pass_flags_for_log, had_encoder_for_log);
+   }
+   /* Implicit foveation: the pass resolved into the hidden foveated image; a sampled
+    * blit reads it through the rate map into the application's ordinary target. */
+   for (uint32_t i = 0; i < KK_MAX_RTS; i++) {
+      if (!implicit_dst[i])
+         continue;
+      const VkOffset3D lo = {implicit_area.offset.x, implicit_area.offset.y, 0};
+      const VkOffset3D hi = {implicit_area.offset.x + (int32_t)implicit_area.extent.width,
+                             implicit_area.offset.y + (int32_t)implicit_area.extent.height, 1};
+      const VkImageBlit2 region = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .srcOffsets = {lo, hi},
+         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, implicit_dst[i]->vk.base_mip_level,
+                            implicit_dst[i]->vk.base_array_layer, 1},
+         .dstOffsets = {lo, hi},
+      };
+      const VkBlitImageInfo2 blit = {
+         .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+         .srcImage = vk_image_to_handle(implicit_src[i]->vk.image),
+         .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .dstImage = vk_image_to_handle(implicit_dst[i]->vk.image),
+         .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .regionCount = 1,
+         .pRegions = &region,
+         .filter = VK_FILTER_LINEAR,
+      };
+      if (debug_get_bool_option("KK_IMPLICIT_SKIP_BLIT", false))
+         continue;
+      if (debug_get_bool_option("KK_IMPLICIT_CLEAR_TEST", false)) {
+         const VkClearColorValue magenta = {.float32 = {1.0f, 0.0f, 1.0f, 1.0f}};
+         const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+         kk_CmdClearColorImage(kk_cmd_buffer_to_handle(cmd), blit.dstImage, VK_IMAGE_LAYOUT_GENERAL,
+                               &magenta, 1, &range);
+         static uint32_t logged;
+         if (logged++ < 4)
+            mesa_logi("kk-implicit: clear test on %p (pass colour %p)", (void *)implicit_dst[i]->vk.image,
+                      (void *)implicit_src[i]->vk.image);
+         continue;
+      }
+      kk_CmdBlitImage2(kk_cmd_buffer_to_handle(cmd), &blit);
+   }
 
    if (need_meta_resolve) {
       if (full_rate_depth_resolve)

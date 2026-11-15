@@ -128,6 +128,18 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, image, pCopyImageToBufferInfo->srcImage);
    VK_FROM_HANDLE(kk_buffer, buffer, pCopyImageToBufferInfo->dstBuffer);
+   bool level0 = true;
+   for (uint32_t r = 0; r < pCopyImageToBufferInfo->regionCount; r++)
+      level0 &= pCopyImageToBufferInfo->pRegions[r].imageSubresource.mipLevel == 0;
+   VkImage unwarp = level0 ? kk_implicit_unwarp_for_copy(cmd, image, pCopyImageToBufferInfo->srcImageLayout, NULL)
+                           : VK_NULL_HANDLE;
+   if (unwarp != VK_NULL_HANDLE) {
+      VkCopyImageToBufferInfo2 info = *pCopyImageToBufferInfo;
+      info.srcImage = unwarp;
+      info.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      kk_CmdCopyImageToBuffer2(commandBuffer, &info);
+      return;
+   }
    kk_fdm_note_use(&image->vk, "copy to buffer source");
 
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
@@ -364,6 +376,23 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);
+   kk_implicit_trace("copy", &src->vk, &dst->vk);
+   if (dst->implicit_fdm && !src->implicit_fdm && !dst->implicit_unwarp_logged) {
+      dst->implicit_unwarp_logged = true;
+      mesa_logw("kk-implicit: raw copy of an ordinary image into foveated %p", (void *)dst);
+   }
+   bool level0 = true;
+   for (uint32_t r = 0; r < pCopyImageInfo->regionCount; r++)
+      level0 &= pCopyImageInfo->pRegions[r].srcSubresource.mipLevel == 0;
+   VkImage unwarp = level0 ? kk_implicit_unwarp_for_copy(cmd, src, pCopyImageInfo->srcImageLayout, dst)
+                           : VK_NULL_HANDLE;
+   if (unwarp != VK_NULL_HANDLE) {
+      VkCopyImageInfo2 info = *pCopyImageInfo;
+      info.srcImage = unwarp;
+      info.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      kk_CmdCopyImage2(commandBuffer, &info);
+      return;
+   }
    kk_fdm_note_use(&src->vk, "copy source");
    kk_fdm_note_use(&dst->vk, "copy destination");
 

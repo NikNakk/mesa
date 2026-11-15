@@ -110,6 +110,10 @@ struct kk_attachment {
    /* Resolve in the render pass even though it does not cover the whole
     * framebuffer or is a depth/stencil resolve. */
    bool resolve_in_pass;
+
+   /* Implicit foveation: the application's resolve target, replaced for the pass
+    * by the source's hidden foveated image. */
+   struct kk_image_view *implicit_dst;
 };
 
 struct kk_rendering_state {

@@ -73,6 +73,20 @@ struct kk_image {
       struct kk_fdm_params *params;
    } fdm;
 
+   /* Implicit foveation: a multisampled eye-sized attachment (kk_fdm.h). */
+   bool implicit_candidate;
+   bool implicit_fdm;
+   /* Its hidden single-sample image in the same foveated layout: the pass resolves
+    * into it and it is then blitted, through the map, into the application's
+    * ordinary resolve target. */
+   VkImage implicit_resolve_image;
+   VkImageView implicit_resolve_view;
+   VkDeviceMemory implicit_resolve_memory;
+   /* Single-sample foveated images: an ordinary copy made before a raw copy reads it. */
+   VkImage implicit_unwarp_image;
+   VkDeviceMemory implicit_unwarp_memory;
+   bool implicit_unwarp_logged;
+   bool implicit_poison; /* shares a pass with an image that cannot be foveated */
    struct kk_bo *rate_params;
    const void *rate_params_owner;
    uint64_t rate_params_serial;

@@ -13,6 +13,7 @@
 #include "kk_shader.h"
 #include "kk_image.h"
 #include "kk_sampler.h"
+#include "kk_fdm.h"
 
 #include "kosmickrisp/compiler/nir_to_msl.h"
 
@@ -363,12 +364,85 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
                           offset_B, ctx);
 }
 
+static nir_def *
+kk_load_rate_u32(nir_builder *b, nir_def *addr, unsigned offset,
+                 unsigned components)
+{
+   return nir_build_load_global_constant(b, components, 32,
+                                         nir_iadd_imm(b, addr, offset),
+                                         .align_mul = 4);
+}
+
+/* Implicit foveation (KK_IMPLICIT_STORAGE): integer coordinates of storage loads, stores
+ * and atomics on a foveated image go through its rate map, screen to physical, as
+ * sampled fetches do. Several screen texels may then store to one physical texel. */
+static void
+kk_lower_storage_coord(nir_builder *b, nir_intrinsic_instr *intr, nir_deref_instr *deref,
+                       const struct lower_descriptors_ctx *ctx)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      break;
+   default:
+      return;
+   }
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   if (dim != GLSL_SAMPLER_DIM_2D && dim != GLSL_SAMPLER_DIM_MS)
+      return;
+   nir_def *coord = intr->src[1].ssa;
+   if (coord->num_components < 2 || coord->bit_size != 32)
+      return;
+
+   nir_def *addr = load_resource_deref_desc(
+      b, 1, 64, deref, offsetof(struct kk_storage_image_descriptor, rate_params), ctx);
+   nir_push_if(b, nir_ine_imm(b, addr, 0));
+   nir_def *valid =
+      kk_load_rate_u32(b, addr, offsetof(struct kk_rate_params_header, valid), 1);
+   nir_push_if(b, nir_ine_imm(b, valid, 0));
+
+   nir_def *layer = load_resource_deref_desc(
+      b, 1, 32, deref, offsetof(struct kk_storage_image_descriptor, rate_base_layer), ctx);
+   if (nir_intrinsic_image_array(intr))
+      layer = nir_iadd(b, layer, nir_channel(b, coord, 2));
+   nir_def *layers =
+      kk_load_rate_u32(b, addr, offsetof(struct kk_rate_params_header, layers), 1);
+   layer = nir_umin(b, layer, nir_iadd_imm(b, layers, -1));
+   nir_def *phys_addr = nir_iadd(
+      b, nir_iadd_imm(b, addr, offsetof(struct kk_rate_params_header, physical)),
+      nir_u2u64(b, nir_imul_imm(b, layer, 8)));
+   nir_def *phys_size = nir_u2f32(
+      b, nir_build_load_global_constant(b, 2, 32, phys_addr, .align_mul = 4));
+
+   nir_def *xy = nir_fadd_imm(b, nir_i2f32(b, nir_channels(b, coord, 0x3)), 0.5f);
+   nir_def *ph = nir_rate_map_screen_to_physical_kk(
+      b, nir_iadd_imm(b, addr, KK_RATE_PARAMS_HEADER_B), xy, layer);
+   ph = nir_fmax(b, ph, nir_imm_float(b, 0.5f));
+   ph = nir_fmin(b, ph, nir_fadd_imm(b, phys_size, -0.5f));
+   nir_def *uv = nir_f2i32(b, nir_ffloor(b, ph));
+
+   nir_def *comps[4];
+   for (unsigned i = 0; i < coord->num_components; i++)
+      comps[i] = i < 2 ? nir_channel(b, uv, i) : nir_channel(b, coord, i);
+   nir_def *mapped = nir_vec(b, comps, coord->num_components);
+   nir_pop_if(b, NULL);
+   nir_def *inner = nir_if_phi(b, mapped, coord);
+   nir_pop_if(b, NULL);
+   nir_def *result = nir_if_phi(b, inner, coord);
+   nir_src_rewrite(&intr->src[1], result);
+}
+
 static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   if (kk_implicit_fdm_enabled() && kk_implicit_storage_enabled())
+      kk_lower_storage_coord(b, intr, deref, ctx);
 
    /* Reads and queries use the texture descriptor; writes and atomics PBE. */
    unsigned offs =
@@ -480,20 +554,14 @@ kk_sampler_deref_is_subsampled(nir_builder *b, nir_deref_instr *deref,
    get_resource_deref_binding(b, deref, &set, &binding, &index);
    const struct kk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
+   if (kk_implicit_fdm_enabled() && !debug_get_bool_option("KK_IMPLICIT_NO_SAMPLE", false))
+      return true;
    return binding_layout->immutable_samplers != NULL &&
           binding_layout->immutable_samplers[0] != NULL &&
           (binding_layout->immutable_samplers[0]->vk.flags &
            VK_SAMPLER_CREATE_SUBSAMPLED_BIT_EXT);
 }
 
-static nir_def *
-kk_load_rate_u32(nir_builder *b, nir_def *addr, unsigned offset,
-                 unsigned components)
-{
-   return nir_build_load_global_constant(b, components, 32,
-                                         nir_iadd_imm(b, addr, offset),
-                                         .align_mul = 4);
-}
 
 static void
 kk_lower_subsampled_coord(nir_builder *b, nir_tex_instr *tex,
@@ -592,13 +660,17 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       kk_lower_subsampled_coord(b, tex,
                                 nir_src_as_deref(nir_src_for_ssa(texture)),
                                 plane_offset_B, ctx);
-   else if (KK_EXPERIMENTAL(FDM_RATE) &&
+   else if (KK_EXPERIMENTAL(FDM_RATE) && !debug_get_bool_option("KK_IMPLICIT_NO_FETCH", false) &&
+            /* KK_IMPLICIT_NO_FETCH_APP=1: only the driver's own shaders (diagnostic). */
+            (b->shader->info.internal ||
+             !debug_get_bool_option("KK_IMPLICIT_NO_FETCH_APP", false)) &&
             (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms) &&
             (tex->sampler_dim == GLSL_SAMPLER_DIM_2D ||
-             tex->sampler_dim == GLSL_SAMPLER_DIM_MS))
+             tex->sampler_dim == GLSL_SAMPLER_DIM_MS)) {
       kk_lower_subsampled_coord(b, tex,
                                 nir_src_as_deref(nir_src_for_ssa(texture)),
                                 plane_offset_B, ctx);
+   }
 
    /* LOD bias is passed in the descriptor set, rather than embedded into
     * the sampler descriptor. There's no spot in the hardware descriptor,

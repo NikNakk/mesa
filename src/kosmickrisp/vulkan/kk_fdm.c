@@ -11,12 +11,15 @@
 #include "kk_device.h"
 #include "kk_image.h"
 #include "kk_image_view.h"
+#include "kk_entrypoints.h"
+#include "vk_format.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 #include "kosmickrisp/bridge/mtl_encoder.h"
 #include "kosmickrisp/bridge/mtl_rate_map.h"
 
 #include "util/log.h"
+#include "util/u_atomic.h"
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
@@ -207,6 +210,348 @@ kk_fdm_note_view(const struct vk_image_view *view, const char *what)
                 view->image->array_layers, view->format);
    }
    simple_mtx_unlock(&kk_fdm_lock);
+}
+
+
+#define KK_IMPLICIT_SAMPLES 64
+struct kk_implicit_profile {
+   uint32_t count; /* samples across one eye, per axis */
+   float horizontal[2][KK_IMPLICIT_SAMPLES], vertical[KK_IMPLICIT_SAMPLES];
+   uint64_t serial;
+};
+static struct {
+   int state; /* 0 unread, 1 on, -1 off */
+   bool automatic;
+   uint32_t view_width, view_height; /* one eye */
+   struct kk_implicit_profile pending, latched;
+   struct {
+      uint32_t width, height, eyes;
+      struct kk_image *density;
+   } targets[8];
+   uint32_t target_count;
+} kk_implicit;
+
+bool
+kk_implicit_fdm_enabled(void)
+{
+   if (kk_implicit.state == 0) {
+      const char *text = getenv("KK_IMPLICIT_FDM");
+      uint32_t width = 0, height = 0;
+      float outer = 0.3f, core = 0.35f, edge = 0.75f;
+      if (text && KK_EXPERIMENTAL(FDM_RATE) && !strcmp(text, "auto")) {
+         kk_implicit.automatic = true;
+         kk_implicit.state = 1;
+         mesa_logi("kk-implicit: waiting for the OpenXR layer's view size and profile");
+      } else if (text && KK_EXPERIMENTAL(FDM_RATE) &&
+                 sscanf(text, "%ux%u,%f,%f,%f", &width, &height, &outer, &core, &edge) >= 2 &&
+                 width && height) {
+         /* Fixed: both eyes side by side in a WIDTHxHEIGHT target. */
+         outer = CLAMP(outer, 0.1f, 1.0f);
+         edge = MAX2(edge, core + 0.05f);
+         struct kk_implicit_profile *p = &kk_implicit.pending;
+         p->count = KK_IMPLICIT_SAMPLES;
+         const float half = width / 4.0f;
+         for (uint32_t i = 0; i < p->count; i++) {
+            float along = (i + 0.5f) / p->count;
+            float dist[2] = {fabsf(along - 0.5f) * 2.0f, fabsf(along - 0.5f) * height / half};
+            for (uint32_t c = 0; c < 2; c++) {
+               float s = CLAMP((dist[c] - core) / (edge - core), 0.0f, 1.0f);
+               s = s * s * (3.0f - 2.0f * s);
+               float rate = 1.0f + (outer - 1.0f) * s;
+               if (c == 0)
+                  p->horizontal[0][i] = p->horizontal[1][i] = rate;
+               else
+                  p->vertical[i] = rate;
+            }
+         }
+         p->serial = 1;
+         kk_implicit.view_width = width / 2;
+         kk_implicit.view_height = height;
+         kk_implicit.state = 1;
+         mesa_logi("kk-implicit: foveating multisampled %ux%u targets, outer %.2f core %.2f edge %.2f",
+                   width, height, outer, core, edge);
+      } else {
+         kk_implicit.state = -1;
+      }
+   }
+   return kk_implicit.state > 0;
+}
+
+/* From the OpenXR layer in the same process: one eye's size and the rate (0..1] at
+ * `count` evenly spaced positions across each eye, left to right and top to bottom of
+ * the image as this driver stores it. Takes effect at the next frame of each target. */
+PUBLIC void
+kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t count,
+                            const float *horizontal0, const float *horizontal1,
+                            const float *vertical)
+{
+   if (!kk_implicit_fdm_enabled() || !kk_implicit.automatic || !count || !view_width || !view_height)
+      return;
+   count = MIN2(count, KK_IMPLICIT_SAMPLES);
+   simple_mtx_lock(&kk_fdm_lock);
+   struct kk_implicit_profile *p = &kk_implicit.pending;
+   p->count = count;
+   for (uint32_t i = 0; i < count; i++) {
+      p->horizontal[0][i] = CLAMP(horizontal0[i], 0.0625f, 1.0f);
+      p->horizontal[1][i] = CLAMP(horizontal1[i], 0.0625f, 1.0f);
+      p->vertical[i] = CLAMP(vertical[i], 0.0625f, 1.0f);
+   }
+   p->serial++;
+   if (kk_implicit.view_width != view_width || kk_implicit.view_height != view_height)
+      mesa_logi("kk-implicit: view size %ux%u from the OpenXR layer", view_width, view_height);
+   kk_implicit.view_width = view_width;
+   kk_implicit.view_height = view_height;
+   simple_mtx_unlock(&kk_fdm_lock);
+}
+
+/* Set while the driver creates its own images (the unwarp copies): never candidates. */
+static _Thread_local bool kk_implicit_internal_image;
+
+bool
+kk_implicit_fdm_image(const VkImageCreateInfo *info)
+{
+   if (kk_implicit_internal_image)
+      return false;
+   /* Every multisampled attachment is a candidate: the size that marks an eye target
+    * may only be known later, and descriptors copy the parameter address when written. */
+   if (!kk_implicit_fdm_enabled() || info->imageType != VK_IMAGE_TYPE_2D ||
+       info->arrayLayers != 1 ||
+       (info->mipLevels != 1 && info->samples != VK_SAMPLE_COUNT_1_BIT) ||
+       !(info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+      return false;
+   if (info->samples != VK_SAMPLE_COUNT_1_BIT)
+      return info->mipLevels == 1;
+   /* KK_IMPLICIT_SINGLE=1: single-sample eye targets too (The Talos Principle VR). They
+    * stay warped: shader reads are translated, and raw copies read an unwarped copy
+    * (kk_implicit_unwarp_for_copy). Storage access is not translated, so such images
+    * are left alone; colour targets must be sampleable for the unwarp blit. Not for
+    * applications whose MSAA resolve targets are read outside Vulkan (Earth VR). */
+   static int single = -1;
+   if (single < 0)
+      single = debug_get_bool_option("KK_IMPLICIT_SINGLE", false);
+   /* Mip levels below the first are made by blits of the image into itself, which keep
+    * the warped layout at every level (kk_implicit_set_raw). */
+   if (!single || ((info->usage & VK_IMAGE_USAGE_STORAGE_BIT) && !kk_implicit_storage_enabled()) ||
+       (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_ALIAS_BIT)))
+      return false;
+   return (info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
+          (info->usage & VK_IMAGE_USAGE_SAMPLED_BIT);
+}
+
+static uint32_t
+kk_implicit_eyes(const struct kk_image *image)
+{
+   if (!kk_implicit.view_width)
+      return 0;
+   /* KK_IMPLICIT_HALF=1 (single-sample route): half-size targets too, each with its own
+    * map of the same profile (half-resolution effects; The Talos Principle VR). */
+   static int half = -1;
+   if (half < 0)
+      half = debug_get_bool_option("KK_IMPLICIT_HALF", false) &&
+             debug_get_bool_option("KK_IMPLICIT_SINGLE", false);
+   if (half && image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+       image->vk.extent.width == DIV_ROUND_UP(kk_implicit.view_width, 2) &&
+       image->vk.extent.height == DIV_ROUND_UP(kk_implicit.view_height, 2))
+      return 1;
+   /* KK_IMPLICIT_SCALED=1 (single-sample route): the eye layout scaled down uniformly,
+    * 40-100%, within 0.8%, not powers of two, as a render scale or dynamic resolution makes it (No Man's Sky renders
+    * its scene at about 59% and upscales). Each size gets its own map of the profile. */
+   static int scaled = -1;
+   if (scaled < 0)
+      scaled = debug_get_bool_option("KK_IMPLICIT_SCALED", false) &&
+               debug_get_bool_option("KK_IMPLICIT_SINGLE", false);
+   /* Power-of-two sizes are textures, shadow maps or probes, not scaled eyes; with a
+    * nearly square eye a square texture would otherwise match. */
+   const bool pot = util_is_power_of_two_nonzero(image->vk.extent.width) &&
+                    util_is_power_of_two_nonzero(image->vk.extent.height);
+   if (scaled && image->vk.samples == VK_SAMPLE_COUNT_1_BIT && !pot) {
+      for (uint32_t eyes = 1; eyes <= 2; eyes++) {
+         const float sx = (float)image->vk.extent.width / (eyes * kk_implicit.view_width);
+         const float sy = (float)image->vk.extent.height / kk_implicit.view_height;
+         if (sx >= 0.4f && sx < 1.0f && fabsf(sx - sy) <= 0.008f)
+            return eyes;
+      }
+   }
+   if (image->vk.extent.height != kk_implicit.view_height)
+      return 0;
+   return image->vk.extent.width == kk_implicit.view_width ? 1
+          : image->vk.extent.width == 2 * kk_implicit.view_width ? 2 : 0;
+}
+
+bool
+kk_implicit_fdm_match(struct kk_image *image)
+{
+   if (image->implicit_fdm || !image->implicit_candidate || image->implicit_poison)
+      return image->implicit_fdm;
+   simple_mtx_lock(&kk_fdm_lock);
+   if (kk_implicit_eyes(image) && kk_implicit.pending.serial) {
+      image->implicit_fdm = true;
+      mesa_logi("kk-implicit: foveating %ux%u s%u image %p (%u eye%s)", image->vk.extent.width,
+                image->vk.extent.height, image->vk.samples, (void *)image, kk_implicit_eyes(image),
+                kk_implicit_eyes(image) == 2 ? "s side by side" : "");
+   }
+   simple_mtx_unlock(&kk_fdm_lock);
+   return image->implicit_fdm;
+}
+
+static void
+kk_implicit_fill(struct kk_image *density, uint32_t width, uint32_t height, uint32_t eyes)
+{
+   const struct kk_implicit_profile *p = &kk_implicit.latched;
+   const uint32_t w = density->fdm.width, h = density->fdm.height;
+   const float eye_width = (float)width / eyes;
+   for (uint32_t y = 0; y < h; y++) {
+      float py = MIN2((y + 0.5f) * 32.0f, height - 0.5f);
+      uint32_t vi = MIN2((uint32_t)(py / height * p->count), p->count - 1);
+      for (uint32_t x = 0; x < w; x++) {
+         float px = MIN2((x + 0.5f) * 32.0f, width - 0.5f);
+         uint32_t eye = MIN2((uint32_t)(px / eye_width), eyes - 1);
+         uint32_t hi = MIN2((uint32_t)((px - eye * eye_width) / eye_width * p->count), p->count - 1);
+         uint8_t *texel = density->fdm.cpu + ((size_t)y * w + x) * 2;
+         texel[0] = (uint8_t)lroundf(255.0f * p->horizontal[eye][hi]);
+         texel[1] = (uint8_t)lroundf(255.0f * p->vertical[vi]);
+      }
+   }
+   density->fdm.version++;
+}
+
+/* The driver-made density map for a target of this size. `new_frame`: the pass does
+ * not load the target, so a new profile cannot leave it in two layouts. Called with
+ * kk_fdm_lock held. */
+static struct kk_image *
+kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool new_frame)
+{
+   const uint32_t eyes = kk_implicit_eyes(image);
+   if (!eyes || !kk_implicit.pending.serial)
+      return NULL;
+   if (kk_implicit.latched.serial != kk_implicit.pending.serial &&
+       (new_frame || !kk_implicit.latched.serial)) {
+      kk_implicit.latched = kk_implicit.pending;
+      for (uint32_t i = 0; i < kk_implicit.target_count; i++)
+         kk_implicit_fill(kk_implicit.targets[i].density, kk_implicit.targets[i].width,
+                          kk_implicit.targets[i].height, kk_implicit.targets[i].eyes);
+   }
+   for (uint32_t i = 0; i < kk_implicit.target_count; i++) {
+      if (kk_implicit.targets[i].width == image->vk.extent.width &&
+          kk_implicit.targets[i].height == image->vk.extent.height)
+         return kk_implicit.targets[i].density;
+   }
+   if (kk_implicit.target_count == ARRAY_SIZE(kk_implicit.targets))
+      return NULL;
+   struct kk_image *density = calloc(1, sizeof(*density));
+   if (density == NULL)
+      return NULL;
+   vk_object_base_init(&dev->vk, &density->vk.base, VK_OBJECT_TYPE_IMAGE);
+   const uint32_t w = DIV_ROUND_UP(image->vk.extent.width, 32), h = DIV_ROUND_UP(image->vk.extent.height, 32);
+   density->vk.extent = (VkExtent3D){w, h, 1};
+   density->fdm.width = w; density->fdm.height = h; density->fdm.layers = 1;
+   density->fdm.cpu = malloc((size_t)w * h * 2);
+   if (density->fdm.cpu == NULL) {
+      free(density);
+      return NULL;
+   }
+   kk_implicit_fill(density, image->vk.extent.width, image->vk.extent.height, eyes);
+   kk_implicit.targets[kk_implicit.target_count].width = image->vk.extent.width;
+   kk_implicit.targets[kk_implicit.target_count].height = image->vk.extent.height;
+   kk_implicit.targets[kk_implicit.target_count].eyes = eyes;
+   kk_implicit.targets[kk_implicit.target_count++].density = density;
+   return density;
+}
+
+struct kk_image_view *
+kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
+                         const struct kk_image_view *dst)
+{
+   if (!src->implicit_fdm || dst == NULL ||
+       (dst->vk.image->create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT) ||
+       debug_get_bool_option("KK_IMPLICIT_NATIVE_RESOLVE", false))
+      return NULL;
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkDevice device = kk_device_to_handle(dev);
+   simple_mtx_lock(&kk_fdm_lock);
+   if (src->implicit_resolve_view == VK_NULL_HANDLE) {
+      const VkImageCreateInfo image_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .flags = VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = dst->vk.view_format,
+         .extent = src->vk.extent,
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      VkImage image = VK_NULL_HANDLE;
+      VkDeviceMemory memory = VK_NULL_HANDLE;
+      VkImageView view = VK_NULL_HANDLE;
+      VkResult result = disp->CreateImage(device, &image_info, NULL, &image);
+      if (result == VK_SUCCESS) {
+         VkMemoryRequirements2 reqs = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+         const VkImageMemoryRequirementsInfo2 reqs_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = image};
+         disp->GetImageMemoryRequirements2(device, &reqs_info, &reqs);
+         const VkMemoryAllocateInfo alloc = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = reqs.memoryRequirements.size,
+            .memoryTypeIndex = ffs(reqs.memoryRequirements.memoryTypeBits) - 1,
+         };
+         result = disp->AllocateMemory(device, &alloc, NULL, &memory);
+      }
+      if (result == VK_SUCCESS) {
+         const VkBindImageMemoryInfo bind = {
+            .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, .image = image, .memory = memory};
+         result = disp->BindImageMemory2(device, 1, &bind);
+      }
+      if (result == VK_SUCCESS) {
+         const VkImageViewCreateInfo view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = dst->vk.view_format,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+         };
+         result = disp->CreateImageView(device, &view_info, NULL, &view);
+      }
+      if (result != VK_SUCCESS) {
+         mesa_logw("kk-implicit: hidden resolve image failed (%d)", result);
+         if (image != VK_NULL_HANDLE)
+            disp->DestroyImage(device, image, NULL);
+         if (memory != VK_NULL_HANDLE)
+            disp->FreeMemory(device, memory, NULL);
+         simple_mtx_unlock(&kk_fdm_lock);
+         return NULL;
+      }
+      src->implicit_resolve_image = image;
+      src->implicit_resolve_memory = memory;
+      src->implicit_resolve_view = view;
+      mesa_logi("kk-implicit: hidden resolve image %ux%u format %d for %p", src->vk.extent.width,
+                src->vk.extent.height, dst->vk.view_format, (void *)src);
+   }
+   simple_mtx_unlock(&kk_fdm_lock);
+   VK_FROM_HANDLE(kk_image_view, hidden, src->implicit_resolve_view);
+   return hidden->vk.view_format == dst->vk.view_format ? hidden : NULL;
+}
+
+void
+kk_implicit_image_finish(struct kk_device *dev, struct kk_image *image)
+{
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkDevice device = kk_device_to_handle(dev);
+   if (image->implicit_unwarp_image != VK_NULL_HANDLE) {
+      disp->DestroyImage(device, image->implicit_unwarp_image, NULL);
+      disp->FreeMemory(device, image->implicit_unwarp_memory, NULL);
+      image->implicit_unwarp_image = VK_NULL_HANDLE;
+   }
+   if (image->implicit_resolve_view == VK_NULL_HANDLE)
+      return;
+   disp->DestroyImageView(device, image->implicit_resolve_view, NULL);
+   disp->DestroyImage(device, image->implicit_resolve_image, NULL);
+   disp->FreeMemory(device, image->implicit_resolve_memory, NULL);
+   image->implicit_resolve_view = VK_NULL_HANDLE;
 }
 
 VkResult
@@ -591,16 +936,20 @@ static bool
 kk_fdm_all_subsampled(const struct kk_rendering_state *render)
 {
    for (uint32_t i = 0; i < render->color_att_count; i++) {
+      /* Implicit foveation resolves into ordinary images after the pass, through the map. */
       if (!kk_fdm_subsampled(render->color_att[i].iview) ||
           (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE &&
-           !kk_fdm_subsampled(render->color_att[i].resolve_iview)))
+           !kk_fdm_subsampled(render->color_att[i].resolve_iview) &&
+           !kk_implicit_fdm_enabled()))
          return false;
    }
    return kk_fdm_depth_compatible(render, &render->depth_att) &&
           kk_fdm_depth_compatible(render, &render->stencil_att) &&
           (render->depth_att.resolve_mode == VK_RESOLVE_MODE_NONE ||
+           kk_implicit_fdm_enabled() ||
            kk_fdm_subsampled(render->depth_att.resolve_iview)) &&
           (render->stencil_att.resolve_mode == VK_RESOLVE_MODE_NONE ||
+           kk_implicit_fdm_enabled() ||
            kk_fdm_subsampled(render->stencil_att.resolve_iview));
 }
 
@@ -704,7 +1053,31 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
       }
    }
 
+   for (uint32_t i = 0; i < render->color_att_count; i++) {
+      if (render->color_att[i].iview)
+         kk_implicit_trace(render->color_att[i].resolve_iview ? "render colour+resolve" : "render colour",
+                           render->color_att[i].iview->vk.image,
+                           render->color_att[i].resolve_iview ? render->color_att[i].resolve_iview->vk.image : NULL);
+   }
+   if (render->depth_att.iview)
+      kk_implicit_trace("render depth", render->depth_att.iview->vk.image,
+                        render->depth_att.resolve_iview ? render->depth_att.resolve_iview->vk.image : NULL);
+
    simple_mtx_lock(&kk_fdm_lock);
+   if (!density && kk_implicit_fdm_enabled() && !gfx->in_custom_resolve && !kk_implicit_raw_active() &&
+       !debug_get_bool_option("KK_IMPLICIT_NOMAP", false)) {
+      const struct kk_image_view *first =
+         render->color_att_count && render->color_att[0].iview ? render->color_att[0].iview
+                                                               : render->depth_att.iview;
+      struct kk_image *target = first ? container_of(first->vk.image, struct kk_image, vk) : NULL;
+      /* Every pass on a foveated image, whatever its render area: an unmapped pass
+       * would write the image in a second layout. */
+      if (target && target->implicit_fdm) {
+         const struct kk_attachment *att = render->color_att_count && render->color_att[0].iview
+                                              ? &render->color_att[0] : &render->depth_att;
+         density = kk_implicit_density(dev, target, att->load_op != VK_ATTACHMENT_LOAD_OP_LOAD);
+      }
+   }
    void *map = density ? kk_fdm_get_map(cmd, density, screen, render->area) : NULL;
    if (map && !kk_fdm_all_subsampled(render)) {
       static uint32_t logged;
@@ -793,6 +1166,52 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    }
 }
 
+
+/* Diagnostic (KK_IMPLICIT_TRACE=1): each distinct image operation an application
+ * performs, once, to plan foveation of applications that do not ask for it. */
+void
+kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_image *b)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("KK_IMPLICIT_TRACE", false);
+   if (!enabled)
+      return;
+   {
+      /* KK_IMPLICIT_SEQ=N: also the 60 consecutive operations from the Nth, in order. */
+      static int64_t first = -2;
+      static uint32_t calls;
+      if (first == -2)
+         first = debug_get_num_option("KK_IMPLICIT_SEQ", -1);
+      uint32_t n = p_atomic_inc_return(&calls);
+      if (first >= 0 && n >= first && n < first + 60)
+         mesa_logi("kk-seqop %u: %s %p s%u %ux%u -> %p", n, what, (const void *)a, a ? a->samples : 0,
+                   a ? a->extent.width : 0, a ? a->extent.height : 0, (const void *)b);
+   }
+   static struct { const char *what; const void *a, *b; uint32_t n; } seen[512];
+   static uint32_t count;
+   simple_mtx_lock(&kk_fdm_lock);
+   for (uint32_t i = 0; i < count; i++) {
+      if (seen[i].what == what && seen[i].a == a && seen[i].b == b) {
+         seen[i].n++;
+         simple_mtx_unlock(&kk_fdm_lock);
+         return;
+      }
+   }
+   if (count < ARRAY_SIZE(seen)) {
+      seen[count].what = what; seen[count].a = a; seen[count].b = b; seen[count].n = 1;
+      count++;
+      char sb[96] = "";
+      if (b)
+         snprintf(sb, sizeof(sb), " -> %p fmt %d s%u %ux%ux%u usage 0x%x", (const void *)b, b->format,
+                  b->samples, b->extent.width, b->extent.height, b->array_layers, (unsigned)b->usage);
+      mesa_logi("kk-implicit: %s %p fmt %d s%u %ux%ux%u usage 0x%x%s", what, (const void *)a,
+                a ? a->format : 0, a ? a->samples : 0, a ? a->extent.width : 0, a ? a->extent.height : 0,
+                a ? a->array_layers : 0, a ? (unsigned)a->usage : 0, sb);
+   }
+   simple_mtx_unlock(&kk_fdm_lock);
+}
+
 void
 kk_seq_log(struct kk_cmd_buffer *cmd, const char *fmt, ...)
 {
@@ -822,4 +1241,211 @@ void
 kk_fdm_carry_to_next_rendering(struct kk_cmd_buffer *cmd)
 {
    cmd->state.gfx.fdm.carry = cmd->state.gfx.fdm.density != NULL;
+}
+
+VkImage
+kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
+                            VkImageLayout src_layout, const struct kk_image *dst)
+{
+   if (!src->implicit_fdm || src->vk.samples != VK_SAMPLE_COUNT_1_BIT)
+      return VK_NULL_HANDLE;
+   /* Between two foveated images of one size the layouts agree: copy as stored. */
+   if (dst && dst->implicit_fdm && dst->vk.extent.width == src->vk.extent.width &&
+       dst->vk.extent.height == src->vk.extent.height)
+      return VK_NULL_HANDLE;
+   if (vk_format_is_depth_or_stencil(src->vk.format)) {
+      if (!src->implicit_unwarp_logged) {
+         src->implicit_unwarp_logged = true;
+         mesa_logw("kk-implicit: raw copy of foveated depth image %p is not unwarped", (void *)src);
+      }
+      return VK_NULL_HANDLE;
+   }
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkDevice device = kk_device_to_handle(dev);
+   simple_mtx_lock(&kk_fdm_lock);
+   if (src->implicit_unwarp_image == VK_NULL_HANDLE) {
+      const VkImageCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = src->vk.format,
+         .extent = src->vk.extent,
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      };
+      VkImage image = VK_NULL_HANDLE;
+      VkDeviceMemory memory = VK_NULL_HANDLE;
+      kk_implicit_internal_image = true;
+      VkResult result = disp->CreateImage(device, &info, NULL, &image);
+      kk_implicit_internal_image = false;
+      if (result == VK_SUCCESS) {
+         VkMemoryRequirements2 reqs = {.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+         const VkImageMemoryRequirementsInfo2 reqs_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, .image = image};
+         disp->GetImageMemoryRequirements2(device, &reqs_info, &reqs);
+         const VkMemoryAllocateInfo alloc = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = reqs.memoryRequirements.size,
+            .memoryTypeIndex = ffs(reqs.memoryRequirements.memoryTypeBits) - 1,
+         };
+         result = disp->AllocateMemory(device, &alloc, NULL, &memory);
+      }
+      if (result == VK_SUCCESS) {
+         const VkBindImageMemoryInfo bind = {
+            .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO, .image = image, .memory = memory};
+         result = disp->BindImageMemory2(device, 1, &bind);
+      }
+      if (result != VK_SUCCESS) {
+         if (image != VK_NULL_HANDLE)
+            disp->DestroyImage(device, image, NULL);
+         if (memory != VK_NULL_HANDLE)
+            disp->FreeMemory(device, memory, NULL);
+         simple_mtx_unlock(&kk_fdm_lock);
+         mesa_logw("kk-implicit: unwarp image failed (%d)", result);
+         return VK_NULL_HANDLE;
+      }
+      src->implicit_unwarp_image = image;
+      src->implicit_unwarp_memory = memory;
+      mesa_logi("kk-implicit: unwarping copies of %ux%u format %d image %p", src->vk.extent.width,
+                src->vk.extent.height, src->vk.format, (void *)src);
+   }
+   VkImage unwarp = src->implicit_unwarp_image;
+   simple_mtx_unlock(&kk_fdm_lock);
+   /* The driver's blit samples `src` through its rate map (every sampled read is
+    * translated in implicit mode) and renders an ordinary image. */
+   const VkImageBlit2 region = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .srcOffsets = {{0, 0, 0}, {(int32_t)src->vk.extent.width, (int32_t)src->vk.extent.height, 1}},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .dstOffsets = {{0, 0, 0}, {(int32_t)src->vk.extent.width, (int32_t)src->vk.extent.height, 1}},
+   };
+   const VkBlitImageInfo2 blit = {
+      .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+      .srcImage = kk_image_to_handle(src),
+      .srcImageLayout = src_layout,
+      .dstImage = unwarp,
+      .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .regionCount = 1,
+      .pRegions = &region,
+      .filter = VK_FILTER_NEAREST,
+   };
+   kk_CmdBlitImage2(kk_cmd_buffer_to_handle(cmd), &blit);
+   return unwarp;
+}
+
+bool
+kk_implicit_storage_enabled(void)
+{
+   /* KK_IMPLICIT_STORAGE=1: storage images can be foveated; their loads, stores and
+    * atomics are translated (kk_nir_lower_descriptors.c). */
+   static int storage = -1;
+   if (storage < 0)
+      storage = debug_get_bool_option("KK_IMPLICIT_STORAGE", false);
+   return storage;
+}
+
+static _Thread_local bool kk_implicit_raw;
+bool kk_implicit_raw_active(void) { return kk_implicit_raw; }
+void kk_implicit_set_raw(bool raw) { kk_implicit_raw = raw; }
+
+static const char *
+kk_implicit_why_not(const struct kk_image *image, const struct kk_image_view *view)
+{
+   if (image->implicit_poison)
+      return "shares a pass with an ordinary attachment";
+   if (!image->implicit_candidate)
+      return image->vk.array_layers != 1 ? "array" :
+             ((image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) && !kk_implicit_storage_enabled())
+                ? "storage usage" :
+             !(image->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ? "not sampled" :
+             "not a candidate";
+   if (!kk_implicit_eyes(image))
+      return "not eye sized";
+   if (view->vk.base_mip_level || view->vk.base_array_layer)
+      return "renders a mip level or layer";
+   return NULL;
+}
+
+void
+kk_implicit_match_pass(struct kk_cmd_buffer *cmd, struct kk_rendering_state *render)
+{
+   static int single = -1;
+   if (single < 0)
+      single = debug_get_bool_option("KK_IMPLICIT_SINGLE", false);
+   struct kk_image_view *views[KK_MAX_RTS + 2];
+   uint32_t n = 0;
+   for (uint32_t i = 0; i < render->color_att_count; i++)
+      if (render->color_att[i].iview)
+         views[n++] = render->color_att[i].iview;
+   if (render->depth_att.iview)
+      views[n++] = render->depth_att.iview;
+   if (render->stencil_att.iview && render->stencil_att.iview != render->depth_att.iview)
+      views[n++] = render->stencil_att.iview;
+   if (!single) {
+      /* The multisampled route: each attachment on its own (resolves are redirected). */
+      for (uint32_t i = 0; i < n; i++)
+         kk_implicit_fdm_match(container_of(views[i]->vk.image, struct kk_image, vk));
+      return;
+   }
+   if (kk_implicit_raw)
+      return;
+   /* All attachments together or none: an ordinary pass that writes or tests against a
+    * foveated image would leave it in two layouts. */
+   const char *why = NULL;
+   const struct kk_image *blocker = NULL;
+   bool any = false;
+   simple_mtx_lock(&kk_fdm_lock);
+   const bool have_profile = kk_implicit.pending.serial != 0;
+   simple_mtx_unlock(&kk_fdm_lock);
+   for (uint32_t i = 0; i < n; i++) {
+      const struct kk_image *image = container_of(views[i]->vk.image, struct kk_image, vk);
+      any |= image->implicit_candidate || image->implicit_fdm;
+      const char *w = kk_implicit_why_not(image, views[i]);
+      if (w && !why) {
+         why = w;
+         blocker = image;
+      }
+   }
+   if (!any && have_profile) {
+      /* Diagnostic: eye-sized attachments that were never candidates, once each. */
+      for (uint32_t i = 0; i < n; i++) {
+         struct kk_image *image = container_of(views[i]->vk.image, struct kk_image, vk);
+         if (!kk_implicit_eyes(image) || image->implicit_unwarp_logged)
+            continue;
+         image->implicit_unwarp_logged = true;
+         mesa_logi("kk-implicit: eye-sized image %p fmt %d is not a candidate: usage 0x%x flags 0x%x "
+                   "mips %u layers %u samples %u", (void *)image, image->vk.format,
+                   (unsigned)image->vk.usage, (unsigned)image->vk.create_flags,
+                   image->vk.mip_levels, image->vk.array_layers, (unsigned)image->vk.samples);
+      }
+   }
+   if (!any || !have_profile)
+      return;
+   if (!why) {
+      for (uint32_t i = 0; i < n; i++)
+         kk_implicit_fdm_match(container_of(views[i]->vk.image, struct kk_image, vk));
+      return;
+   }
+   for (uint32_t i = 0; i < n; i++) {
+      struct kk_image *image = container_of(views[i]->vk.image, struct kk_image, vk);
+      if (!image->implicit_candidate || image->implicit_poison)
+         continue;
+      image->implicit_poison = true;
+      mesa_logi("kk-implicit: not foveating %ux%u fmt %d image %p: pass with %ux%u fmt %d "
+                "image %p (%s)%s", image->vk.extent.width, image->vk.extent.height,
+                image->vk.format, (void *)image, blocker->vk.extent.width,
+                blocker->vk.extent.height, blocker->vk.format, (void *)blocker, why,
+                image->implicit_fdm ? "; was foveated, now ordinary" : "");
+      if (image->implicit_fdm) {
+         image->implicit_fdm = false;
+         kk_fdm_clear_image_mapping(cmd, image);
+      }
+   }
 }

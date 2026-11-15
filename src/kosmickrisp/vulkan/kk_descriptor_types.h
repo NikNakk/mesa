@@ -39,9 +39,15 @@ static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
 
 struct kk_storage_image_descriptor {
    uint64_t image_gpu_resource_id;
+   /* Implicit foveation (KK_IMPLICIT_STORAGE): the image's rate parameters, as for
+    * sampled images; 0 for ordinary images and texel buffers. */
+   uint64_t rate_params;
+   uint32_t rate_image_size[2];
+   uint32_t rate_base_layer;
+   uint32_t pad_to_power_2;
 };
 
-static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+static_assert(sizeof(struct kk_storage_image_descriptor) == 32,
               "kk_storage_image_descriptor has no holes");
 
 /* This has to match nir_address_format_64bit_bounded_global */

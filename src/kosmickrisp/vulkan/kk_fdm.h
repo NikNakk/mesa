@@ -42,6 +42,45 @@ void kk_fdm_latch_gaze(void);
 
 void kk_seq_log(struct kk_cmd_buffer *cmd, const char *fmt, ...);
 
+/* Implicit foveation (KK_IMPLICIT_FDM=WIDTHxHEIGHT[,OUTER[,CORE,EDGE]]): multisampled
+ * attachments of exactly that size are treated as subsampled images and their passes
+ * get a driver-built rate map, for applications that do not use fragment density
+ * maps. The target holds both eyes side by side. OUTER is the peripheral rate per
+ * axis (default 0.3); CORE and EDGE are the full-rate and outer radii as fractions
+ * of half an eye's width (defaults 0.35, 0.75). Needs MESA_KK_EXPERIMENTAL=fdm_rate. */
+bool kk_implicit_fdm_enabled(void);
+bool kk_implicit_fdm_image(const VkImageCreateInfo *info);
+struct kk_image;
+/* Whether a candidate is an eye target, once the view size is known. */
+bool kk_implicit_fdm_match(struct kk_image *image);
+struct kk_rendering_state;
+/* KK_IMPLICIT_SINGLE: foveate a pass's attachments together or not at all. */
+void kk_implicit_match_pass(struct kk_cmd_buffer *cmd, struct kk_rendering_state *render);
+/* Set while the driver blits a foveated image into itself (mip generation): the copy
+ * keeps the warped layout, so it is neither translated nor rate mapped. */
+bool kk_implicit_raw_active(void);
+bool kk_implicit_storage_enabled(void);
+void kk_implicit_set_raw(bool raw);
+/* KK_IMPLICIT_FDM=auto: the view size and profile come from the OpenXR layer. */
+PUBLIC void kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t count,
+                                        const float *horizontal0, const float *horizontal1,
+                                        const float *vertical);
+struct kk_image_view;
+/* The hidden resolve view for a foveated multisampled image (created on first use),
+ * or NULL when `dst` can take the resolve directly. */
+struct kk_image_view *kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
+                                               const struct kk_image_view *dst);
+void kk_implicit_image_finish(struct kk_device *dev, struct kk_image *image);
+struct kk_cmd_buffer;
+/* A raw copy (transfer, not a shader) is about to read `src`. If it is foveated, record
+ * a shader blit of it into an ordinary image of the same format and return that image
+ * for the copy to read instead; otherwise return VK_NULL_HANDLE. */
+VkImage kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
+                                    VkImageLayout src_layout, const struct kk_image *dst);
+
+struct vk_image;
+void kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_image *b);
+
 struct vk_image;
 void kk_fdm_note_use(const struct vk_image *image, const char *what);
 struct vk_image_view;
