@@ -183,6 +183,10 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
       .EXT_fragment_density_map = KK_EXPERIMENTAL(FDM),
+      /* KK_FAKE_VRS=1 (diagnostic): attachment shading rates are accepted and ignored
+       * (every fragment shaded), so an application shows which passes it would
+       * shade coarsely (kk_vrs_* in kk_fdm.c). */
+      .KHR_fragment_shading_rate = debug_get_bool_option("KK_FAKE_VRS", false),
       .EXT_fragment_density_map_offset = KK_EXPERIMENTAL(FDM_RATE) &&
          debug_get_bool_option("KK_FDM_OFFSET_PROBE", false),
 #ifdef VK_USE_PLATFORM_METAL_EXT
@@ -461,6 +465,11 @@ kk_get_device_features(
 
       /* VK_EXT_custom_resolve */
       .customResolve = true,
+
+      /* VK_KHR_fragment_shading_rate (KK_FAKE_VRS) */
+      .pipelineFragmentShadingRate = supported_extensions->KHR_fragment_shading_rate,
+      .primitiveFragmentShadingRate = false,
+      .attachmentFragmentShadingRate = supported_extensions->KHR_fragment_shading_rate,
 
       /* VK_EXT_fragment_density_map */
       .fragmentDensityMap = supported_extensions->EXT_fragment_density_map,
@@ -859,6 +868,25 @@ kk_get_device_properties(
 
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT32_MAX,
+
+      /* VK_KHR_fragment_shading_rate (KK_FAKE_VRS) */
+      .minFragmentShadingRateAttachmentTexelSize = {8, 8},
+      .maxFragmentShadingRateAttachmentTexelSize = {32, 32},
+      .maxFragmentShadingRateAttachmentTexelSizeAspectRatio = 4,
+      .primitiveFragmentShadingRateWithMultipleViewports = false,
+      .layeredShadingRateAttachments = true,
+      .fragmentShadingRateNonTrivialCombinerOps = true,
+      .maxFragmentSize = {4, 4},
+      .maxFragmentSizeAspectRatio = 4,
+      .maxFragmentShadingRateCoverageSamples = 16,
+      .maxFragmentShadingRateRasterizationSamples = VK_SAMPLE_COUNT_4_BIT,
+      .fragmentShadingRateWithShaderDepthStencilWrites = true,
+      .fragmentShadingRateWithSampleMask = true,
+      .fragmentShadingRateWithShaderSampleMask = false,
+      .fragmentShadingRateWithConservativeRasterization = false,
+      .fragmentShadingRateWithFragmentShaderInterlock = false,
+      .fragmentShadingRateWithCustomSampleLocations = false,
+      .fragmentShadingRateStrictMultiplyCombiner = false,
 
       /* VK_EXT_fragment_density_map */
       .minFragmentDensityTexelSize = {32, 32},
@@ -1425,4 +1453,24 @@ kk_GetPhysicalDeviceMultisamplePropertiesEXT(
    } else {
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){0, 0};
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetPhysicalDeviceFragmentShadingRatesKHR(
+   VkPhysicalDevice physicalDevice, uint32_t *pFragmentShadingRateCount,
+   VkPhysicalDeviceFragmentShadingRateKHR *pFragmentShadingRates)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceFragmentShadingRateKHR, out,
+                          pFragmentShadingRates, pFragmentShadingRateCount);
+   static const VkExtent2D sizes[] = {
+      {4, 4}, {4, 2}, {2, 4}, {2, 2}, {2, 1}, {1, 2}, {1, 1},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(sizes); i++) {
+      vk_outarray_append_typed(VkPhysicalDeviceFragmentShadingRateKHR, &out, rate) {
+         rate->fragmentSize = sizes[i];
+         rate->sampleCounts =
+            VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+      }
+   }
+   return vk_outarray_status(&out);
 }

@@ -124,6 +124,12 @@ struct kk_attachment {
 struct kk_rendering_state {
    VkRenderingFlagBits flags;
 
+   /* KK_FAKE_VRS: what the pass asked for (kk_vrs_* in kk_fdm.c). */
+   struct {
+      VkExtent2D texel;
+      bool pipeline_rate;
+   } vrs_note;
+
    VkRect2D area;
    uint32_t layer_count;
    uint32_t view_mask;

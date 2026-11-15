@@ -91,6 +91,10 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
        pdev->vk.supported_extensions.EXT_fragment_density_map)
       features |= VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT;
 
+   if (vk_format == VK_FORMAT_R8_UINT && tiling == VK_IMAGE_TILING_OPTIMAL &&
+       pdev->vk.supported_extensions.KHR_fragment_shading_rate)
+      features |= VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
    if (features != 0) {
       features |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT;
       features |= VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;

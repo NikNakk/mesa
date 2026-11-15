@@ -383,6 +383,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                            RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);
    if (fsr_att_info != NULL && fsr_att_info->imageView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(kk_image_view, iview, fsr_att_info->imageView);
+      render->vrs_note.texel = fsr_att_info->shadingRateAttachmentTexelSize;
       render->fsr_att = (struct kk_attachment){
          .vk_format = iview->vk.format,
          .iview = iview,
@@ -876,6 +877,7 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    struct kk_rendering_state *render = &cmd->state.gfx.render;
    bool need_meta_resolve = false;
    kk_seq_log(cmd, "end rendering");
+   kk_vrs_end(cmd);
    cmd->state.gfx.in_custom_resolve = false;
    cmd->state.gfx.tile_resolve.possible = false;
    cmd->state.gfx.tile_resolve.active = false;
@@ -1410,6 +1412,8 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
+
+   kk_vrs_note_draw(cmd);
 
    /* We always need at least 1 viewport for the hardware. With rasterizer
     * discard the app may not supply any, but we can just program garbage.

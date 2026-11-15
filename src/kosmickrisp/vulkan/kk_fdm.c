@@ -1759,3 +1759,181 @@ kk_implicit_compact_dispatch(struct kk_cmd_buffer *cmd, const struct kk_shader *
    *group_y = DIV_ROUND_UP(physical[1], ly);
    return params[0];
 }
+
+/* KK_FAKE_VRS logging. */
+#define KK_VRS_KEYS 256
+static struct {
+   simple_mtx_t lock;
+   struct { char key[160]; uint64_t count; uint32_t w, h; } e[KK_VRS_KEYS];
+   uint32_t n;
+   uint64_t frames, last_ns;
+   struct kk_vrs_capture { struct kk_bo *bo; struct kk_device *dev; uint32_t w, h;
+                           uint64_t at_ns; char name[64]; } cap[16];
+   uint32_t cap_n, cap_done;
+   struct { uint32_t w, h, seen, taken; } cap_sizes[8];
+   uint32_t cap_size_n;
+} kk_vrs = {.lock = SIMPLE_MTX_INITIALIZER};
+
+static bool
+kk_vrs_enabled(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = debug_get_bool_option("KK_FAKE_VRS", false);
+   return on;
+}
+
+void
+kk_vrs_note_draw(struct kk_cmd_buffer *cmd)
+{
+   if (!kk_vrs_enabled())
+      return;
+   const struct vk_fragment_shading_rate_state *fsr = &cmd->vk.dynamic_graphics_state.fsr;
+   if (!vk_fragment_shading_rate_is_disabled(fsr))
+      cmd->state.gfx.render.vrs_note.pipeline_rate = true;
+}
+
+static void
+kk_vrs_capture(struct kk_cmd_buffer *cmd, struct kk_image_view *iview)
+{
+   const char *dir = getenv("KK_VRS_CAPTURE_DIR");
+   if (!dir || kk_vrs.cap_n >= ARRAY_SIZE(kk_vrs.cap))
+      return;
+   struct kk_image *image = container_of(iview->vk.image, struct kk_image, vk);
+   const uint32_t w = image->vk.extent.width, h = image->vk.extent.height;
+   uint32_t i;
+   for (i = 0; i < kk_vrs.cap_size_n; i++)
+      if (kk_vrs.cap_sizes[i].w == w && kk_vrs.cap_sizes[i].h == h)
+         break;
+   if (i == kk_vrs.cap_size_n) {
+      if (i == ARRAY_SIZE(kk_vrs.cap_sizes))
+         return;
+      kk_vrs.cap_sizes[kk_vrs.cap_size_n++] = (__typeof__(kk_vrs.cap_sizes[0])){w, h, 0, 0};
+   }
+   /* Two per size: early in play and later. */
+   const uint32_t seen = ++kk_vrs.cap_sizes[i].seen;
+   if (seen != 2000 && seen != 20000)
+      return;
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   struct kk_bo *bo = NULL;
+   if (kk_alloc_bo(dev, &dev->vk.base, (uint64_t)w * h * image->vk.array_layers, 0, &bo) !=
+       VK_SUCCESS)
+      return;
+   for (uint32_t l = 0; l < image->vk.array_layers; l++) {
+      struct mtl_buffer_image_copy copy = {
+         .image_size = {w, h, 1},
+         .buffer = bo->map,
+         .image = image->planes[0].mtl_handle,
+         .buffer_offset_B = (size_t)l * w * h,
+         .buffer_stride_B = w,
+         .buffer_2d_image_size_B = (size_t)w * h,
+         .image_slice = l,
+      };
+      mtl_copy_from_texture_to_buffer(cs_get_compute(cmd), &copy);
+   }
+   struct kk_vrs_capture *c = &kk_vrs.cap[kk_vrs.cap_n++];
+   *c = (struct kk_vrs_capture){bo, dev, w, h * image->vk.array_layers,
+                                os_time_get_nano(), ""};
+   snprintf(c->name, sizeof(c->name), "vrs-%ux%u-%u.pgm", w, h, ++kk_vrs.cap_sizes[i].taken);
+}
+
+void
+kk_vrs_end(struct kk_cmd_buffer *cmd)
+{
+   if (!kk_vrs_enabled())
+      return;
+   struct kk_rendering_state *r = &cmd->state.gfx.render;
+   kk_vrs_note_draw(cmd);
+   const struct kk_image_view *c = r->color_att_count ? r->color_att[0].iview : NULL;
+   const struct kk_image_view *d = r->depth_att.iview;
+   const struct kk_image_view *v = c ? c : d;
+   const struct kk_image_view *rate = r->fsr_att.iview;
+   char key[160];
+   snprintf(key, sizeof(key), "%-13s %5ux%-5u c%d d%d s%u x%u%s | rate %ux%u texel %ux%u",
+            rate && r->vrs_note.pipeline_rate ? "VRS+pipeline"
+            : rate                            ? "VRS attachment"
+            : r->vrs_note.pipeline_rate       ? "pipeline rate"
+                                              : "-",
+            v ? v->vk.image->extent.width : 0, v ? v->vk.image->extent.height : 0,
+            c ? (int)c->vk.view_format : 0, d ? (int)d->vk.view_format : 0,
+            v ? (unsigned)v->vk.image->samples : 0, r->color_att_count,
+            v && v->vk.image->array_layers > 1 ? " layered" : "",
+            rate ? rate->vk.image->extent.width : 0, rate ? rate->vk.image->extent.height : 0,
+            r->vrs_note.texel.width, r->vrs_note.texel.height);
+   simple_mtx_lock(&kk_vrs.lock);
+   uint32_t i;
+   for (i = 0; i < kk_vrs.n && strcmp(kk_vrs.e[i].key, key); i++)
+      ;
+   if (i == kk_vrs.n && i < KK_VRS_KEYS) {
+      snprintf(kk_vrs.e[i].key, sizeof(kk_vrs.e[i].key), "%s", key);
+      kk_vrs.e[i].w = v ? v->vk.image->extent.width : 0;
+      kk_vrs.e[i].h = v ? v->vk.image->extent.height : 0;
+      kk_vrs.n++;
+   }
+   if (i < kk_vrs.n)
+      kk_vrs.e[i].count++;
+   if (rate)
+      kk_vrs_capture(cmd, (struct kk_image_view *)rate);
+   simple_mtx_unlock(&kk_vrs.lock);
+   r->vrs_note.pipeline_rate = false;
+   r->vrs_note.texel = (VkExtent2D){0, 0};
+}
+
+void
+kk_vrs_frame(void)
+{
+   if (!kk_vrs_enabled())
+      return;
+   simple_mtx_lock(&kk_vrs.lock);
+   kk_vrs.frames++;
+   const uint64_t now = os_time_get_nano();
+   /* Captured rate images, two seconds after recording (their command buffers have
+    * completed by then), as PGM with the rate code scaled for viewing (and .bin raw). */
+   const char *dir = getenv("KK_VRS_CAPTURE_DIR");
+   while (dir && kk_vrs.cap_done < kk_vrs.cap_n &&
+          now - kk_vrs.cap[kk_vrs.cap_done].at_ns > 2000000000ull) {
+      struct kk_vrs_capture *c = &kk_vrs.cap[kk_vrs.cap_done++];
+      char path[512];
+      snprintf(path, sizeof(path), "%s/%s", dir, c->name);
+      FILE *f = fopen(path, "wb");
+      if (f) {
+         fprintf(f, "P5\n%u %u\n255\n", c->w, c->h);
+         const uint8_t *src = c->bo->cpu;
+         for (uint64_t p = 0; p < (uint64_t)c->w * c->h; p++)
+            fputc(MIN2(src[p] * 25, 255), f);
+         fclose(f);
+      }
+      snprintf(path, sizeof(path), "%s/%s.bin", dir, c->name);
+      f = fopen(path, "wb");
+      if (f) {
+         fwrite(c->bo->cpu, 1, (size_t)c->w * c->h, f);
+         fclose(f);
+      }
+      mesa_logi("kk-vrs: saved %s", c->name);
+      kk_destroy_bo(c->dev, c->bo);
+   }
+   if (!kk_vrs.last_ns)
+      kk_vrs.last_ns = now;
+   if (now - kk_vrs.last_ns > 10000000000ull && kk_vrs.frames) {
+      mesa_logi("kk-vrs: passes per frame over %llu frames (largest first):",
+                (unsigned long long)kk_vrs.frames);
+      uint32_t order[KK_VRS_KEYS];
+      for (uint32_t i = 0; i < kk_vrs.n; i++)
+         order[i] = i;
+      for (uint32_t i = 0; i < kk_vrs.n; i++)
+         for (uint32_t j = i + 1; j < kk_vrs.n; j++)
+            if ((uint64_t)kk_vrs.e[order[j]].w * kk_vrs.e[order[j]].h >
+                (uint64_t)kk_vrs.e[order[i]].w * kk_vrs.e[order[i]].h) {
+               uint32_t x = order[i]; order[i] = order[j]; order[j] = x;
+            }
+      for (uint32_t i = 0; i < kk_vrs.n; i++)
+         if (kk_vrs.e[order[i]].count)
+            mesa_logi("kk-vrs: %6.1f  %s", (double)kk_vrs.e[order[i]].count / kk_vrs.frames,
+                      kk_vrs.e[order[i]].key);
+      for (uint32_t i = 0; i < kk_vrs.n; i++)
+         kk_vrs.e[i].count = 0;
+      kk_vrs.frames = 0;
+      kk_vrs.last_ns = now;
+   }
+   simple_mtx_unlock(&kk_vrs.lock);
+}

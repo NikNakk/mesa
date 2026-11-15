@@ -97,4 +97,12 @@ void kk_fdm_note_use(const struct vk_image *image, const char *what);
 struct vk_image_view;
 void kk_fdm_note_view(const struct vk_image_view *view, const char *what);
 
+struct kk_rendering_state;
+/* KK_FAKE_VRS: note a pass's shading-rate requests (attachment at begin, pipeline or
+ * dynamic rates at draws) and log every pass shape with them; KK_VRS_CAPTURE_DIR saves
+ * the rate images. */
+void kk_vrs_note_draw(struct kk_cmd_buffer *cmd);
+void kk_vrs_end(struct kk_cmd_buffer *cmd);
+void kk_vrs_frame(void);
+
 #endif
