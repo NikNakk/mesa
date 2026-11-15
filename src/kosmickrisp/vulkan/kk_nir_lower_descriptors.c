@@ -651,10 +651,14 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    const uint64_t plane_offset_B =
       plane * sizeof(struct kk_sampled_image_descriptor);
 
+   /* Gathers (tg4) take normalised coordinates like sampling: untranslated, NMS's
+    * half-resolution shadow mask (gathered by its full-resolution lighting) was read in
+    * its physical layout, sunlit only inside a rectangle of the physical size. */
    if (KK_EXPERIMENTAL(FDM_RATE) && sampler != NULL &&
        !tex->is_shadow &&
        (tex->op == nir_texop_tex || tex->op == nir_texop_txb ||
-        tex->op == nir_texop_txl || tex->op == nir_texop_txd) &&
+        tex->op == nir_texop_txl || tex->op == nir_texop_txd ||
+        tex->op == nir_texop_tg4) &&
        kk_sampler_deref_is_subsampled(
           b, nir_src_as_deref(nir_src_for_ssa(sampler)), ctx))
       kk_lower_subsampled_coord(b, tex,

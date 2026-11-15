@@ -88,6 +88,8 @@ struct kk_image {
    bool implicit_unwarp_logged;
    bool implicit_poison; /* shares a pass with an image that cannot be foveated */
    struct kk_bo *rate_params;
+   /* The parameters (and map) the image's contents are laid out in, referenced. */
+   struct kk_fdm_params *rate_ref;
    const void *rate_params_owner;
    uint64_t rate_params_serial;
    uint32_t rate_params_version;

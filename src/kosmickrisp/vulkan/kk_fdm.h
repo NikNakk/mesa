@@ -25,6 +25,10 @@ struct kk_fdm_params {
    struct kk_device *dev;
    struct kk_bo *bo;
    uint32_t refs;
+   /* The rate map these parameters describe (retained), so a pass can still render an
+    * image in the layout it was drawn in after the density map has moved on. */
+   void *map;
+   uint64_t serial;
 };
 
 void kk_fdm_cmd_release(struct kk_cmd_buffer *cmd);
