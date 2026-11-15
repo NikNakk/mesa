@@ -300,6 +300,8 @@ struct kk_cmd_buffer {
    void *drawable;
    bool wsi_signal_only;
    struct util_dynarray wsi_direct_images;
+   /* KK_PASS_TIMING=1: GPU timestamps at encoder boundaries (struct kk_pass_timing). */
+   void *pass_timing;
    mtl_argument_table *argument_table;
    bool no_stitch;
 
@@ -481,5 +483,11 @@ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 void kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write);
 
 void kk_cmd_buffer_set_label(struct kk_cmd_buffer *cb, const char *label);
+
+/* KK_PASS_TIMING=1 (diagnostic): per-encoder GPU time, summed by pass shape and
+ * logged every five seconds per presented frame. */
+void kk_pass_timing_end_cmdbuf(struct kk_cmd_buffer *cmd);
+void kk_pass_timing_frame(void);
+void kk_pass_timing_free(struct kk_cmd_buffer *cmd);
 
 #endif
