@@ -9,7 +9,11 @@
 #include "vk_format.h"
 
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CABase.h>
 #import <Metal/Metal.h>
+
+#include "util/log.h"
+#include "util/u_debug.h"
 
 void
 wsi_metal_layer_size(const CAMetalLayer *metal_layer,
@@ -358,11 +362,21 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
    }
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(wsi_metal_present_trace, "MESA_VK_WSI_METAL_PRESENT_TRACE", false)
+
 void
 wsi_metal_layer_present(CAMetalDrawable **drawable_ptr)
 {
    @autoreleasepool {
       id<CAMetalDrawable> drawable = [(id<CAMetalDrawable>)*drawable_ptr autorelease];
+      if (debug_get_option_wsi_metal_present_trace()) {
+         CFTimeInterval requested = CACurrentMediaTime();
+         [drawable addPresentedHandler: ^(id<MTLDrawable> presented) {
+            mesa_logi("wsi-metal-present: drawable=%lu requested_s=%.9f presented_s=%.9f",
+                      (unsigned long)presented.drawableID, requested,
+                      presented.presentedTime);
+         }];
+      }
       [drawable present];
 
       *drawable_ptr = nil;
