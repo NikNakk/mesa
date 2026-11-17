@@ -107,6 +107,7 @@ wine)
   test -x "$PREFIX/bin/wine"
   ;;
 dxmt)
+  work=$(mktemp -d "${RUNNER_TEMP:-/tmp}/threshold-dxmt.XXXXXX")
   brew install meson mingw-w64
   mkdir -p "$work/wine"
   curl --fail --location --retry 3 https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz -o "$work/wine.tar.gz"
