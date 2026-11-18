@@ -2628,6 +2628,88 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
 
 #endif
 
+#ifdef __APPLE__
+#include <objc/message.h>
+#include <objc/runtime.h>
+
+/* EGL_ANGLE_metal_texture_client_buffer, for Zink over a Metal Vulkan driver:
+ * the same target and slice attribute ANGLE uses, so an application written for
+ * ANGLE's Metal backend imports its textures unchanged. The buffer is an
+ * id<MTLTexture>; for a 2D array, EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE picks the
+ * slice. The texture needs MTLTextureUsagePixelFormatView. */
+#define EGL_METAL_TEXTURE_ANGLE_MESA             0x34A7
+#define EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE_MESA 0x34DD
+
+typedef struct { unsigned long location, length; } mesa_ns_range;
+
+static enum pipe_format
+mtl_pixel_format_to_pipe(unsigned long mtl)
+{
+   switch (mtl) {
+   case 70:  return PIPE_FORMAT_R8G8B8A8_UNORM;     /* MTLPixelFormatRGBA8Unorm */
+   case 71:  return PIPE_FORMAT_R8G8B8A8_SRGB;      /* MTLPixelFormatRGBA8Unorm_sRGB */
+   case 80:  return PIPE_FORMAT_B8G8R8A8_UNORM;     /* MTLPixelFormatBGRA8Unorm */
+   case 81:  return PIPE_FORMAT_B8G8R8A8_SRGB;      /* MTLPixelFormatBGRA8Unorm_sRGB */
+   case 90:  return PIPE_FORMAT_R10G10B10A2_UNORM;  /* MTLPixelFormatRGB10A2Unorm */
+   case 115: return PIPE_FORMAT_R16G16B16A16_FLOAT; /* MTLPixelFormatRGBA16Float */
+   default:  return PIPE_FORMAT_NONE;
+   }
+}
+
+static _EGLImage *
+dri2_create_image_metal_texture(_EGLDisplay *disp, _EGLContext *ctx,
+                                EGLClientBuffer buffer, const EGLint *attr_list)
+{
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   id tex = (id)buffer;
+   unsigned long slice = 0;
+   for (const EGLint *a = attr_list; a && a[0] != EGL_NONE; a += 2) {
+      if (a[0] == EGL_METAL_TEXTURE_ARRAY_SLICE_ANGLE_MESA)
+         slice = (unsigned long)a[1];
+      else {
+         _eglError(EGL_BAD_PARAMETER, "eglCreateImage(EGL_METAL_TEXTURE_ANGLE)");
+         return EGL_NO_IMAGE_KHR;
+      }
+   }
+   if (!tex) {
+      _eglError(EGL_BAD_PARAMETER, "eglCreateImage(EGL_METAL_TEXTURE_ANGLE)");
+      return EGL_NO_IMAGE_KHR;
+   }
+#define MSG(ret, obj, sel) ((ret (*)(id, SEL))objc_msgSend)((id)(obj), sel_registerName(sel))
+   unsigned long type = MSG(unsigned long, tex, "textureType");
+   unsigned long fmt = MSG(unsigned long, tex, "pixelFormat");
+   unsigned long width = MSG(unsigned long, tex, "width");
+   unsigned long height = MSG(unsigned long, tex, "height");
+   unsigned long layers = MSG(unsigned long, tex, "arrayLength");
+   enum pipe_format format = mtl_pixel_format_to_pipe(fmt);
+   /* MTLTextureType2D = 2, MTLTextureType2DArray = 3 */
+   if (format == PIPE_FORMAT_NONE || (type != 2 && type != 3) || slice >= layers ||
+       (type == 2 && slice)) {
+      _eglError(EGL_BAD_PARAMETER, "eglCreateImage(EGL_METAL_TEXTURE_ANGLE): unsupported texture");
+      return EGL_NO_IMAGE_KHR;
+   }
+   /* Always a one-slice 2D-array view: KosmicKrisp stores Zink's colour images
+    * as 2D arrays (they carry input-attachment usage) and adopts a texture only
+    * of that type, and a view also selects the slice of an array. */
+   id view = ((id (*)(id, SEL, unsigned long, unsigned long, mesa_ns_range, mesa_ns_range))objc_msgSend)(
+      tex, sel_registerName("newTextureViewWithPixelFormat:textureType:levels:slices:"), fmt, 3,
+      (mesa_ns_range){0, 1}, (mesa_ns_range){slice, 1});
+   if (!view) {
+      _eglError(EGL_BAD_ALLOC, "eglCreateImage(EGL_METAL_TEXTURE_ANGLE): no slice view");
+      return EGL_NO_IMAGE_KHR;
+   }
+   struct dri_image *dri_image = dri_create_image_from_metal_texture(
+      dri2_dpy->dri_screen_render_gpu, (void *)view, (int)width, (int)height, format, NULL);
+   MSG(void, view, "release");   /* the imported image keeps its own reference */
+#undef MSG
+   if (!dri_image) {
+      _eglError(EGL_BAD_ALLOC, "eglCreateImage(EGL_METAL_TEXTURE_ANGLE)");
+      return EGL_NO_IMAGE_KHR;
+   }
+   return dri2_create_image_from_dri(disp, dri_image);
+}
+#endif
+
 _EGLImage *
 dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
                       EGLClientBuffer buffer, const EGLint *attr_list)
@@ -2645,6 +2727,10 @@ dri2_create_image_khr(_EGLDisplay *disp, _EGLContext *ctx, EGLenum target,
                                            attr_list);
    case EGL_GL_RENDERBUFFER_KHR:
       return dri2_create_image_khr_renderbuffer(disp, ctx, buffer, attr_list);
+#ifdef __APPLE__
+   case EGL_METAL_TEXTURE_ANGLE_MESA:
+      return dri2_create_image_metal_texture(disp, ctx, buffer, attr_list);
+#endif
 #ifdef HAVE_LIBDRM
    case EGL_LINUX_DMA_BUF_EXT:
       return dri2_create_image_dma_buf(disp, ctx, buffer, attr_list);
@@ -3120,6 +3206,23 @@ dri2_interop_query_device_info(_EGLDisplay *disp, _EGLContext *ctx,
 }
 
 static int
+dri2_export_metal_texture(_EGLDisplay *disp, _EGLContext *ctx, unsigned texture,
+                          struct mesa_metal_texture *out)
+{
+   struct dri2_egl_context *dri2_ctx = dri2_egl_context(ctx);
+
+   return dri_export_metal_texture(dri2_ctx->dri_context, texture, out);
+}
+
+static int
+dri2_signal_metal_shared_event(_EGLDisplay *disp, _EGLContext *ctx, void *event, uint64_t value)
+{
+   struct dri2_egl_context *dri2_ctx = dri2_egl_context(ctx);
+
+   return dri_signal_metal_shared_event(dri2_ctx->dri_context, event, value);
+}
+
+static int
 dri2_interop_export_object(_EGLDisplay *disp, _EGLContext *ctx,
                            struct mesa_glinterop_export_in *in,
                            struct mesa_glinterop_export_out *out)
@@ -3213,6 +3316,8 @@ const _EGLDriver _eglDriver = {
    .DestroySyncKHR = dri2_destroy_sync,
    .GLInteropQueryDeviceInfo = dri2_interop_query_device_info,
    .GLInteropExportObject = dri2_interop_export_object,
+   .ExportMetalTexture = dri2_export_metal_texture,
+   .SignalMetalSharedEvent = dri2_signal_metal_shared_event,
    .GLInteropFlushObjects = dri2_interop_flush_objects,
    .DupNativeFenceFDANDROID = dri2_dup_native_fence_fd,
    .SetBlobCacheFuncsANDROID = dri2_set_blob_cache_funcs,

@@ -372,6 +372,33 @@ MesaGLInteropEGLExportObject(EGLDisplay dpy, EGLContext context,
                              struct mesa_glinterop_export_in *in,
                              struct mesa_glinterop_export_out *out);
 
+/* In-process only: the MTLTexture behind a 2D texture of an EGL context, when the
+ * driver renders with Metal (Zink over a Metal Vulkan driver such as KosmicKrisp).
+ * The texture object is borrowed and stays valid while the GL texture keeps its
+ * storage; its pixel format is the MTLTexture's own. The caller orders access
+ * (for example with glFinish). The EGL counterpart of wglExportMetalTextureMWXR,
+ * reached through eglGetProcAddress("eglExportMetalTextureMESA"). Returns a
+ * MESA_GLINTEROP_* code. */
+struct mesa_metal_texture {
+   void *mtl_texture;
+   uint32_t width;
+   uint32_t height;
+   uint32_t levels;
+   uint32_t samples;
+};
+
+int
+eglExportMetalTextureMESA(EGLDisplay dpy, EGLContext context, unsigned texture,
+                          struct mesa_metal_texture *out);
+
+/* In-process only: flush the context and have the GPU set the id<MTLSharedEvent>
+ * to value once the work issued so far has run, so a Metal queue can wait on it
+ * (encodeWaitForEvent:value:) instead of the CPU calling glFinish. The context
+ * must be current. Reached through eglGetProcAddress. Returns MESA_GLINTEROP_*. */
+int
+eglSignalMetalSharedEventMESA(EGLDisplay dpy, EGLContext context, void *event,
+                              uint64_t value);
+
 
 /**
 * Same as MesaGLInteropGLXExportObject except that it accepts

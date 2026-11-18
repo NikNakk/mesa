@@ -179,6 +179,11 @@ if with_ld_version_script
   endif
 endif
 
+# EGL_ANGLE_metal_texture_client_buffer on macOS asks the MTLTexture for its shape.
+if host_machine.system() == 'darwin'
+  link_args_for_egl += ['-lobjc']
+endif
+
 egl_def = custom_target(
   'egl.def',
   input: 'main/egl.def.in',

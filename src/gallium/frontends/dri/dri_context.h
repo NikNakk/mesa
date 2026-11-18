@@ -72,6 +72,10 @@ struct dri_context
    /* gallium */
    struct st_context *st;
    struct hud_context *hud;
+
+   /* dri_signal_metal_shared_event: the last event and the fence over it */
+   void *metal_event;
+   struct pipe_fence_handle *metal_fence;
 };
 
 /***********************************************************************
