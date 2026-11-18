@@ -239,6 +239,10 @@ EGL_FUNCTIONS = (
     _eglFunc("eglGLInteropExportObjectMESA",         "display"),
     _eglFunc("eglGLInteropFlushObjectsMESA",         "display"),
 
+    # Metal texture export (Zink over a Metal Vulkan driver)
+    _eglFunc("eglExportMetalTextureMESA",            "display"),
+    _eglFunc("eglSignalMetalSharedEventMESA",        "display"),
+
     # EGL_EXT_surface_compression
     _eglFunc("eglQuerySupportedCompressionRatesEXT", "display"),
 

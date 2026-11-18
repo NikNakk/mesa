@@ -171,6 +171,18 @@ PUBLIC int
 dri_interop_export_object(struct dri_context *ctx,
                           struct mesa_glinterop_export_in *in,
                           struct mesa_glinterop_export_out *out);
+struct mesa_metal_texture;
+/* Set an in-process id<MTLSharedEvent> to value once the context's work so far has run. */
+PUBLIC int
+dri_signal_metal_shared_event(struct dri_context *ctx, void *event, uint64_t value);
+/* An EGLImage over an in-process MTLTexture (Zink over a Metal Vulkan driver). */
+PUBLIC struct dri_image *
+dri_create_image_from_metal_texture(struct dri_screen *screen, void *mtl_texture,
+                                    int width, int height, enum pipe_format format,
+                                    void *loader_private);
+PUBLIC int
+dri_export_metal_texture(struct dri_context *ctx, unsigned texture,
+                         struct mesa_metal_texture *out);
 PUBLIC int
 dri_interop_flush_objects(struct dri_context *_ctx,
                            unsigned count, struct mesa_glinterop_export_in *objects,

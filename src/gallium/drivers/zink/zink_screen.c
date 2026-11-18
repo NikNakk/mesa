@@ -3890,6 +3890,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (screen->info.have_KHR_external_memory_win32)
       screen->base.create_fence_win32 = zink_create_fence_win32;
 #endif
+   if (screen->info.have_EXT_metal_objects)
+      screen->base.create_fence_metal_shared_event = zink_create_fence_metal_shared_event;
    screen->base.context_create = zink_context_create;
    screen->base.flush_frontbuffer = zink_flush_frontbuffer;
    screen->base.destroy = zink_destroy_screen;

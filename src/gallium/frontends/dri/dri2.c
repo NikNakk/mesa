@@ -1563,6 +1563,85 @@ dri_interop_export_object(struct dri_context *ctx,
    return st_interop_export_object(ctx->st, in, out);
 }
 
+struct dri_image *
+dri_create_image_from_metal_texture(struct dri_screen *screen, void *mtl_texture,
+                                    int width, int height, enum pipe_format format,
+                                    void *loader_private)
+{
+   struct pipe_screen *pscreen = screen->base.screen;
+   if (!pscreen->resource_from_handle || format == PIPE_FORMAT_NONE)
+      return NULL;
+   struct pipe_resource templ = {
+      .target = PIPE_TEXTURE_2D,
+      .format = format,
+      .width0 = width,
+      .height0 = height,
+      .depth0 = 1,
+      .array_size = 1,
+      .last_level = 0,
+      .bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW,
+   };
+   struct winsys_handle whandle = {
+      .type = WINSYS_HANDLE_TYPE_METAL_TEXTURE,
+      .com_obj = mtl_texture,
+      .format = format,
+      .modifier = DRM_FORMAT_MOD_INVALID,
+   };
+   struct pipe_resource *tex =
+      pscreen->resource_from_handle(pscreen, &templ, &whandle, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   if (!tex)
+      return NULL;
+   struct dri_image *img = CALLOC_STRUCT(dri_image);
+   if (!img) {
+      pipe_resource_reference(&tex, NULL);
+      return NULL;
+   }
+   img->texture = tex;
+   img->dri_format = format;
+   img->in_fence_fd = -1;
+   img->loader_private = loader_private;
+   img->screen = screen;
+   return img;
+}
+
+int
+dri_signal_metal_shared_event(struct dri_context *ctx, void *event, uint64_t value)
+{
+   struct pipe_screen *pscreen = ctx->screen->base.screen;
+   struct pipe_context *pipe = ctx->st->pipe;
+   if (!pscreen->create_fence_metal_shared_event || !pipe->fence_server_signal || !event)
+      return MESA_GLINTEROP_UNSUPPORTED;
+   if (ctx->metal_event != event) {
+      if (ctx->metal_fence)
+         pscreen->fence_reference(pscreen, &ctx->metal_fence, NULL);
+      pscreen->create_fence_metal_shared_event(pscreen, &ctx->metal_fence, event);
+      ctx->metal_event = ctx->metal_fence ? event : NULL;
+      if (!ctx->metal_fence)
+         return MESA_GLINTEROP_OUT_OF_RESOURCES;
+   }
+   /* Everything the application issued so far, then the signal behind it. */
+   _mesa_glthread_finish(ctx->st->ctx);
+   st_context_flush(ctx->st, 0, NULL, NULL, NULL);
+   pipe->fence_server_signal(pipe, ctx->metal_fence, value);
+   return MESA_GLINTEROP_SUCCESS;
+}
+
+int
+dri_export_metal_texture(struct dri_context *ctx, unsigned texture,
+                         struct mesa_metal_texture *out)
+{
+   struct st_interop_metal_texture metal;
+   int ret = st_interop_export_metal_texture(ctx->st, texture, &metal);
+   if (ret != MESA_GLINTEROP_SUCCESS)
+      return ret;
+   out->mtl_texture = (void *)(uintptr_t)metal.mtl_texture;
+   out->width = metal.width;
+   out->height = metal.height;
+   out->levels = metal.levels;
+   out->samples = metal.samples;
+   return MESA_GLINTEROP_SUCCESS;
+}
+
 int
 dri_interop_flush_objects(struct dri_context *ctx,
                            unsigned count, struct mesa_glinterop_export_in *objects,

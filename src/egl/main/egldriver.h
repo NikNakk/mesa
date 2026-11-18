@@ -74,6 +74,7 @@ struct mesa_glinterop_device_info;
 struct mesa_glinterop_export_in;
 struct mesa_glinterop_export_out;
 struct mesa_glinterop_flush_out;
+struct mesa_metal_texture;
 typedef struct __GLsync *GLsync;
 
 #define EGL_UUID_SIZE 16
@@ -214,6 +215,11 @@ struct _egl_driver {
    int (*GLInteropExportObject)(_EGLDisplay *disp, _EGLContext *ctx,
                                 struct mesa_glinterop_export_in *in,
                                 struct mesa_glinterop_export_out *out);
+   /* for eglExportMetalTextureMESA; see include/GL/mesa_glinterop.h */
+   int (*ExportMetalTexture)(_EGLDisplay *disp, _EGLContext *ctx, unsigned texture,
+                             struct mesa_metal_texture *out);
+   int (*SignalMetalSharedEvent)(_EGLDisplay *disp, _EGLContext *ctx, void *event,
+                                 uint64_t value);
    int (*GLInteropFlushObjects)(_EGLDisplay *disp, _EGLContext *ctx,
                                 unsigned count,
                                 struct mesa_glinterop_export_in *in,
