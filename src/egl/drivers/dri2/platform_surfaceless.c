@@ -389,7 +389,11 @@ dri2_initialize_surfaceless(_EGLDisplay *disp)
     */
    driver_loaded = surfaceless_probe_device(disp, disp->Options.ForceSoftware,
                                             disp->Options.Zink);
-   if (!driver_loaded && disp->Options.ForceSoftware) {
+   /* With no DRM render node (macOS), Zink over a hardware Vulkan driver can
+    * still come up on the device-less path; don't require LIBGL_ALWAYS_SOFTWARE
+    * for it, since Zink reads that as "pick a CPU Vulkan device".
+    */
+   if (!driver_loaded && (disp->Options.ForceSoftware || disp->Options.Zink)) {
       _eglLog(_EGL_DEBUG, "Falling back to surfaceless swrast without DRM.");
       driver_loaded = surfaceless_probe_device_sw(disp);
    }
