@@ -329,6 +329,39 @@ zink_semaphore_fence_create(struct pipe_screen *pscreen, VkSemaphoreType sema_ty
    return mfence;
 }
 
+/* A timeline semaphore over an id<MTLSharedEvent> (VK_EXT_metal_objects), so a
+ * fence_server_signal at value v sets the event to v once the work before it
+ * has run, and a Metal queue can wait on it. */
+void
+zink_create_fence_metal_shared_event(struct pipe_screen *pscreen, struct pipe_fence_handle **pfence, void *event)
+{
+   struct zink_screen *screen = zink_screen(pscreen);
+   *pfence = NULL;
+   struct zink_tc_fence *mfence = zink_create_tc_fence();
+   if (!mfence)
+      return;
+   const VkImportMetalSharedEventInfoEXT import = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_SHARED_EVENT_INFO_EXT,
+      .mtlSharedEvent = (MTLSharedEvent_id)event,
+   };
+   const VkSemaphoreTypeCreateInfo tci = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+      .pNext = &import,
+      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+   };
+   const VkSemaphoreCreateInfo sci = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+      .pNext = &tci,
+   };
+   VkResult result = VKSCR(CreateSemaphore)(screen->dev, &sci, NULL, &mfence->sem);
+   if (result != VK_SUCCESS) {
+      mesa_loge("ZINK: vkCreateSemaphore(MTLSharedEvent) failed (%s)", vk_Result_to_str(result));
+      FREE(mfence);
+      return;
+   }
+   *pfence = (struct pipe_fence_handle *)mfence;
+}
+
 void
 zink_create_fence_fd(struct pipe_context *pctx, struct pipe_fence_handle **pfence, int fd, enum pipe_fd_type type)
 {

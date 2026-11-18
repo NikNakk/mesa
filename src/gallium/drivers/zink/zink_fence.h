@@ -56,6 +56,8 @@ void
 zink_create_fence_win32(struct pipe_screen *screen, struct pipe_fence_handle **pfence, void *handle, const void *name, enum pipe_fd_type type);
 #endif
 void
+zink_create_fence_metal_shared_event(struct pipe_screen *pscreen, struct pipe_fence_handle **pfence, void *event);
+void
 zink_fence_server_signal(struct pipe_context *pctx, struct pipe_fence_handle *pfence, uint64_t value);
 void
 zink_fence_server_sync(struct pipe_context *pctx, struct pipe_fence_handle *pfence, uint64_t value);

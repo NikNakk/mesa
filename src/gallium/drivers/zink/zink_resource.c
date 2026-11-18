@@ -1356,6 +1356,8 @@ get_export_flags(struct zink_screen *screen, const struct pipe_resource *templ, 
       if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_FD ||
           alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE)
          needs_export |= true;
+      else if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_METAL_TEXTURE)
+         ; /* the image adopts the texture at creation; no memory is imported */
       else
          UNREACHABLE("unknown handle type");
    }
@@ -2089,6 +2091,19 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
    if (util_format_is_yuv(templ->format)) {
    } else if (alloc_info->whandle) {
       obj->plane_strides[alloc_info->whandle->plane] = alloc_info->whandle->stride;
+   }
+
+   /* An imported MTLTexture (VK_EXT_metal_objects): the driver adopts it as the
+    * image's storage, and binding memory to such an image is a no-op there. */
+   VkImportMetalTextureInfoEXT imti;
+   if (alloc_info->whandle && alloc_info->whandle->type == WINSYS_HANDLE_TYPE_METAL_TEXTURE) {
+      imti = (VkImportMetalTextureInfoEXT){
+         .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT,
+         .pNext = ici.pNext,
+         .plane = VK_IMAGE_ASPECT_PLANE_0_BIT,
+         .mtlTexture = (MTLTexture_id)alloc_info->whandle->com_obj,
+      };
+      ici.pNext = &imti;
    }
 
    VkResult result = VKSCR(CreateImage)(screen->dev, &ici, NULL, &obj->image);
@@ -2871,6 +2886,17 @@ zink_resource_from_handle(struct pipe_screen *pscreen,
                  struct winsys_handle *whandle,
                  unsigned usage)
 {
+   if (whandle->type == WINSYS_HANDLE_TYPE_METAL_TEXTURE) {
+      /* In-process only: a 2D texture over an existing MTLTexture, which must
+       * match templ in format, size and levels. */
+      if (templ->target != PIPE_TEXTURE_2D || !zink_screen(pscreen)->info.have_EXT_metal_objects)
+         return NULL;
+      uint64_t mod = DRM_FORMAT_MOD_INVALID;
+      struct pipe_resource *pres = resource_create(pscreen, templ, whandle, usage, &mod, 0, NULL, NULL);
+      if (pres)
+         zink_resource(pres)->valid = true;
+      return pres;
+   }
 #ifdef ZINK_USE_DMABUF
    struct zink_screen *screen = zink_screen(pscreen);
 
@@ -4389,8 +4415,9 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
       pscreen->resource_get_handle = zink_resource_get_handle;
       pscreen->resource_from_handle = zink_resource_from_handle;
    } else if (screen->info.have_EXT_metal_objects) {
-      /* Only WINSYS_HANDLE_TYPE_METAL_TEXTURE can be exported. */
+      /* Only WINSYS_HANDLE_TYPE_METAL_TEXTURE can be exported or imported. */
       pscreen->resource_get_handle = zink_resource_get_handle;
+      pscreen->resource_from_handle = zink_resource_from_handle;
    }
    if (screen->info.have_EXT_external_memory_host) {
       pscreen->resource_from_user_memory = zink_resource_from_user_memory;

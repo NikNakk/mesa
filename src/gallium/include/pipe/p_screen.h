@@ -474,6 +474,14 @@ struct pipe_screen {
                               enum pipe_fd_type type);
 
    /**
+    * Create a timeline fence over an in-process id<MTLSharedEvent>, for
+    * fence_server_signal/fence_server_sync on a Metal-backed driver.
+    */
+   void (*create_fence_metal_shared_event)(struct pipe_screen *screen,
+                                           struct pipe_fence_handle **fence,
+                                           void *event);
+
+   /**
     * Returns a driver-specific query.
     *
     * If \p info is NULL, the number of available queries is returned.

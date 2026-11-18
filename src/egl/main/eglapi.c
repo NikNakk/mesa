@@ -2868,6 +2868,45 @@ MesaGLInteropEGLExportObject(EGLDisplay dpy, EGLContext context,
 }
 
 PUBLIC int
+eglExportMetalTextureMESA(EGLDisplay dpy, EGLContext context, unsigned texture,
+                          struct mesa_metal_texture *out)
+{
+   _EGLDisplay *disp;
+   _EGLContext *ctx;
+   int ret;
+
+   if (!out)
+      return MESA_GLINTEROP_INVALID_OPERATION;
+   ret = _eglLockDisplayInterop(dpy, context, &disp, &ctx);
+   if (ret != MESA_GLINTEROP_SUCCESS)
+      return ret;
+
+   if (disp->Driver->ExportMetalTexture)
+      ret = disp->Driver->ExportMetalTexture(disp, ctx, texture, out);
+   else
+      ret = MESA_GLINTEROP_UNSUPPORTED;
+
+   _eglUnlockDisplay(disp);
+   return ret;
+}
+
+PUBLIC int
+eglSignalMetalSharedEventMESA(EGLDisplay dpy, EGLContext context, void *event, uint64_t value)
+{
+   _EGLDisplay *disp;
+   _EGLContext *ctx;
+   int ret = _eglLockDisplayInterop(dpy, context, &disp, &ctx);
+   if (ret != MESA_GLINTEROP_SUCCESS)
+      return ret;
+   if (disp->Driver->SignalMetalSharedEvent)
+      ret = disp->Driver->SignalMetalSharedEvent(disp, ctx, event, value);
+   else
+      ret = MESA_GLINTEROP_UNSUPPORTED;
+   _eglUnlockDisplay(disp);
+   return ret;
+}
+
+PUBLIC int
 MesaGLInteropEGLFlushObjects(EGLDisplay dpy, EGLContext context, unsigned count,
                              struct mesa_glinterop_export_in *objects,
                              struct mesa_glinterop_flush_out *out)

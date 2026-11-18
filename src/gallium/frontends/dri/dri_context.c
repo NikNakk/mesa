@@ -144,6 +144,8 @@ dri_destroy_context(struct dri_context *ctx)
     * partially destroyed context.
     */
    st_context_flush(ctx->st, 0, NULL, NULL, NULL);
+   if (ctx->metal_fence)
+      ctx->screen->base.screen->fence_reference(ctx->screen->base.screen, &ctx->metal_fence, NULL);
    st_destroy_context(ctx->st);
    free(ctx);
 }
