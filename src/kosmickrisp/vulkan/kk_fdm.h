@@ -91,6 +91,9 @@ struct kk_image_view;
 struct kk_image_view *kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
                                                const struct kk_image_view *dst);
 void kk_implicit_image_finish(struct kk_device *dev, struct kk_image *image);
+/* An image imported from a Metal texture: its runtime may publish profiles on it
+ * (threshold-foveation API level 3) for KK_IMPLICIT_FDM=auto. */
+void kk_implicit_note_import(struct kk_image *image);
 struct kk_cmd_buffer;
 /* A raw copy (transfer, not a shader) is about to read `src`. If it is foveated, record
  * a shader blit of it into an ordinary image of the same format and return that image

@@ -33,6 +33,7 @@
 #include "vk_util.h"
 #include "vk_cmd_queue.h"
 
+#include <dlfcn.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -334,15 +335,12 @@ kk_implicit_fdm_enabled(void)
 /* From the OpenXR layer in the same process: one eye's size and the rate (0..1] at
  * `count` evenly spaced positions across each eye, left to right and top to bottom of
  * the image as this driver stores it. Takes effect at the next frame of each target. */
-PUBLIC void
-kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t count,
-                            const float *horizontal0, const float *horizontal1,
-                            const float *vertical)
+static void
+kk_implicit_take_profile_locked(uint32_t view_width, uint32_t view_height, uint32_t count,
+                                const float *horizontal0, const float *horizontal1,
+                                const float *vertical, const char *source)
 {
-   if (!kk_implicit_fdm_enabled() || !kk_implicit.automatic || !count || !view_width || !view_height)
-      return;
    count = MIN2(count, KK_IMPLICIT_SAMPLES);
-   simple_mtx_lock(&kk_fdm_lock);
    struct kk_implicit_profile *p = &kk_implicit.pending;
    p->count = count;
    for (uint32_t i = 0; i < count; i++) {
@@ -352,10 +350,114 @@ kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t 
    }
    p->serial++;
    if (kk_implicit.view_width != view_width || kk_implicit.view_height != view_height)
-      mesa_logi("kk-implicit: view size %ux%u from the OpenXR layer", view_width, view_height);
+      mesa_logi("kk-implicit: view size %ux%u from %s", view_width, view_height, source);
    kk_implicit.view_width = view_width;
    kk_implicit.view_height = view_height;
+}
+
+PUBLIC void
+kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t count,
+                            const float *horizontal0, const float *horizontal1,
+                            const float *vertical)
+{
+   if (!kk_implicit_fdm_enabled() || !kk_implicit.automatic || !count || !view_width || !view_height)
+      return;
+   simple_mtx_lock(&kk_fdm_lock);
+   kk_implicit_take_profile_locked(view_width, view_height, count, horizontal0, horizontal1, vertical,
+                                   "the OpenXR layer");
    simple_mtx_unlock(&kk_fdm_lock);
+}
+
+/*
+ * Runtime profiles (threshold-foveation API level 3). An OpenXR runtime in this process
+ * that binds a rate map on each swapchain image may also publish the per-view profile it
+ * was built from, for whatever renders the application's frames. With
+ * KK_IMPLICIT_FDM=auto the driver reads it from the runtime images it imported (the
+ * swapchain images an application or a layer such as Wine's OpenXR bridge renders or
+ * copies into) and takes the newest, so no layer has to call kk_implicit_fdm_set_profile.
+ * A new revision is published at each acquire, so it also ends a frame for an
+ * application that does not present. KK_IMPLICIT_RUNTIME_FLIP=1 reverses the vertical
+ * profile for an application whose images are bottom-up (OpenGL through Zink).
+ */
+#define KK_RUNTIME_IMAGES 16
+static struct {
+   struct kk_image *images[KK_RUNTIME_IMAGES];
+   uint32_t count;
+   uint64_t revision;
+} kk_runtime;
+
+void
+kk_implicit_note_import(struct kk_image *image)
+{
+   simple_mtx_lock(&kk_fdm_lock);
+   if (kk_runtime.count < KK_RUNTIME_IMAGES)
+      kk_runtime.images[kk_runtime.count++] = image;
+   simple_mtx_unlock(&kk_fdm_lock);
+}
+
+static void
+kk_implicit_forget_import(struct kk_image *image)
+{
+   simple_mtx_lock(&kk_fdm_lock);
+   for (uint32_t i = 0; i < kk_runtime.count; i++) {
+      if (kk_runtime.images[i] == image) {
+         kk_runtime.images[i] = kk_runtime.images[--kk_runtime.count];
+         break;
+      }
+   }
+   simple_mtx_unlock(&kk_fdm_lock);
+}
+
+static void kk_implicit_mark_boundary_locked(void);
+
+/* Takes a newer runtime profile, if one of the imported images carries it. Called with
+ * kk_fdm_lock held. */
+static void
+kk_implicit_poll_runtime_locked(void)
+{
+#ifdef THRESHOLD_SHARED_FOVEATION
+   typedef int (*copy_profile_fn)(void *, struct tf_image_profile *);
+   static copy_profile_fn copy_profile;
+   static int looked;
+   static int flip = -1;
+   if (!looked) {
+      copy_profile = (copy_profile_fn)dlsym(RTLD_DEFAULT, "tf_metal_copy_texture_profile");
+      looked = 1;
+      if (!copy_profile)
+         mesa_logi("kk-implicit: threshold-foveation has no image profiles (API level 3)");
+   }
+   if (flip < 0)
+      flip = debug_get_bool_option("KK_IMPLICIT_RUNTIME_FLIP", false);
+   if (!copy_profile || !kk_runtime.count)
+      return;
+   struct tf_image_profile best = {0}, profile;
+   for (uint32_t i = 0; i < kk_runtime.count; i++) {
+      memset(&profile, 0, sizeof(profile));
+      profile.struct_size = sizeof(profile);
+      if (copy_profile(kk_runtime.images[i]->planes[0].mtl_handle, &profile) == 0 &&
+          profile.revision > best.revision)
+         best = profile;
+   }
+   if (best.revision <= kk_runtime.revision)
+      return;
+   const bool first = !kk_runtime.revision;
+   kk_runtime.revision = best.revision;
+   const struct tf_image_profile_view *left = &best.views[0];
+   const struct tf_image_profile_view *right = &best.views[best.view_count > 1 ? 1 : 0];
+   /* One vertical profile serves both eyes: take the higher rate of the two. */
+   float vertical[KK_IMPLICIT_SAMPLES];
+   const uint32_t count = MIN2(best.sample_count, KK_IMPLICIT_SAMPLES);
+   for (uint32_t i = 0; i < count; i++) {
+      const uint32_t row = flip ? count - 1 - i : i;
+      vertical[i] = MAX2(left->vertical[row], right->vertical[row]);
+   }
+   kk_implicit_take_profile_locked(left->width, left->height, count, left->horizontal, right->horizontal,
+                                   vertical, "the OpenXR runtime's images");
+   if (first)
+      mesa_logi("kk-implicit: profiles from the OpenXR runtime's images (%u views%s)", best.view_count,
+                flip ? ", bottom-up" : "");
+   kk_implicit_mark_boundary_locked();
+#endif
 }
 
 /* Set while the driver creates its own images (the unwarp copies): never candidates. */
@@ -448,12 +550,17 @@ kk_implicit_eyes(const struct kk_image *image)
           : image->vk.extent.width == 2 * kk_implicit.view_width ? 2 : 0;
 }
 
+static void kk_implicit_poll_runtime_locked(void);
+
 bool
 kk_implicit_fdm_match(struct kk_image *image)
 {
    if (image->implicit_fdm || !image->implicit_candidate || image->implicit_poison)
       return image->implicit_fdm;
    simple_mtx_lock(&kk_fdm_lock);
+   /* The eye size may only be known from a runtime profile not read yet. */
+   if (kk_implicit.automatic && !kk_implicit_eyes(image))
+      kk_implicit_poll_runtime_locked();
    if (kk_implicit_eyes(image) && kk_implicit.pending.serial) {
       image->implicit_fdm = true;
       mesa_logi("kk-implicit: foveating %ux%u s%u image %p (%u eye%s)", image->vk.extent.width,
@@ -505,6 +612,12 @@ kk_implicit_fdm_present(void)
    kk_implicit_frame_boundary = true;
 }
 
+static void
+kk_implicit_mark_boundary_locked(void)
+{
+   kk_implicit_fdm_present();
+}
+
 PUBLIC void
 kk_implicit_fdm_frame_boundary(void)
 {
@@ -525,6 +638,8 @@ kk_implicit_fdm_frame_boundary(void)
 static struct kk_image *
 kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool new_frame)
 {
+   if (kk_implicit.automatic && (new_frame || !kk_implicit.pending.serial))
+      kk_implicit_poll_runtime_locked();
    const uint32_t eyes = kk_implicit_eyes(image);
    if (!eyes || !kk_implicit.pending.serial)
       return NULL;
@@ -651,6 +766,8 @@ kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
 void
 kk_implicit_image_finish(struct kk_device *dev, struct kk_image *image)
 {
+   if (image->metal_imported)
+      kk_implicit_forget_import(image);
    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
    VkDevice device = kk_device_to_handle(dev);
    if (image->implicit_unwarp_image != VK_NULL_HANDLE) {

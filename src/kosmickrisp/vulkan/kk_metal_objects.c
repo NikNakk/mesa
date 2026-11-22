@@ -6,6 +6,7 @@
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_image.h"
+#include "kk_fdm.h"
 #include "kk_image_view.h"
 #include "kk_sync.h"
 
@@ -119,6 +120,8 @@ kk_image_import_metal(struct kk_device *dev, struct kk_image *image,
       mtl_resource_set_label(plane->mtl_handle, image->vk.base.object_name);
    kk_residency_add(dev, plane->mtl_handle);
    image->metal_imported = true;
+   if (kk_implicit_fdm_enabled())
+      kk_implicit_note_import(image);
    return VK_SUCCESS;
 }
 
