@@ -65,6 +65,18 @@ if host_machine.system() == 'darwin'
   )
 endif
 
+threshold_foveation_dep = declare_dependency()
+threshold_foveation_root = get_option('threshold-foveation-root')
+if host_machine.system() == 'darwin' and threshold_foveation_root != ''
+  threshold_foveation_dep = declare_dependency(
+    dependencies : meson.get_compiler('c').find_library('threshold_foveation', dirs : [threshold_foveation_root / 'lib'], required : true),
+    include_directories : include_directories(threshold_foveation_root / 'include'),
+    compile_args : ['-DTHRESHOLD_SHARED_FOVEATION=1'],
+    link_args : ['-Wl,-rpath,' + threshold_foveation_root / 'lib'],
+  )
+  mtl_bridge_dependencies += threshold_foveation_dep
+endif
+
 libmtl_bridge = static_library(
   'mtl_bridge',
   [mtl_bridge_files],
@@ -77,4 +89,5 @@ libmtl_bridge = static_library(
 
 idep_mtl_bridge = declare_dependency(
   link_with : libmtl_bridge,
+  dependencies : threshold_foveation_dep,
 )

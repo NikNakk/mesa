@@ -936,3 +936,5 @@ option(
   value : true,
   description : 'Build panfrost Rust components.'
 )
+
+option('threshold-foveation-root', type : 'string', value : '', description : 'Optional Threshold shared Metal foveation library prefix')

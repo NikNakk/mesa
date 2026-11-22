@@ -7,6 +7,7 @@
 
 #include "kk_cmd_buffer.h"
 #include "kk_fdm.h"
+#include "kosmickrisp/bridge/mtl_rate_map.h"
 
 #include "kk_bo.h"
 #include "kk_buffer.h"
@@ -364,6 +365,14 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);
+   void *src_map = mtl_texture_copy_rate_map(src->planes[0].mtl_handle);
+   void *dst_map = mtl_texture_copy_rate_map(dst->planes[0].mtl_handle);
+   if (src_map || dst_map) {
+      if (src_map) mtl_release(src_map);
+      if (dst_map) mtl_release(dst_map);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
    kk_fdm_note_use(&src->vk, "copy source");
    kk_fdm_note_use(&dst->vk, "copy destination");
 

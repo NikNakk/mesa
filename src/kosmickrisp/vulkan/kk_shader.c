@@ -198,9 +198,10 @@ kk_populate_fs_key(struct kk_fs_key *key,
    key->ms_input_fetch = KK_EXPERIMENTAL(MS_INPUT_FETCH);
    key->tile_resolve = KK_EXPERIMENTAL(TILE_RESOLVE);
    key->fdm_frag_coord =
-      KK_EXPERIMENTAL(FDM_RATE) &&
-      (state->pipeline_flags &
-       VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT);
+      debug_get_bool_option("KK_METAL_FOVEATION", false) ||
+      (KK_EXPERIMENTAL(FDM_RATE) &&
+       (state->pipeline_flags &
+        VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT));
    if (key->custom_resolve && state->ial) {
       key->input_color_count = state->ial->color_attachment_count;
       memcpy(key->input_color_map, state->ial->color_map,
@@ -945,9 +946,10 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, kk_nir_lower_fs_multiview, state->mv->view_mask);
 
-      if (KK_EXPERIMENTAL(FDM_RATE) && state && state->rp &&
-          (state->pipeline_flags &
-           VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT))
+      if (debug_get_bool_option("KK_METAL_FOVEATION", false) ||
+          (KK_EXPERIMENTAL(FDM_RATE) && state && state->rp &&
+           (state->pipeline_flags &
+            VK_PIPELINE_CREATE_2_RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_BIT_EXT)))
          NIR_PASS(_, nir, nir_shader_lower_instructions, kk_is_frag_coord,
                   kk_lower_fdm_frag_coord, NULL);
 
