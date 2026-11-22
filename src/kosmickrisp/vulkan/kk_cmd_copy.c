@@ -7,6 +7,7 @@
 
 #include "kk_cmd_buffer.h"
 #include "kk_fdm.h"
+#include "kosmickrisp/bridge/mtl_rate_map.h"
 
 #include "kk_bo.h"
 #include "kk_buffer.h"
@@ -376,6 +377,19 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_image, src, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(kk_image, dst, pCopyImageInfo->dstImage);
+   /* Rendering straight into a runtime-mapped image (KK_METAL_FOVEATION) cannot be
+    * copied yet. Without that switch, a runtime's map on an image (for example
+    * Monado's on every swapchain image) is only a hint for implicit foveation. */
+   if (debug_get_bool_option("KK_METAL_FOVEATION", false)) {
+      void *src_map = mtl_texture_copy_rate_map(src->planes[0].mtl_handle);
+      void *dst_map = mtl_texture_copy_rate_map(dst->planes[0].mtl_handle);
+      if (src_map || dst_map) {
+         if (src_map) mtl_release(src_map);
+         if (dst_map) mtl_release(dst_map);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+   }
    kk_implicit_trace("copy", &src->vk, &dst->vk);
    if (dst->implicit_fdm && !src->implicit_fdm && !dst->implicit_unwarp_logged) {
       dst->implicit_unwarp_logged = true;

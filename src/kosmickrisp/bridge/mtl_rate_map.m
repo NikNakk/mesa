@@ -7,6 +7,8 @@
 
 #include <Metal/MTL4RenderPass.h>
 #include <Metal/MTLDevice.h>
+#include <Metal/MTLTexture.h>
+#include <objc/runtime.h>
 #include <Metal/MTLRasterizationRate.h>
 
 mtl_rate_map *
@@ -72,3 +74,50 @@ mtl_render_pass_descriptor_set_rate_map(mtl_render_pass_descriptor *descriptor,
          (id<MTLRasterizationRateMap>)map;
    }
 }
+
+#ifdef THRESHOLD_SHARED_FOVEATION
+#include <threshold_foveation.h>
+
+__attribute__((visibility("default"))) int
+kk_metal_foveation_set_texture(void *texture, void *map)
+{
+   return tf_metal_set_texture_map(texture, map);
+}
+
+mtl_rate_map *
+mtl_texture_copy_rate_map(mtl_texture *texture)
+{
+   return tf_metal_copy_texture_map(texture);
+}
+#else
+static char rate_map_key;
+
+static id<MTLTexture>
+rate_map_root(id<MTLTexture> texture)
+{
+   while (texture.parentTexture)
+      texture = texture.parentTexture;
+   return texture;
+}
+
+__attribute__((visibility("default"))) int
+kk_metal_foveation_set_texture(void *texture, void *map)
+{
+   if (!texture)
+      return -1;
+   id<MTLTexture> root = rate_map_root((id<MTLTexture>)texture);
+   id<MTLRasterizationRateMap> rate = (id<MTLRasterizationRateMap>)map;
+   if (rate && (rate.device != root.device || rate.layerCount != 1 ||
+                rate.screenSize.width != root.width || rate.screenSize.height != root.height))
+      return -1;
+   objc_setAssociatedObject(root, &rate_map_key, rate, OBJC_ASSOCIATION_RETAIN);
+   return 0;
+}
+
+mtl_rate_map *
+mtl_texture_copy_rate_map(mtl_texture *texture)
+{
+   return [objc_getAssociatedObject(rate_map_root((id<MTLTexture>)texture), &rate_map_key) retain];
+}
+
+#endif

@@ -4,6 +4,9 @@
  */
 
 #include "kk_fdm.h"
+#ifdef THRESHOLD_SHARED_FOVEATION
+#include <threshold_foveation.h>
+#endif
 
 #include "kk_bo.h"
 #include "kk_debug.h"
@@ -1160,6 +1163,75 @@ kk_fdm_publish(struct kk_cmd_buffer *cmd, struct kk_image *density,
    image->rate_params_serial = params->serial;
 }
 
+static uint64_t
+kk_metal_foveation_setup(struct kk_cmd_buffer *cmd,
+                         mtl_render_pass_descriptor *descriptor,
+                         VkExtent2D screen)
+{
+   struct kk_rendering_state *render = &cmd->state.gfx.render;
+   if (!debug_get_bool_option("KK_METAL_FOVEATION", false))
+      return 0;
+   void *map = NULL;
+   for (uint32_t i = 0; i < render->color_att_count && !map; i++) {
+      struct kk_image_view *views[] = {render->color_att[i].iview, render->color_att[i].resolve_iview};
+      for (uint32_t j = 0; j < ARRAY_SIZE(views) && !map; j++)
+         if (views[j])
+            map = mtl_texture_copy_rate_map(views[j]->planes[0].mtl_handle_render);
+   }
+   if (!map)
+      return 0;
+   struct kk_image_view *view = render->color_att[0].iview;
+   if (render->color_att_count != 1 || !view || render->samples != 1 ||
+       render->view_mask || render->layer_count != 1 ||
+       render->color_att[0].resolve_mode != VK_RESOLVE_MODE_NONE ||
+       view->vk.base_mip_level || view->vk.base_array_layer || view->vk.layer_count != 1 ||
+       view->vk.image->extent.width != screen.width ||
+       view->vk.image->extent.height != screen.height) {
+      mesa_loge("kk-monado: unsupported render pass targets a rate-mapped image");
+      mtl_release(map);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return 0;
+   }
+   uint64_t bytes = mtl_rate_map_parameter_size(map);
+   struct kk_fdm_params *params = calloc(1, sizeof(*params));
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   if (!params || bytes > KK_RATE_PARAMS_SIZE_B - KK_RATE_PARAMS_HEADER_B) {
+      free(params);
+      mtl_release(map);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return 0;
+   }
+   VkResult result = kk_alloc_bo(dev, &dev->vk.base, KK_RATE_PARAMS_SIZE_B, 0, &params->bo);
+   if (result != VK_SUCCESS) {
+      free(params);
+      mtl_release(map);
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return 0;
+   }
+   params->dev = dev;
+   params->refs = 1;
+   struct kk_rate_params_header *header = params->bo->cpu;
+   memset(header, 0, KK_RATE_PARAMS_HEADER_B);
+   mtl_rate_map_copy_parameters(map, params->bo->map, KK_RATE_PARAMS_HEADER_B);
+   header->layers = 1;
+   header->screen[0] = screen.width;
+   header->screen[1] = screen.height;
+   mtl_rate_map_physical_size(map, 0, &header->physical[0][0], &header->physical[0][1]);
+   header->valid = 1;
+   mtl_render_pass_descriptor_set_rate_map(descriptor, map);
+   mtl_release(map);
+   kk_fdm_cmd_ref(cmd, params);
+   uint64_t address = params->bo->gpu;
+   if (kk_fdm_debug()) {
+      static unsigned logged;
+      if (logged++ < 8)
+         mesa_logi("kk-monado: rate mapped pass %ux%u physical %ux%u", screen.width,
+                   screen.height, header->physical[0][0], header->physical[0][1]);
+   }
+   kk_fdm_params_unref(params);
+   return address;
+}
+
 void
 kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
                        const VkRenderingInfo *pRenderingInfo,
@@ -1172,10 +1244,11 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    struct kk_image *density = NULL;
    kk_fdm_scan_offsets(cmd);
 
+   const VkRenderingFragmentDensityMapAttachmentInfoEXT *fdm_info =
+      vk_find_struct_const(pRenderingInfo->pNext,
+                           RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT);
+   bool explicit_fdm_present = fdm_info != NULL || gfx->fdm.carry;
    if (KK_EXPERIMENTAL(FDM_RATE)) {
-      const VkRenderingFragmentDensityMapAttachmentInfoEXT *fdm_info =
-         vk_find_struct_const(pRenderingInfo->pNext,
-                              RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT);
       if (fdm_info && fdm_info->imageView != VK_NULL_HANDLE) {
          VK_FROM_HANDLE(kk_image_view, view, fdm_info->imageView);
          density = container_of(view->vk.image, struct kk_image, vk);
@@ -1337,6 +1410,12 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
          kk_fdm_publish(cmd, density, use, render->stencil_att.resolve_iview);
       }
    }
+#ifdef THRESHOLD_SHARED_FOVEATION
+   if (tf_select_source(explicit_fdm_present, true, false) == TF_SOURCE_RUNTIME)
+#else
+   if (!explicit_fdm_present)
+#endif
+      params = kk_metal_foveation_setup(cmd, descriptor, screen);
    simple_mtx_unlock(&kk_fdm_lock);
 
    struct kk_descriptor_state *desc = &gfx->descriptors;

@@ -39,3 +39,5 @@ mtl_render_pass_descriptor_set_rate_map(mtl_render_pass_descriptor *descriptor,
                                         mtl_rate_map *map)
 {
 }
+
+mtl_rate_map *mtl_texture_copy_rate_map(mtl_texture *texture) { return NULL; }

@@ -29,4 +29,6 @@ void mtl_rate_map_copy_parameters(mtl_rate_map *map, mtl_buffer *buffer,
 void mtl_render_pass_descriptor_set_rate_map(
    mtl_render_pass_descriptor *descriptor, mtl_rate_map *map);
 
+mtl_rate_map *mtl_texture_copy_rate_map(mtl_texture *texture);
+
 #endif /* MTL_RATE_MAP_H */
