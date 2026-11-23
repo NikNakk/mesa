@@ -428,15 +428,30 @@ kk_implicit_poll_runtime_locked(void)
    }
    if (flip < 0)
       flip = debug_get_bool_option("KK_IMPLICIT_RUNTIME_FLIP", false);
-   if (!copy_profile || !kk_runtime.count)
+   if (!copy_profile || !kk_runtime.count) {
+      static int reported_empty;
+      if (copy_profile && !reported_empty) {
+         reported_empty = 1;
+         mesa_logi("kk-implicit: no imported runtime images to read profiles from");
+      }
       return;
+   }
    struct tf_image_profile best = {0}, profile;
+   uint32_t found = 0;
    for (uint32_t i = 0; i < kk_runtime.count; i++) {
       memset(&profile, 0, sizeof(profile));
       profile.struct_size = sizeof(profile);
-      if (copy_profile(kk_runtime.images[i]->planes[0].mtl_handle, &profile) == 0 &&
-          profile.revision > best.revision)
-         best = profile;
+      if (copy_profile(kk_runtime.images[i]->planes[0].mtl_handle, &profile) == 0) {
+         found++;
+         if (profile.revision > best.revision)
+            best = profile;
+      }
+   }
+   static int reported_none;
+   if (!found && !reported_none) {
+      reported_none = 1;
+      mesa_logi("kk-implicit: %u imported runtime image(s), none carrying a profile yet",
+                kk_runtime.count);
    }
    if (best.revision <= kk_runtime.revision)
       return;
@@ -1790,6 +1805,10 @@ kk_implicit_match_pass(struct kk_cmd_buffer *cmd, struct kk_rendering_state *ren
    const struct kk_image *blocker = NULL;
    bool any = false;
    simple_mtx_lock(&kk_fdm_lock);
+   /* The first profile may still be waiting on the runtime's images: read it here, since
+    * this route matches no attachment until a profile exists. */
+   if (kk_implicit.automatic && !kk_implicit.pending.serial)
+      kk_implicit_poll_runtime_locked();
    const bool have_profile = kk_implicit.pending.serial != 0;
    simple_mtx_unlock(&kk_fdm_lock);
    for (uint32_t i = 0; i < n; i++) {
