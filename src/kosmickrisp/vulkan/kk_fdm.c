@@ -417,28 +417,23 @@ kk_implicit_poll_runtime_locked(void)
 {
 #ifdef THRESHOLD_SHARED_FOVEATION
    typedef int (*copy_profile_fn)(void *, struct tf_image_profile *);
+   typedef int (*copy_process_fn)(struct tf_image_profile *);
    static copy_profile_fn copy_profile;
+   static copy_process_fn copy_process;
    static int looked;
    static int flip = -1;
    if (!looked) {
       copy_profile = (copy_profile_fn)dlsym(RTLD_DEFAULT, "tf_metal_copy_texture_profile");
+      copy_process = (copy_process_fn)dlsym(RTLD_DEFAULT, "tf_copy_process_profile");
       looked = 1;
       if (!copy_profile)
          mesa_logi("kk-implicit: threshold-foveation has no image profiles (API level 3)");
    }
    if (flip < 0)
       flip = debug_get_bool_option("KK_IMPLICIT_RUNTIME_FLIP", false);
-   if (!copy_profile || !kk_runtime.count) {
-      static int reported_empty;
-      if (copy_profile && !reported_empty) {
-         reported_empty = 1;
-         mesa_logi("kk-implicit: no imported runtime images to read profiles from");
-      }
-      return;
-   }
    struct tf_image_profile best = {0}, profile;
    uint32_t found = 0;
-   for (uint32_t i = 0; i < kk_runtime.count; i++) {
+   for (uint32_t i = 0; copy_profile && i < kk_runtime.count; i++) {
       memset(&profile, 0, sizeof(profile));
       profile.struct_size = sizeof(profile);
       if (copy_profile(kk_runtime.images[i]->planes[0].mtl_handle, &profile) == 0) {
@@ -447,10 +442,22 @@ kk_implicit_poll_runtime_locked(void)
             best = profile;
       }
    }
+   /* The images this driver renders for come first. Without any carrying a profile (output
+    * that reaches the runtime through another API: Zink's OpenGL frames that an OpenVR
+    * layer copies through D3D11), the runtime's profile for the process (API level 4). */
+   const char *source = "the OpenXR runtime's images";
+   if (!found && copy_process) {
+      memset(&profile, 0, sizeof(profile));
+      profile.struct_size = sizeof(profile);
+      if (copy_process(&profile) == 0) {
+         best = profile;
+         source = "the OpenXR runtime's process profile";
+      }
+   }
    static int reported_none;
-   if (!found && !reported_none) {
+   if (!best.revision && !reported_none) {
       reported_none = 1;
-      mesa_logi("kk-implicit: %u imported runtime image(s), none carrying a profile yet",
+      mesa_logi("kk-implicit: %u imported runtime image(s) and no process profile yet",
                 kk_runtime.count);
    }
    if (best.revision <= kk_runtime.revision)
@@ -467,9 +474,9 @@ kk_implicit_poll_runtime_locked(void)
       vertical[i] = MAX2(left->vertical[row], right->vertical[row]);
    }
    kk_implicit_take_profile_locked(left->width, left->height, count, left->horizontal, right->horizontal,
-                                   vertical, "the OpenXR runtime's images");
+                                   vertical, source);
    if (first)
-      mesa_logi("kk-implicit: profiles from the OpenXR runtime's images (%u views%s)", best.view_count,
+      mesa_logi("kk-implicit: profiles from %s (%u views%s)", source, best.view_count,
                 flip ? ", bottom-up" : "");
    kk_implicit_mark_boundary_locked();
 #endif
