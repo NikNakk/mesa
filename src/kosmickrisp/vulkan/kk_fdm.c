@@ -334,25 +334,34 @@ kk_implicit_fdm_enabled(void)
 
 /* From the OpenXR layer in the same process: one eye's size and the rate (0..1] at
  * `count` evenly spaced positions across each eye, left to right and top to bottom of
- * the image as this driver stores it. Takes effect at the next frame of each target. */
-static void
+ * the image as this driver stores it. Takes effect at the next frame of each target.
+ * A profile equal to the pending one changes nothing: a new serial would rebuild every
+ * target's density and rate map for identical rates. Returns whether it changed. */
+static bool
 kk_implicit_take_profile_locked(uint32_t view_width, uint32_t view_height, uint32_t count,
                                 const float *horizontal0, const float *horizontal1,
                                 const float *vertical, const char *source)
 {
    count = MIN2(count, KK_IMPLICIT_SAMPLES);
-   struct kk_implicit_profile *p = &kk_implicit.pending;
-   p->count = count;
+   struct kk_implicit_profile next = {.count = count};
    for (uint32_t i = 0; i < count; i++) {
-      p->horizontal[0][i] = CLAMP(horizontal0[i], 0.0625f, 1.0f);
-      p->horizontal[1][i] = CLAMP(horizontal1[i], 0.0625f, 1.0f);
-      p->vertical[i] = CLAMP(vertical[i], 0.0625f, 1.0f);
+      next.horizontal[0][i] = CLAMP(horizontal0[i], 0.0625f, 1.0f);
+      next.horizontal[1][i] = CLAMP(horizontal1[i], 0.0625f, 1.0f);
+      next.vertical[i] = CLAMP(vertical[i], 0.0625f, 1.0f);
    }
-   p->serial++;
+   struct kk_implicit_profile *p = &kk_implicit.pending;
+   if (p->serial && p->count == count && kk_implicit.view_width == view_width &&
+       kk_implicit.view_height == view_height &&
+       !memcmp(p->horizontal, next.horizontal, sizeof(next.horizontal)) &&
+       !memcmp(p->vertical, next.vertical, sizeof(next.vertical)))
+      return false;
+   next.serial = p->serial + 1;
+   *p = next;
    if (kk_implicit.view_width != view_width || kk_implicit.view_height != view_height)
       mesa_logi("kk-implicit: view size %ux%u from %s", view_width, view_height, source);
    kk_implicit.view_width = view_width;
    kk_implicit.view_height = view_height;
+   return true;
 }
 
 PUBLIC void
@@ -375,8 +384,11 @@ kk_implicit_fdm_set_profile(uint32_t view_width, uint32_t view_height, uint32_t 
  * KK_IMPLICIT_FDM=auto the driver reads it from the runtime images it imported (the
  * swapchain images an application or a layer such as Wine's OpenXR bridge renders or
  * copies into) and takes the newest, so no layer has to call kk_implicit_fdm_set_profile.
- * A new revision is published at each acquire, so it also ends a frame for an
- * application that does not present. KK_IMPLICIT_RUNTIME_FLIP=1 reverses the vertical
+ * A profile covering both eyes is preferred: an image of a one-eye swapchain carries
+ * only its own eye's, whose horizontal rates are wrong for the other eye. A revision is
+ * published at each acquire, which may come in the middle of the application's frame,
+ * so it never ends a frame by itself; a new profile is taken at the next frame start
+ * (kk_implicit_density). KK_IMPLICIT_RUNTIME_FLIP=1 reverses the vertical
  * profile for an application whose images are bottom-up (OpenGL through Zink).
  */
 #define KK_RUNTIME_IMAGES 16
@@ -408,8 +420,6 @@ kk_implicit_forget_import(struct kk_image *image)
    simple_mtx_unlock(&kk_fdm_lock);
 }
 
-static void kk_implicit_mark_boundary_locked(void);
-
 /* Takes a newer runtime profile, if one of the imported images carries it. Called with
  * kk_fdm_lock held. */
 static void
@@ -431,28 +441,37 @@ kk_implicit_poll_runtime_locked(void)
    }
    if (flip < 0)
       flip = debug_get_bool_option("KK_IMPLICIT_RUNTIME_FLIP", false);
-   struct tf_image_profile best = {0}, profile;
-   uint32_t found = 0;
+   /* The newest profile among the images, for both eyes and for one eye. */
+   struct tf_image_profile stereo = {0}, mono = {0}, process = {0}, profile;
    for (uint32_t i = 0; copy_profile && i < kk_runtime.count; i++) {
       memset(&profile, 0, sizeof(profile));
       profile.struct_size = sizeof(profile);
       if (copy_profile(kk_runtime.images[i]->planes[0].mtl_handle, &profile) == 0) {
-         found++;
-         if (profile.revision > best.revision)
-            best = profile;
+         struct tf_image_profile *slot = profile.view_count > 1 ? &stereo : &mono;
+         if (profile.revision > slot->revision)
+            *slot = profile;
       }
    }
-   /* The images this driver renders for come first. Without any carrying a profile (output
-    * that reaches the runtime through another API: Zink's OpenGL frames that an OpenVR
-    * layer copies through D3D11), the runtime's profile for the process (API level 4). */
+   /* The runtime's profile for the process (API level 4) covers both eyes. It serves
+    * output that reaches the runtime only through another API (Zink's OpenGL frames
+    * that an OpenVR layer copies through D3D11), and one-eye swapchains. */
+   if (copy_process) {
+      process.struct_size = sizeof(process);
+      if (copy_process(&process) != 0)
+         process.revision = 0;
+   }
+   /* Both eyes from the images first, then from the process, then one eye. */
+   struct tf_image_profile best = stereo;
    const char *source = "the OpenXR runtime's images";
-   if (!found && copy_process) {
-      memset(&profile, 0, sizeof(profile));
-      profile.struct_size = sizeof(profile);
-      if (copy_process(&profile) == 0) {
-         best = profile;
-         source = "the OpenXR runtime's process profile";
-      }
+   if (!best.revision && process.revision && process.view_count > 1) {
+      best = process;
+      source = "the OpenXR runtime's process profile";
+   } else if (!best.revision && mono.revision) {
+      best = mono;
+      source = "the OpenXR runtime's one-eye images";
+   } else if (!best.revision && process.revision) {
+      best = process;
+      source = "the OpenXR runtime's process profile";
    }
    static int reported_none;
    if (!best.revision && !reported_none) {
@@ -475,10 +494,11 @@ kk_implicit_poll_runtime_locked(void)
    }
    kk_implicit_take_profile_locked(left->width, left->height, count, left->horizontal, right->horizontal,
                                    vertical, source);
-   if (first)
+   static const char *reported_source;
+   if (first || source != reported_source)
       mesa_logi("kk-implicit: profiles from %s (%u views%s)", source, best.view_count,
                 flip ? ", bottom-up" : "");
-   kk_implicit_mark_boundary_locked();
+   reported_source = source;
 #endif
 }
 
@@ -634,12 +654,6 @@ kk_implicit_fdm_present(void)
    kk_implicit_frame_boundary = true;
 }
 
-static void
-kk_implicit_mark_boundary_locked(void)
-{
-   kk_implicit_fdm_present();
-}
-
 PUBLIC void
 kk_implicit_fdm_frame_boundary(void)
 {
@@ -668,14 +682,17 @@ kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool ne
    /* A new profile is taken only at the first pass after a present that does not load its
     * target. Taken at any such pass, it changed the map in the middle of a frame: later
     * passes loading targets drawn earlier in the frame rendered them in the new layout
-    * over content in the old one (NMS with a moving gaze: hard-edged rectangles). An
-    * application that never presents keeps the old rule. */
+    * over content in the old one (NMS with a moving gaze: hard-edged rectangles). That
+    * first pass ends the chance whether or not the profile changed: a profile arriving
+    * later in the frame (a runtime publishes one at each swapchain acquire) waits for the
+    * next present. An application that never presents keeps the old rule. */
    const bool presents = kk_implicit_last_present_ns &&
                          os_time_get_nano() - kk_implicit_last_present_ns < 200000000ull;
-   const bool boundary = presents ? kk_implicit_frame_boundary : true;
-   if (kk_implicit.latched.serial != kk_implicit.pending.serial &&
-       ((new_frame && boundary) || !kk_implicit.latched.serial)) {
+   const bool frame_start = new_frame && (presents ? kk_implicit_frame_boundary : true);
+   if (frame_start)
       kk_implicit_frame_boundary = false;
+   if (kk_implicit.latched.serial != kk_implicit.pending.serial &&
+       (frame_start || !kk_implicit.latched.serial)) {
       kk_implicit.latched = kk_implicit.pending;
       for (uint32_t i = 0; i < kk_implicit.target_count; i++)
          kk_implicit_fill(kk_implicit.targets[i].density, kk_implicit.targets[i].width,
@@ -1310,15 +1327,41 @@ kk_metal_foveation_setup(struct kk_cmd_buffer *cmd,
    struct kk_rendering_state *render = &cmd->state.gfx.render;
    if (!debug_get_bool_option("KK_METAL_FOVEATION", false))
       return 0;
-   void *map = NULL;
+   void *map = NULL, *mapped = NULL;
    for (uint32_t i = 0; i < render->color_att_count && !map; i++) {
       struct kk_image_view *views[] = {render->color_att[i].iview, render->color_att[i].resolve_iview};
       for (uint32_t j = 0; j < ARRAY_SIZE(views) && !map; j++)
-         if (views[j])
-            map = mtl_texture_copy_rate_map(views[j]->planes[0].mtl_handle_render);
+         if (views[j]) {
+            mapped = views[j]->planes[0].mtl_handle_render;
+            map = mtl_texture_copy_rate_map(mapped);
+         }
    }
    if (!map)
       return 0;
+#ifdef THRESHOLD_SHARED_FOVEATION
+   /* This path leaves the image warped for a consumer that reconstructs it with this map.
+    * A runtime that publishes maps on its images for drivers to foveate their own
+    * targets (MNDX_foveation_metal version 7) also publishes the profile, and expects
+    * ordinary pixels in the image: such a map is not for rendering into it. */
+   typedef int (*copy_profile_fn)(void *, struct tf_image_profile *);
+   static copy_profile_fn copy_profile;
+   static bool looked;
+   if (!looked) {
+      copy_profile = (copy_profile_fn)dlsym(RTLD_DEFAULT, "tf_metal_copy_texture_profile");
+      looked = true;
+   }
+   struct tf_image_profile profile = {.struct_size = sizeof(profile)};
+   if (copy_profile && copy_profile(mapped, &profile) == 0) {
+      static bool reported;
+      if (!reported) {
+         reported = true;
+         mesa_logi("kk-monado: the runtime's image maps are for implicit foveation; "
+                   "rendering into its images at full rate");
+      }
+      mtl_release(map);
+      return 0;
+   }
+#endif
    struct kk_image_view *view = render->color_att[0].iview;
    if (render->color_att_count != 1 || !view || render->samples != 1 ||
        render->view_mask || render->layer_count != 1 ||
