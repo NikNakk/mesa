@@ -270,6 +270,11 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    const struct kk_image *blit_src =
       container_of(vk_image_from_handle(pBlitImageInfo->srcImage), struct kk_image, vk);
    const bool raw = blit_src->implicit_fdm && pBlitImageInfo->srcImage == pBlitImageInfo->dstImage;
+   for (uint32_t r = 0; r < pBlitImageInfo->regionCount; r++)
+      kk_implicit_fov_op("blit", blit_src,
+                         container_of(vk_image_from_handle(pBlitImageInfo->dstImage), struct kk_image, vk),
+                         pBlitImageInfo->pRegions[r].srcSubresource.mipLevel,
+                         raw ? "raw into itself" : "translated");
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdBlitImage2");
    if (raw)
@@ -289,6 +294,10 @@ kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
 
    struct kk_meta_save save;
    kk_implicit_trace("resolve", vk_image_from_handle(pResolveImageInfo->srcImage), vk_image_from_handle(pResolveImageInfo->dstImage));
+   kk_implicit_fov_op("resolve",
+                      container_of(vk_image_from_handle(pResolveImageInfo->srcImage), struct kk_image, vk),
+                      container_of(vk_image_from_handle(pResolveImageInfo->dstImage), struct kk_image, vk),
+                      0, "resolve");
    /* Diagnostic: leave only the resolve-attachment path, to look at its blit. */
    if (container_of(vk_image_from_handle(pResolveImageInfo->srcImage), struct kk_image, vk)->implicit_fdm &&
        debug_get_bool_option("KK_IMPLICIT_SKIP_EXPLICIT", false))

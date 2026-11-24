@@ -134,6 +134,10 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
       level0 &= pCopyImageToBufferInfo->pRegions[r].imageSubresource.mipLevel == 0;
    VkImage unwarp = level0 ? kk_implicit_unwarp_for_copy(cmd, image, pCopyImageToBufferInfo->srcImageLayout, NULL)
                            : VK_NULL_HANDLE;
+   for (uint32_t r = 0; r < pCopyImageToBufferInfo->regionCount; r++)
+      kk_implicit_fov_op("copy to buffer", image, NULL,
+                         pCopyImageToBufferInfo->pRegions[r].imageSubresource.mipLevel,
+                         unwarp ? "unwarped" : "RAW");
    if (unwarp != VK_NULL_HANDLE) {
       VkCopyImageToBufferInfo2 info = *pCopyImageToBufferInfo;
       info.srcImage = unwarp;
@@ -400,6 +404,9 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       level0 &= pCopyImageInfo->pRegions[r].srcSubresource.mipLevel == 0;
    VkImage unwarp = level0 ? kk_implicit_unwarp_for_copy(cmd, src, pCopyImageInfo->srcImageLayout, dst)
                            : VK_NULL_HANDLE;
+   for (uint32_t r = 0; r < pCopyImageInfo->regionCount; r++)
+      kk_implicit_fov_op("copy", src, dst, pCopyImageInfo->pRegions[r].srcSubresource.mipLevel,
+                         unwarp ? "unwarped" : dst->implicit_fdm ? "as stored (both foveated)" : "RAW");
    /* Diagnostic (session marks): copies out of foveated images, first few. */
    if (src->implicit_fdm && getenv("XRT_SESSION_RECORD_DIR")) {
       static uint32_t told;

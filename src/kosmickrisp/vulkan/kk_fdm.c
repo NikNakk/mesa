@@ -182,9 +182,33 @@ kk_watched_res_listed(uint64_t id)
    return false;
 }
 
+/* Diagnostic: every sampled view id with its image's description (copied, so it can be
+ * printed without touching the image), for the mark logs. */
+static struct {
+   uint64_t id;
+   const void *image;
+   uint32_t w, h, levels;
+   int format, candidate;
+} kk_names[8192];
+static uint32_t kk_name_count;
+
+static void
+kk_name_note_locked(uint64_t id, const struct kk_image *image)
+{
+   if (kk_name_count < ARRAY_SIZE(kk_names))
+      kk_names[kk_name_count++] = (__typeof__(kk_names[0])){
+         id, image, image->vk.extent.width, image->vk.extent.height, image->vk.mip_levels,
+         image->vk.format, image->implicit_candidate};
+}
+
 void
 kk_implicit_note_view_id(uint64_t id, struct kk_image *image)
 {
+   if (id && image) {
+      simple_mtx_lock(&kk_rate_registry_lock);
+      kk_name_note_locked(id, image);
+      simple_mtx_unlock(&kk_rate_registry_lock);
+   }
    if (id && image && kk_watched_res_listed(id)) {
       mesa_logi("kk-res: view %llx is image %p %ux%u fmt %d usage 0x%x flags 0x%x mips %u "
                 "layers %u samples %u candidate %d", (unsigned long long)id, (void *)image,
@@ -220,6 +244,12 @@ kk_implicit_forget_view_id(uint64_t id)
    if (!id)
       return;
    simple_mtx_lock(&kk_rate_registry_lock);
+   for (uint32_t i = 0; i < kk_name_count; i++) {
+      if (kk_names[i].id == id) {
+         kk_names[i] = kk_names[--kk_name_count];
+         break;
+      }
+   }
    for (uint32_t i = 0; i < kk_watched_res.view_count; i++) {
       if (kk_watched_res.views[i].id == id) {
          kk_watched_res.views[i] = kk_watched_res.views[--kk_watched_res.view_count];
@@ -2776,6 +2806,20 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
                   simple_mtx_unlock(&kk_rate_registry_lock);
                   continue;
                }
+               const __typeof__(kk_names[0]) *named = NULL;
+               for (uint32_t k = 0; k < kk_name_count; k++)
+                  if (kk_names[k].id == d->image_gpu_resource_id)
+                     named = &kk_names[k];
+               if (named) {
+                  lines++;
+                  mesa_logi("%s   set %u binding %u[%u] @%u: ordinary %p %ux%u fmt %d mips %u%s "
+                            "(resource %llx)", prefix, s, b, e, at, named->image, named->w,
+                            named->h, named->format, named->levels,
+                            named->candidate ? " candidate" : "",
+                            (unsigned long long)d->image_gpu_resource_id);
+                  simple_mtx_unlock(&kk_rate_registry_lock);
+                  continue;
+               }
                simple_mtx_unlock(&kk_rate_registry_lock);
                lines++;
                mesa_logi("%s   set %u%s binding %u[%u] @%u: no map (resource %llx)", prefix, s,
@@ -3079,4 +3123,33 @@ kk_watched_res_image(const struct kk_image *image)
       found |= kk_watched_res.views[i].image == image;
    simple_mtx_unlock(&kk_rate_registry_lock);
    return found;
+}
+
+/* Diagnostic (session recordings): each distinct transfer out of a foveated image, with
+ * the path it took, once. */
+void
+kk_implicit_fov_op(const char *what, const struct kk_image *src, const struct kk_image *dst,
+                   uint32_t level, const char *path)
+{
+   if (!src || !src->implicit_fdm || !getenv("XRT_SESSION_RECORD_DIR"))
+      return;
+   static struct { const char *what, *path; const void *src, *dst; uint32_t level; } seen[256];
+   static uint32_t count;
+   simple_mtx_lock(&kk_fdm_lock);
+   for (uint32_t i = 0; i < count; i++) {
+      if (seen[i].what == what && seen[i].path == path && seen[i].src == src &&
+          seen[i].dst == dst && seen[i].level == level) {
+         simple_mtx_unlock(&kk_fdm_lock);
+         return;
+      }
+   }
+   if (count < ARRAY_SIZE(seen)) {
+      seen[count++] = (__typeof__(seen[0])){what, path, src, dst, level};
+      mesa_logi("kk-fovop: %s %p %ux%u fmt %d level %u -> %p %ux%u fmt %d fdm=%d: %s", what,
+                (const void *)src, src->vk.extent.width, src->vk.extent.height, src->vk.format,
+                level, (const void *)dst, dst ? dst->vk.extent.width : 0,
+                dst ? dst->vk.extent.height : 0, dst ? dst->vk.format : 0,
+                dst ? dst->implicit_fdm : 0, path);
+   }
+   simple_mtx_unlock(&kk_fdm_lock);
 }
