@@ -7,6 +7,7 @@
 
 #include "kk_shader.h"
 #include <unistd.h>
+#include <sys/stat.h>
 #include "kk_fdm.h"
 
 #include "kk_cmd_buffer.h"
@@ -1695,6 +1696,14 @@ kk_dump_msl(mesa_shader_stage stage, const char *code)
       snprintf(trigger_dir, sizeof(trigger_dir), "%s.msl", trigger);
       if (access(trigger_dir, F_OK) == 0)
          msl_dump_dir = trigger_dir;
+   }
+   /* Else <XRT_SESSION_RECORD_DIR>/msl, beside a Monado session recording. */
+   static char session_dir[1024];
+   const char *session = getenv("XRT_SESSION_RECORD_DIR");
+   if (!msl_dump_dir && session) {
+      snprintf(session_dir, sizeof(session_dir), "%s/msl", session);
+      mkdir(session_dir, 0755);
+      msl_dump_dir = session_dir;
    }
    if (!msl_dump_dir || !code)
       return;

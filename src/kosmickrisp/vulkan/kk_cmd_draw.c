@@ -2157,7 +2157,10 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    }
 
    struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
-   if (getenv("KK_CAPTURE_TRIGGER_FILE")) {
+   static int watching = -1;
+   if (watching < 0)
+      watching = getenv("KK_CAPTURE_TRIGGER_FILE") || getenv("XRT_SESSION_RECORD_DIR");
+   if (watching) {
       /* The fragment MSL lives with the vertex shader object (as for the target log). */
       struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
       const char *code = vs ? vs->msl_data[MESA_SHADER_FRAGMENT].code : NULL;

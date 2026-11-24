@@ -2476,6 +2476,52 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
       render->color_att_count && render->color_att[0].iview ? render->color_att[0].iview
                                                             : render->depth_att.iview;
    const struct kk_image *target = tv ? container_of(tv->vk.image, struct kk_image, vk) : NULL;
+
+   /* Session marks: XRT_SESSION_RECORD_DIR is Monado's recording folder, where each
+    * mark (Enter in the recorder, or both thumbsticks held) saves mark_<n>.ppm. For
+    * half a second after a new one, every distinct shader and target pair is logged
+    * with a "kk-mark <n>:" prefix. */
+   static const char *mark_dir;
+   static int mark_looked;
+   static uint32_t next_mark = 1, mark_now, mark_lines;
+   static uint64_t mark_until_ns, mark_checked_ns;
+   static struct { uint32_t fs; const void *target; } mark_pairs[512];
+   static uint32_t mark_pair_count;
+   if (!mark_looked) {
+      mark_looked = 1;
+      mark_dir = getenv("XRT_SESSION_RECORD_DIR");
+      if (mark_dir)
+         mesa_logi("kk-mark: watching %s for marks", mark_dir);
+   }
+   char prefix[32] = "kk-watch:";
+   if (mark_dir) {
+      const uint64_t now = os_time_get_nano();
+      if (now - mark_checked_ns > 100000000ull) {
+         mark_checked_ns = now;
+         char path[1024];
+         snprintf(path, sizeof(path), "%s/mark_%u.ppm", mark_dir, next_mark);
+         if (access(path, F_OK) == 0) {
+            mark_now = next_mark++;
+            mark_until_ns = now + 500000000ull;
+            mark_pair_count = 0;
+            mark_lines = 0;
+            mesa_logi("kk-mark %u: begin (%s)", mark_now, path);
+         }
+      }
+      if (mark_now && now < mark_until_ns && !hit) {
+         bool known_pair = false;
+         for (uint32_t i = 0; i < mark_pair_count; i++)
+            known_pair |= mark_pairs[i].fs == fs_hash && mark_pairs[i].target == target;
+         if (!known_pair && mark_pair_count < ARRAY_SIZE(mark_pairs) && mark_lines < 3000) {
+            mark_pairs[mark_pair_count].fs = fs_hash;
+            mark_pairs[mark_pair_count++].target = target;
+            snprintf(prefix, sizeof(prefix), "kk-mark %u:", mark_now);
+            hit = true;
+            lines--; /* mark lines do not count against the watch limit */
+            mark_lines += 8;
+         }
+      }
+   }
    /* "all": every distinct shader and target pair, once. */
    if (!hit && watch_all) {
       static struct { uint32_t fs; const void *target; } pairs[1024];
@@ -2489,14 +2535,14 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
          hit = true;
       }
    }
-   if (!hit || lines >= 6000)
+   if (!hit || (lines >= 6000 && strncmp(prefix, "kk-mark", 7)))
       return;
    simple_mtx_lock(&kk_fdm_lock);
    const uint64_t latched = kk_implicit.latched.serial;
    simple_mtx_unlock(&kk_fdm_lock);
    lines++;
-   mesa_logi("kk-watch: FS-%08x draw into %p %ux%u fmt %d fdm=%d map=%llu latched=%llu",
-             fs_hash, (const void *)target, target ? target->vk.extent.width : 0,
+   mesa_logi("%s FS-%08x draw into %p %ux%u fmt %d fdm=%d map=%llu latched=%llu",
+             prefix, fs_hash, (const void *)target, target ? target->vk.extent.width : 0,
              target ? target->vk.extent.height : 0, target ? (int)target->vk.format : 0,
              target ? target->implicit_fdm : 0,
              target && target->rate_ref ? (unsigned long long)target->rate_ref->serial : 0ull,
@@ -2536,7 +2582,7 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
                continue;
             if (!d->rate_params) {
                lines++;
-               mesa_logi("kk-watch:   set %u%s binding %u[%u] @%u: no map (resource %llx)", s,
+               mesa_logi("%s   set %u%s binding %u[%u] @%u: no map (resource %llx)", prefix, s,
                          mapped == (const void *)set ? "" : (set ? "" : " push"), b, e, at,
                          (unsigned long long)d->image_gpu_resource_id);
                continue;
@@ -2545,16 +2591,16 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             const struct kk_image *img = kk_rate_registry_find_locked(d->rate_params);
             lines++;
             if (img)
-               mesa_logi("kk-watch:   set %u binding %u[%u] @%u: %p %ux%u fmt %d s%u fdm=%d "
+               mesa_logi("%s   set %u binding %u[%u] @%u: %p %ux%u fmt %d s%u fdm=%d "
                          "map=%llu params_serial=%llu%s",
-                         s, b, e, at, (const void *)img, img->vk.extent.width,
+                         prefix, s, b, e, at, (const void *)img, img->vk.extent.width,
                          img->vk.extent.height, (int)img->vk.format, img->vk.samples,
                          img->implicit_fdm,
                          img->rate_ref ? (unsigned long long)img->rate_ref->serial : 0ull,
                          (unsigned long long)img->rate_params_serial,
                          img == target ? " (the target)" : "");
             else
-               mesa_logi("kk-watch:   set %u binding %u[%u] @%u: params of an unknown image", s,
+               mesa_logi("%s   set %u binding %u[%u] @%u: params of an unknown image", prefix, s,
                          b, e, at);
             simple_mtx_unlock(&kk_rate_registry_lock);
          }
