@@ -1840,10 +1840,15 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
          kk_fdm_publish(cmd, density, use, render->stencil_att.resolve_iview);
       }
    }
+   /* A runtime's map on the target (KK_METAL_FOVEATION) only for a pass with no map of
+    * its own: it returns no parameters otherwise, and overwriting an implicit pass's
+    * parameters left shaders' fragment positions untranslated, so every screen-space
+    * read from a fragment position landed at the foveated position (The Talos Principle
+    * VR: water, portals, jammer beams and temple shadows wrong, moving with gaze). */
 #ifdef THRESHOLD_SHARED_FOVEATION
-   if (tf_select_source(explicit_fdm_present, true, false) == TF_SOURCE_RUNTIME)
+   if (!params && tf_select_source(explicit_fdm_present, true, false) == TF_SOURCE_RUNTIME)
 #else
-   if (!explicit_fdm_present)
+   if (!params && !explicit_fdm_present)
 #endif
       params = kk_metal_foveation_setup(cmd, descriptor, screen);
    simple_mtx_unlock(&kk_fdm_lock);
@@ -2764,6 +2769,9 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
    const uint64_t latched = kk_implicit.latched.serial;
    simple_mtx_unlock(&kk_fdm_lock);
    lines++;
+   mesa_logi("%s root fdm_rate_params %llx, target params %llx", prefix,
+             (unsigned long long)cmd->state.gfx.descriptors.root.fdm_rate_params,
+             target && target->rate_params ? (unsigned long long)target->rate_params->gpu : 0ull);
    mesa_logi("%s FS-%08x draw into %p %ux%u fmt %d fdm=%d map=%llu latched=%llu",
              prefix, fs_hash, (const void *)target, target ? target->vk.extent.width : 0,
              target ? target->vk.extent.height : 0, target ? (int)target->vk.format : 0,
