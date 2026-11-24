@@ -714,6 +714,14 @@ kk_implicit_nomap(void)
          if (nomap)
             mesa_logi("kk-implicit: maps off (%s)", path);
       }
+      /* Or a "nomap" file in Monado's session recording folder. */
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      if (!nomap && session) {
+         snprintf(path, sizeof(path), "%s/nomap", session);
+         nomap = access(path, F_OK) == 0;
+         if (nomap)
+            mesa_logi("kk-implicit: maps off (%s)", path);
+      }
    }
    return nomap;
 }
