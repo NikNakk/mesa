@@ -6,6 +6,7 @@
  */
 
 #include "kk_image_view.h"
+#include "kk_fdm.h"
 
 #include "kk_device.h"
 #include "kk_entrypoints.h"
@@ -188,6 +189,7 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].sampled_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_sampled);
+         kk_implicit_note_view_id(view->planes[view_plane].sampled_gpu_resource_id, image);
       }
 
       if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
@@ -267,6 +269,7 @@ void
 kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
 {
    for (uint8_t plane = 0; plane < view->plane_count; plane++) {
+      kk_implicit_forget_view_id(view->planes[plane].sampled_gpu_resource_id);
       if (view->planes[plane].mtl_handle_sampled)
          mtl_release(view->planes[plane].mtl_handle_sampled);
 

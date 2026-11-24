@@ -133,6 +133,56 @@ kk_rate_registry_find_locked(uint64_t gpu)
    return NULL;
 }
 
+/* Sampled view ids of foveatable images, so a diagnostic can name the image behind a
+ * descriptor that carries no map. */
+static struct {
+   uint64_t id;
+   struct kk_image *image;
+} kk_view_ids[8192];
+static uint32_t kk_view_id_count;
+
+void
+kk_implicit_note_view_id(uint64_t id, struct kk_image *image)
+{
+   if (!id || !image || !image->rate_params)
+      return;
+   simple_mtx_lock(&kk_rate_registry_lock);
+   if (kk_view_id_count < ARRAY_SIZE(kk_view_ids)) {
+      kk_view_ids[kk_view_id_count].id = id;
+      kk_view_ids[kk_view_id_count++].image = image;
+   }
+   simple_mtx_unlock(&kk_rate_registry_lock);
+}
+
+void
+kk_implicit_forget_view_id(uint64_t id)
+{
+   if (!id)
+      return;
+   simple_mtx_lock(&kk_rate_registry_lock);
+   for (uint32_t i = 0; i < kk_view_id_count; i++) {
+      if (kk_view_ids[i].id == id) {
+         kk_view_ids[i] = kk_view_ids[--kk_view_id_count];
+         break;
+      }
+   }
+   simple_mtx_unlock(&kk_rate_registry_lock);
+}
+
+/* The live image behind a sampled view id, or NULL. Called with kk_rate_registry_lock. */
+static struct kk_image *
+kk_view_id_find_locked(uint64_t id)
+{
+   for (uint32_t i = 0; i < kk_view_id_count; i++) {
+      if (kk_view_ids[i].id != id)
+         continue;
+      for (uint32_t j = 0; j < kk_rate_registry_count; j++)
+         if (kk_rate_registry[j] == kk_view_ids[i].image)
+            return kk_view_ids[i].image;
+   }
+   return NULL;
+}
+
 static bool
 kk_fdm_debug(void)
 {
@@ -2589,6 +2639,21 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             if (!d->image_gpu_resource_id)
                continue;
             if (!d->rate_params) {
+               simple_mtx_lock(&kk_rate_registry_lock);
+               const struct kk_image *known = kk_view_id_find_locked(d->image_gpu_resource_id);
+               if (known) {
+                  lines++;
+                  mesa_logi("%s   set %u binding %u[%u] @%u: %p %ux%u fmt %d s%u fdm=%d map=%llu "
+                            "NO MAP IN DESCRIPTOR%s",
+                            prefix, s, b, e, at, (const void *)known, known->vk.extent.width,
+                            known->vk.extent.height, (int)known->vk.format, known->vk.samples,
+                            known->implicit_fdm,
+                            known->rate_ref ? (unsigned long long)known->rate_ref->serial : 0ull,
+                            known->implicit_fdm ? " (foveated image read raw)" : "");
+                  simple_mtx_unlock(&kk_rate_registry_lock);
+                  continue;
+               }
+               simple_mtx_unlock(&kk_rate_registry_lock);
                lines++;
                mesa_logi("%s   set %u%s binding %u[%u] @%u: no map (resource %llx)", prefix, s,
                          mapped == (const void *)set ? "" : (set ? "" : " push"), b, e, at,
