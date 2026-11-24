@@ -697,6 +697,27 @@ kk_implicit_runtime_frames(void)
 #endif
 }
 
+/* KK_IMPLICIT_NOMAP=1, or a file named after the capture trigger file plus ".nomap" when
+ * the process starts: passes render without maps. Read once, since images drawn under
+ * maps keep them. */
+static bool
+kk_implicit_nomap(void)
+{
+   static int nomap = -1;
+   if (nomap < 0) {
+      nomap = debug_get_bool_option("KK_IMPLICIT_NOMAP", false);
+      const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
+      char path[1024];
+      if (!nomap && trigger) {
+         snprintf(path, sizeof(path), "%s.nomap", trigger);
+         nomap = access(path, F_OK) == 0;
+         if (nomap)
+            mesa_logi("kk-implicit: maps off (%s)", path);
+      }
+   }
+   return nomap;
+}
+
 /* The driver-made density map for a target of this size. `new_frame`: the pass does
  * not load the target, so a new profile cannot leave it in two layouts. Called with
  * kk_fdm_lock held. */
@@ -1509,7 +1530,7 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
    bool implicit_density = false;
    simple_mtx_lock(&kk_fdm_lock);
    if (!density && kk_implicit_fdm_enabled() && !gfx->in_custom_resolve && !kk_implicit_raw_active() &&
-       !debug_get_bool_option("KK_IMPLICIT_NOMAP", false)) {
+       !kk_implicit_nomap()) {
       const struct kk_image_view *first =
          render->color_att_count && render->color_att[0].iview ? render->color_att[0].iview
                                                                : render->depth_att.iview;
