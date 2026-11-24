@@ -2423,6 +2423,15 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
          }
       }
    }
+   /* Each distinct fragment shader drawn, once (at most 256). */
+   static uint32_t seen[256], seen_count;
+   bool known = false;
+   for (uint32_t i = 0; i < seen_count; i++)
+      known |= seen[i] == fs_hash;
+   if (!known && seen_count < ARRAY_SIZE(seen)) {
+      seen[seen_count++] = fs_hash;
+      mesa_logi("kk-watch: drawn FS-%08x", fs_hash);
+   }
    bool hit = false;
    for (uint32_t i = 0; i < watched_count; i++)
       hit |= watched[i] == fs_hash;
