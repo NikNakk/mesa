@@ -26,6 +26,9 @@
 #include "kosmickrisp/bridge/mtl_rate_map.h"
 
 #include "util/log.h"
+#include <sys/stat.h>
+#include "util/u_math.h"
+#include "util/half_float.h"
 #include "util/u_atomic.h"
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
@@ -1772,6 +1775,11 @@ kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_im
          snprintf(path, sizeof(path), "%s.trace", trigger);
          enabled = access(path, F_OK) == 0;
       }
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      if (!enabled && session) {
+         snprintf(path, sizeof(path), "%s/trace", session);
+         enabled = access(path, F_OK) == 0;
+      }
    }
    if (!enabled)
       return;
@@ -2519,6 +2527,9 @@ kk_implicit_copy_map(struct kk_cmd_buffer *cmd, struct kk_image *src, struct kk_
  * is foveated and which map its parameters carry. Shows a texture read in a layout its
  * parameters do not describe. At most 400 lines.
  */
+static void kk_dump_note(struct kk_image *image, uint32_t mark);
+static void kk_dump_arm(uint32_t mark);
+
 void
 kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
 {
@@ -2596,6 +2607,8 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             mesa_logi("kk-mark %u: begin (%s)", mark_now, path);
          }
       }
+      if (mark_now && now >= mark_until_ns)
+         kk_dump_arm(mark_now);
       if (mark_now && now < mark_until_ns && !hit) {
          bool known_pair = false;
          for (uint32_t i = 0; i < mark_pair_count; i++)
@@ -2604,6 +2617,7 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             mark_pairs[mark_pair_count].fs = fs_hash;
             mark_pairs[mark_pair_count++].target = target;
             snprintf(prefix, sizeof(prefix), "kk-mark %u:", mark_now);
+            kk_dump_note((struct kk_image *)target, mark_now);
             hit = true;
             lines--; /* mark lines do not count against the watch limit */
             mark_lines += 8;
@@ -2671,6 +2685,8 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             if (!d->rate_params) {
                simple_mtx_lock(&kk_rate_registry_lock);
                const struct kk_image *known = kk_view_id_find_locked(d->image_gpu_resource_id);
+               if (known && !strncmp(prefix, "kk-mark", 7))
+                  kk_dump_note((struct kk_image *)known, mark_now);
                if (known) {
                   lines++;
                   mesa_logi("%s   set %u binding %u[%u] @%u: %p %ux%u fmt %d s%u fdm=%d map=%llu "
@@ -2692,6 +2708,8 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             }
             simple_mtx_lock(&kk_rate_registry_lock);
             const struct kk_image *img = kk_rate_registry_find_locked(d->rate_params);
+            if (img && !strncmp(prefix, "kk-mark", 7))
+               kk_dump_note((struct kk_image *)img, mark_now);
             lines++;
             if (img)
                mesa_logi("%s   set %u binding %u[%u] @%u: %p %ux%u fmt %d s%u fdm=%d "
@@ -2709,4 +2727,264 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
          }
       }
    }
+}
+
+/*
+ * Diagnostic: image dumps at Monado session marks. The images a mark window logs (the
+ * targets drawn into and the foveatable images sampled) are copied out at the start of
+ * the next primary command buffer after the window, through the unwarp when foveated
+ * (so they are in the application's layout), level 0 and up to three more mip levels
+ * as stored; two seconds later, when that work has completed, they are written to
+ * <XRT_SESSION_RECORD_DIR>/dumps as PPM (with .bin raw data).
+ */
+#define KK_DUMP_IMAGES 24
+#define KK_DUMP_CAPS 96
+static struct {
+   simple_mtx_t lock;
+   struct kk_image *images[KK_DUMP_IMAGES];
+   uint32_t image_count, mark, armed_mark;
+   bool pending;
+   struct {
+      struct kk_bo *bo;
+      struct kk_device *dev;
+      uint32_t w, h, bpp;
+      VkFormat format;
+      uint64_t at_ns;
+      char name[160];
+   } caps[KK_DUMP_CAPS];
+   uint32_t cap_count;
+} kk_dump = {.lock = SIMPLE_MTX_INITIALIZER};
+static volatile bool kk_dump_busy;
+
+static void
+kk_dump_note(struct kk_image *image, uint32_t mark)
+{
+   if (!image || !image->rate_params)
+      return;
+   simple_mtx_lock(&kk_dump.lock);
+   if (kk_dump.mark != mark) {
+      kk_dump.mark = mark;
+      kk_dump.image_count = 0;
+   }
+   bool known = false;
+   for (uint32_t i = 0; i < kk_dump.image_count; i++)
+      known |= kk_dump.images[i] == image;
+   if (!known && kk_dump.image_count < KK_DUMP_IMAGES)
+      kk_dump.images[kk_dump.image_count++] = image;
+   simple_mtx_unlock(&kk_dump.lock);
+}
+
+static void
+kk_dump_arm(uint32_t mark)
+{
+   simple_mtx_lock(&kk_dump.lock);
+   if (kk_dump.armed_mark != mark && kk_dump.mark == mark && kk_dump.image_count) {
+      kk_dump.armed_mark = mark;
+      kk_dump.pending = true;
+      kk_dump_busy = true;
+      mesa_logi("kk-dump: mark %u armed with %u image(s)", mark, kk_dump.image_count);
+   }
+   simple_mtx_unlock(&kk_dump.lock);
+}
+
+static float
+kk_dump_tone(float v)
+{
+   if (!(v > 0.0f))
+      return 0.0f;
+   v = v / (1.0f + v);
+   return powf(v, 1.0f / 2.2f);
+}
+
+static void
+kk_dump_write(const char *dir, const char *name, const uint8_t *data, uint32_t w, uint32_t h,
+              uint32_t bpp, VkFormat format)
+{
+   char path[1200];
+   snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+   FILE *f = fopen(path, "wb");
+   if (f) {
+      fwrite(data, 1, (size_t)w * h * bpp, f);
+      fclose(f);
+   }
+   uint8_t *rgb = malloc((size_t)w * h * 3);
+   if (!rgb)
+      return;
+   bool ok = true;
+   if (format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R32_SFLOAT) {
+      float lo = INFINITY, hi = -INFINITY;
+      for (size_t i = 0; i < (size_t)w * h; i++) {
+         float v = format == VK_FORMAT_R16_SFLOAT ? _mesa_half_to_float(((const uint16_t *)data)[i])
+                                                  : ((const float *)data)[i];
+         if (isfinite(v)) {
+            lo = MIN2(lo, v);
+            hi = MAX2(hi, v);
+         }
+      }
+      const float span = hi > lo ? hi - lo : 1.0f;
+      for (size_t i = 0; i < (size_t)w * h; i++) {
+         float v = format == VK_FORMAT_R16_SFLOAT ? _mesa_half_to_float(((const uint16_t *)data)[i])
+                                                  : ((const float *)data)[i];
+         uint8_t g = isfinite(v) ? (uint8_t)CLAMP(sqrtf((v - lo) / span) * 255.0f, 0, 255) : 255;
+         rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = g;
+      }
+   } else if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+      for (size_t i = 0; i < (size_t)w * h; i++)
+         for (int c = 0; c < 3; c++)
+            rgb[i * 3 + c] = (uint8_t)(kk_dump_tone(_mesa_half_to_float(((const uint16_t *)data)[i * 4 + c])) * 255.0f);
+   } else if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB) {
+      for (size_t i = 0; i < (size_t)w * h; i++) {
+         rgb[i * 3] = data[i * 4 + 2];
+         rgb[i * 3 + 1] = data[i * 4 + 1];
+         rgb[i * 3 + 2] = data[i * 4];
+      }
+   } else if (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB) {
+      for (size_t i = 0; i < (size_t)w * h; i++)
+         memcpy(&rgb[i * 3], &data[i * 4], 3);
+   } else {
+      ok = false;
+   }
+   if (ok) {
+      snprintf(path, sizeof(path), "%s/%s.ppm", dir, name);
+      f = fopen(path, "wb");
+      if (f) {
+         fprintf(f, "P6\n%u %u\n255\n", w, h);
+         fwrite(rgb, 1, (size_t)w * h * 3, f);
+         fclose(f);
+      }
+   }
+   free(rgb);
+}
+
+static void
+kk_dump_add_copy(struct kk_cmd_buffer *cmd, struct kk_image *image, mtl_texture *texture,
+                 uint32_t level, bool unwarped, uint32_t mark)
+{
+   simple_mtx_lock(&kk_dump.lock);
+   const bool full = kk_dump.cap_count >= KK_DUMP_CAPS;
+   simple_mtx_unlock(&kk_dump.lock);
+   if (full)
+      return;
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   const uint32_t w = u_minify(image->vk.extent.width, level);
+   const uint32_t h = u_minify(image->vk.extent.height, level);
+   const uint32_t bpp = vk_format_get_blocksize(image->vk.format);
+   struct kk_bo *bo = NULL;
+   if (kk_alloc_bo(dev, &dev->vk.base, (uint64_t)w * h * bpp, 0, &bo) != VK_SUCCESS)
+      return;
+   struct mtl_buffer_image_copy copy = {
+      .image_size = {w, h, 1},
+      .buffer = bo->map,
+      .image = texture,
+      .buffer_stride_B = (size_t)w * bpp,
+      .buffer_2d_image_size_B = (size_t)w * h * bpp,
+      .image_level = unwarped ? 0 : level,
+   };
+   mtl_copy_from_texture_to_buffer(cs_get_compute(cmd), &copy);
+   simple_mtx_lock(&kk_dump.lock);
+   if (kk_dump.cap_count >= KK_DUMP_CAPS) {
+      simple_mtx_unlock(&kk_dump.lock);
+      kk_destroy_bo(dev, bo);
+      return;
+   }
+   __typeof__(kk_dump.caps[0]) *c = &kk_dump.caps[kk_dump.cap_count++];
+   c->bo = bo;
+   c->dev = dev;
+   c->w = w;
+   c->h = h;
+   c->bpp = bpp;
+   c->format = image->vk.format;
+   c->at_ns = os_time_get_nano();
+   snprintf(c->name, sizeof(c->name), "mark%u_%p_%ux%u_fmt%d_level%u%s%s", mark, (void *)image,
+            image->vk.extent.width, image->vk.extent.height, image->vk.format, level,
+            image->implicit_fdm ? "_foveated" : "", unwarped ? "_unwarped" : "");
+   simple_mtx_unlock(&kk_dump.lock);
+}
+
+void
+kk_implicit_dump_begin(struct kk_cmd_buffer *cmd)
+{
+   if (!kk_dump_busy || cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return;
+   const char *session = getenv("XRT_SESSION_RECORD_DIR");
+   if (!session)
+      return;
+   /* Write the copies whose work has had two seconds to complete. The dump lock is
+    * never held with the rate registry's (the draw-time log takes them the other way). */
+   const uint64_t now = os_time_get_nano();
+   char dir[1100];
+   snprintf(dir, sizeof(dir), "%s/dumps", session);
+   for (;;) {
+      __typeof__(kk_dump.caps[0]) done = {0};
+      simple_mtx_lock(&kk_dump.lock);
+      for (uint32_t i = 0; i < kk_dump.cap_count; i++) {
+         if (now - kk_dump.caps[i].at_ns >= 2000000000ull) {
+            done = kk_dump.caps[i];
+            kk_dump.caps[i] = kk_dump.caps[--kk_dump.cap_count];
+            break;
+         }
+      }
+      simple_mtx_unlock(&kk_dump.lock);
+      if (!done.bo)
+         break;
+      mkdir(dir, 0755);
+      kk_dump_write(dir, done.name, done.bo->cpu, done.w, done.h, done.bpp, done.format);
+      kk_destroy_bo(done.dev, done.bo);
+      mesa_logi("kk-dump: wrote %s", done.name);
+   }
+
+   struct kk_image *images[KK_DUMP_IMAGES];
+   uint32_t count = 0, mark = 0;
+   simple_mtx_lock(&kk_dump.lock);
+   if (kk_dump.pending) {
+      kk_dump.pending = false;
+      count = kk_dump.image_count;
+      mark = kk_dump.armed_mark;
+      memcpy(images, kk_dump.images, count * sizeof(images[0]));
+   }
+   simple_mtx_unlock(&kk_dump.lock);
+
+   if (count) {
+      /* Earlier work on these images first. */
+      const VkMemoryBarrier2 all = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+         .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+      };
+      const VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                    .memoryBarrierCount = 1, .pMemoryBarriers = &all};
+      kk_CmdPipelineBarrier2(kk_cmd_buffer_to_handle(cmd), &dep);
+      for (uint32_t i = 0; i < count; i++) {
+         struct kk_image *image = images[i];
+         /* Still alive? (Foveatable images stay in the rate registry while they live.) */
+         bool alive = false;
+         simple_mtx_lock(&kk_rate_registry_lock);
+         for (uint32_t j = 0; j < kk_rate_registry_count; j++)
+            alive |= kk_rate_registry[j] == image;
+         simple_mtx_unlock(&kk_rate_registry_lock);
+         if (!alive || vk_format_is_depth_or_stencil(image->vk.format) ||
+             image->vk.samples != VK_SAMPLE_COUNT_1_BIT || image->vk.array_layers != 1)
+            continue;
+         VkImage unwarp = image->implicit_fdm
+                             ? kk_implicit_unwarp_for_copy(cmd, image, VK_IMAGE_LAYOUT_GENERAL, NULL)
+                             : VK_NULL_HANDLE;
+         if (cmd->metal.render != NULL)
+            cs_end(cmd);
+         mtl_barrier_after_encoder_stages(cs_get_compute(cmd), MTL_STAGE_ALL,
+                                          MTL_STAGE_BLIT | MTL_STAGE_DISPATCH);
+         if (unwarp != VK_NULL_HANDLE)
+            kk_dump_add_copy(cmd, image, kk_image_from_handle(unwarp)->planes[0].mtl_handle, 0, true,
+                             mark);
+         for (uint32_t level = 0; level < MIN2(image->vk.mip_levels, 4); level++)
+            kk_dump_add_copy(cmd, image, image->planes[0].mtl_handle, level, false, mark);
+      }
+      kk_fdm_order_for_next_encoder(cmd);
+      kk_CmdPipelineBarrier2(kk_cmd_buffer_to_handle(cmd), &dep);
+      mesa_logi("kk-dump: mark %u copies recorded", mark);
+   }
+   simple_mtx_lock(&kk_dump.lock);
+   kk_dump_busy = kk_dump.pending || kk_dump.cap_count;
+   simple_mtx_unlock(&kk_dump.lock);
 }

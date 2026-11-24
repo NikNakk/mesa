@@ -400,6 +400,19 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       level0 &= pCopyImageInfo->pRegions[r].srcSubresource.mipLevel == 0;
    VkImage unwarp = level0 ? kk_implicit_unwarp_for_copy(cmd, src, pCopyImageInfo->srcImageLayout, dst)
                            : VK_NULL_HANDLE;
+   /* Diagnostic (session marks): copies out of foveated images, first few. */
+   if (src->implicit_fdm && getenv("XRT_SESSION_RECORD_DIR")) {
+      static uint32_t told;
+      for (uint32_t r = 0; r < pCopyImageInfo->regionCount && told < 48; r++, told++) {
+         const VkImageCopy2 *g = &pCopyImageInfo->pRegions[r];
+         mesa_logi("kk-copy: %p -> %p (dst fdm=%d) region %u: src level %u layer %u off %d,%d "
+                   "dst level %u off %d,%d extent %ux%u; %s",
+                   (void *)src, (void *)dst, dst->implicit_fdm, r, g->srcSubresource.mipLevel,
+                   g->srcSubresource.baseArrayLayer, g->srcOffset.x, g->srcOffset.y,
+                   g->dstSubresource.mipLevel, g->dstOffset.x, g->dstOffset.y, g->extent.width,
+                   g->extent.height, unwarp ? "through the unwarp" : "raw");
+      }
+   }
    if (unwarp != VK_NULL_HANDLE) {
       VkCopyImageInfo2 info = *pCopyImageInfo;
       info.srcImage = unwarp;

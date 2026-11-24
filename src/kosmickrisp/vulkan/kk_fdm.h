@@ -127,4 +127,6 @@ void kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash);
 void kk_implicit_note_view_id(uint64_t id, struct kk_image *image);
 void kk_implicit_forget_view_id(uint64_t id);
 
+void kk_implicit_dump_begin(struct kk_cmd_buffer *cmd);
+
 #endif

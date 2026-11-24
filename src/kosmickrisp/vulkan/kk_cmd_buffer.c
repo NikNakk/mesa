@@ -529,6 +529,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->state.gfx.pending_barrier_src = MTL_STAGE_ALL;
    cmd->state.gfx.pending_barrier_dst = MTL_STAGE_ALL;
 
+   kk_implicit_dump_begin(cmd);
    return VK_SUCCESS;
 
 fail_allocator:
