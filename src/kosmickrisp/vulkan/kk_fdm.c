@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 
 void
@@ -1653,8 +1654,16 @@ void
 kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_image *b)
 {
    static int enabled = -1;
-   if (enabled < 0)
+   if (enabled < 0) {
       enabled = debug_get_bool_option("KK_IMPLICIT_TRACE", false);
+      /* Or a file named after the capture trigger file plus ".trace". */
+      const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
+      char path[1024];
+      if (!enabled && trigger) {
+         snprintf(path, sizeof(path), "%s.trace", trigger);
+         enabled = access(path, F_OK) == 0;
+      }
+   }
    if (!enabled)
       return;
    {
@@ -2407,6 +2416,7 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
    static uint32_t watched[16], watched_count;
    static int loaded;
    static uint32_t lines;
+   static bool watch_all;
    if (!loaded) {
       loaded = 1;
       const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
@@ -2415,9 +2425,13 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
          snprintf(path, sizeof(path), "%s.watch", trigger);
          FILE *f = fopen(path, "r");
          if (f) {
-            unsigned v;
-            while (watched_count < ARRAY_SIZE(watched) && fscanf(f, " %x", &v) == 1)
-               watched[watched_count++] = v;
+            char word[64];
+            while (watched_count < ARRAY_SIZE(watched) && fscanf(f, " %63s", word) == 1) {
+               if (!strcmp(word, "all"))
+                  watch_all = true;
+               else
+                  watched[watched_count++] = (uint32_t)strtoul(word, NULL, 16);
+            }
             fclose(f);
             mesa_logi("kk-watch: %u shader(s) from %s", watched_count, path);
          }
@@ -2435,14 +2449,27 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
    bool hit = false;
    for (uint32_t i = 0; i < watched_count; i++)
       hit |= watched[i] == fs_hash;
-   if (!hit || lines >= 400)
-      return;
 
    struct kk_rendering_state *render = &cmd->state.gfx.render;
    const struct kk_image_view *tv =
       render->color_att_count && render->color_att[0].iview ? render->color_att[0].iview
                                                             : render->depth_att.iview;
    const struct kk_image *target = tv ? container_of(tv->vk.image, struct kk_image, vk) : NULL;
+   /* "all": every distinct shader and target pair, once. */
+   if (!hit && watch_all) {
+      static struct { uint32_t fs; const void *target; } pairs[1024];
+      static uint32_t pair_count;
+      bool known_pair = false;
+      for (uint32_t i = 0; i < pair_count; i++)
+         known_pair |= pairs[i].fs == fs_hash && pairs[i].target == target;
+      if (!known_pair && pair_count < ARRAY_SIZE(pairs)) {
+         pairs[pair_count].fs = fs_hash;
+         pairs[pair_count++].target = target;
+         hit = true;
+      }
+   }
+   if (!hit || lines >= 6000)
+      return;
    simple_mtx_lock(&kk_fdm_lock);
    const uint64_t latched = kk_implicit.latched.serial;
    simple_mtx_unlock(&kk_fdm_lock);
