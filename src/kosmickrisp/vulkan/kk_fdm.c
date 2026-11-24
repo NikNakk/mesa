@@ -2702,6 +2702,35 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
                                                             : render->depth_att.iview;
    const struct kk_image *target = tv ? container_of(tv->vk.image, struct kk_image, vk) : NULL;
 
+   /* Draws into a foveated image whose viewport does not cover it (a reduced-size
+    * effect drawn into a corner, say): the image's map covers the whole image. */
+   if (target && target->implicit_fdm) {
+      const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+      const VkViewport *vp = &dyn->vp.viewports[0];
+      const uint32_t level = tv->vk.base_mip_level;
+      const float w = (float)u_minify(target->vk.extent.width, level);
+      const float h = (float)u_minify(target->vk.extent.height, level);
+      if (fabsf(vp->x) > 0.5f || fabsf(vp->y) > 0.5f || fabsf(fabsf(vp->width) - w) > 0.5f ||
+          fabsf(fabsf(vp->height) - h) > 0.5f || render->area.extent.width + 1 < w ||
+          render->area.extent.height + 1 < h) {
+         static struct { const void *t; int x, y, w, h; uint32_t fs; } seen[128];
+         static uint32_t count;
+         bool known = false;
+         for (uint32_t i = 0; i < count; i++)
+            known |= seen[i].t == target && seen[i].x == (int)vp->x && seen[i].y == (int)vp->y &&
+                     seen[i].w == (int)vp->width && seen[i].h == (int)vp->height && seen[i].fs == fs_hash;
+         if (!known && count < ARRAY_SIZE(seen)) {
+            seen[count++] = (__typeof__(seen[0])){target, (int)vp->x, (int)vp->y,
+                                                  (int)vp->width, (int)vp->height, fs_hash};
+            mesa_logi("kk-vp: FS-%08x into foveated %p %ux%u level %u: viewport %.0f,%.0f %.0fx%.0f, "
+                      "render area %d,%d %ux%u", fs_hash, (const void *)target,
+                      target->vk.extent.width, target->vk.extent.height, level, vp->x, vp->y,
+                      vp->width, vp->height, render->area.offset.x, render->area.offset.y,
+                      render->area.extent.width, render->area.extent.height);
+         }
+      }
+   }
+
    /* Session marks: XRT_SESSION_RECORD_DIR is Monado's recording folder, where each
     * mark (Enter in the recorder, or both thumbsticks held) saves mark_<n>.ppm. For
     * half a second after a new one, every distinct shader and target pair is logged
