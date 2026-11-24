@@ -2060,7 +2060,22 @@ kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
       .pRegions = &region,
       .filter = VK_FILTER_NEAREST,
    };
+   /* The unwarp is a render pass and the caller's copy then reads its result, which the
+    * application's barrier (around its one copy) cannot order: without these, the copy
+    * could read what an earlier unwarp of this image left (The Talos Principle VR's water
+    * showed its reflection view instead of the scene behind it). */
+   const VkMemoryBarrier2 all = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+   };
+   const VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                 .memoryBarrierCount = 1, .pMemoryBarriers = &all};
+   kk_CmdPipelineBarrier2(kk_cmd_buffer_to_handle(cmd), &dep);
    kk_CmdBlitImage2(kk_cmd_buffer_to_handle(cmd), &blit);
+   kk_CmdPipelineBarrier2(kk_cmd_buffer_to_handle(cmd), &dep);
    return unwarp;
 }
 
