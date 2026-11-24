@@ -425,6 +425,7 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       info.srcImage = unwarp;
       info.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
       kk_CmdCopyImage2(commandBuffer, &info);
+      kk_implicit_dump_after_copy(cmd, src, dst);
       return;
    }
    kk_fdm_note_use(&src->vk, "copy source");

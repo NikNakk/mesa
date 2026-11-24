@@ -132,4 +132,6 @@ void kk_implicit_dump_begin(struct kk_cmd_buffer *cmd);
 void kk_implicit_fov_op(const char *what, const struct kk_image *src, const struct kk_image *dst,
                         uint32_t level, const char *path);
 
+void kk_implicit_dump_after_copy(struct kk_cmd_buffer *cmd, struct kk_image *src, struct kk_image *dst);
+
 #endif

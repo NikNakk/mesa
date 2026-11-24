@@ -2076,6 +2076,20 @@ kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
    kk_CmdPipelineBarrier2(kk_cmd_buffer_to_handle(cmd), &dep);
    kk_CmdBlitImage2(kk_cmd_buffer_to_handle(cmd), &blit);
    kk_CmdPipelineBarrier2(kk_cmd_buffer_to_handle(cmd), &dep);
+   /* Diagnostic: which command buffer each unwarp of a source lands in, first 60. */
+   if (getenv("XRT_SESSION_RECORD_DIR")) {
+      static struct { const void *src, *cmd, *dst; } seen[256];
+      static uint32_t count;
+      bool known = false;
+      for (uint32_t i = 0; i < count; i++)
+         known |= seen[i].src == src && seen[i].cmd == cmd && seen[i].dst == dst;
+      if (!known && count < ARRAY_SIZE(seen))
+         seen[count++] = (__typeof__(seen[0])){src, cmd, dst};
+      if (!known && count < ARRAY_SIZE(seen))
+         mesa_logi("kk-unwarp: src %p fmt %d into %p, command buffer %p, dst %p, at %llu ms",
+                   (void *)src, src->vk.format, (void *)unwarp, (void *)cmd, (const void *)dst,
+                   (unsigned long long)(os_time_get_nano() / 1000000ull));
+   }
    return unwarp;
 }
 
@@ -2878,7 +2892,7 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
 static struct {
    simple_mtx_t lock;
    struct kk_image *images[KK_DUMP_IMAGES];
-   uint32_t image_count, mark, armed_mark;
+   uint32_t image_count, mark, armed_mark, copy_capture_mark;
    bool pending;
    struct {
       struct kk_bo *bo;
@@ -2919,6 +2933,7 @@ kk_dump_arm(uint32_t mark)
    if (kk_dump.armed_mark != mark && kk_dump.mark == mark && kk_dump.image_count) {
       kk_dump.armed_mark = mark;
       kk_dump.pending = true;
+      kk_dump.copy_capture_mark = mark;
       kk_dump_busy = true;
       mesa_logi("kk-dump: mark %u armed with %u image(s)", mark, kk_dump.image_count);
    }
@@ -3167,4 +3182,42 @@ kk_implicit_fov_op(const char *what, const struct kk_image *src, const struct kk
                 dst ? dst->implicit_fdm : 0, path);
    }
    simple_mtx_unlock(&kk_fdm_lock);
+}
+
+/* Diagnostic: right after an armed mark, the next copy out of a foveated image is
+ * captured as its destination holds it then (what later passes read), as
+ * mark<n>_..._aftercopy. Called with no render pass open. */
+void
+kk_implicit_dump_after_copy(struct kk_cmd_buffer *cmd, struct kk_image *src, struct kk_image *dst)
+{
+   if (!src->implicit_fdm || dst->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       vk_format_is_depth_or_stencil(dst->vk.format) || dst->vk.array_layers != 1)
+      return;
+   simple_mtx_lock(&kk_dump.lock);
+   uint32_t mark = kk_dump.copy_capture_mark;
+   bool logged = false;
+   for (uint32_t i = 0; i < kk_dump.image_count; i++)
+      logged |= kk_dump.images[i] == dst;
+   if (!logged)
+      mark = 0;
+   if (mark)
+      kk_dump.copy_capture_mark = 0;
+   simple_mtx_unlock(&kk_dump.lock);
+   if (!mark)
+      return;
+   if (cmd->metal.render != NULL)
+      cs_end(cmd);
+   mtl_barrier_after_encoder_stages(cs_get_compute(cmd), MTL_STAGE_ALL,
+                                    MTL_STAGE_BLIT | MTL_STAGE_DISPATCH);
+   kk_dump_add_copy(cmd, dst, dst->planes[0].mtl_handle, 0, false, mark);
+   kk_fdm_order_for_next_encoder(cmd);
+   simple_mtx_lock(&kk_dump.lock);
+   if (kk_dump.cap_count) {
+      char *name = kk_dump.caps[kk_dump.cap_count - 1].name;
+      strncat(name, "_aftercopy", sizeof(kk_dump.caps[0].name) - strlen(name) - 1);
+   }
+   kk_dump_busy = true;
+   simple_mtx_unlock(&kk_dump.lock);
+   mesa_logi("kk-dump: mark %u captured %p right after a copy from %p", mark, (void *)dst,
+             (void *)src);
 }
