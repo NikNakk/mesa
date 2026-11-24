@@ -2483,10 +2483,23 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
 
    struct kk_descriptor_state *desc = &cmd->state.gfx.descriptors;
    for (uint32_t s = 0; s < KK_MAX_SETS; s++) {
+      /* An allocated set, else a push set. */
       const struct kk_descriptor_set *set = desc->sets[s];
-      if (set == NULL || set->layout == NULL || set->mapped_ptr == NULL)
+      const struct kk_push_descriptor_set *push = desc->push[s];
+      const struct kk_descriptor_set_layout *layout;
+      const void *mapped;
+      uint32_t size;
+      if (set && set->layout && set->mapped_ptr) {
+         layout = set->layout;
+         mapped = set->mapped_ptr;
+         size = set->size;
+      } else if (push && push->layout) {
+         layout = push->layout;
+         mapped = push->data;
+         size = sizeof(push->data);
+      } else {
          continue;
-      const struct kk_descriptor_set_layout *layout = set->layout;
+      }
       for (uint32_t b = 0; b < layout->binding_count; b++) {
          const struct kk_descriptor_set_binding_layout *bl = &layout->binding[b];
          if (bl->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
@@ -2494,15 +2507,17 @@ kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
             continue;
          for (uint32_t e = 0; e < MIN2(bl->array_size, 4); e++) {
             const uint32_t at = bl->offset + e * bl->stride;
-            if (at + sizeof(struct kk_sampled_image_descriptor) > set->size)
+            if (at + sizeof(struct kk_sampled_image_descriptor) > size)
                break;
             const struct kk_sampled_image_descriptor *d =
-               (const void *)((const uint8_t *)set->mapped_ptr + at);
+               (const void *)((const uint8_t *)mapped + at);
             if (!d->image_gpu_resource_id)
                continue;
             if (!d->rate_params) {
                lines++;
-               mesa_logi("kk-watch:   set %u binding %u[%u] @%u: no map", s, b, e, at);
+               mesa_logi("kk-watch:   set %u%s binding %u[%u] @%u: no map (resource %llx)", s,
+                         mapped == (const void *)set ? "" : (set ? "" : " push"), b, e, at,
+                         (unsigned long long)d->image_gpu_resource_id);
                continue;
             }
             simple_mtx_lock(&kk_rate_registry_lock);
