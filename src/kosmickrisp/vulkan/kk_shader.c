@@ -2935,6 +2935,7 @@ kk_msl_deserialize(struct blob_reader *blob, mesa_shader_stage stage,
    if (blob->overrun)
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
+   shader->diagnostic_msl_hash = _mesa_hash_string(data->code);
    kk_dump_msl(stage, data->code);
    return VK_SUCCESS;
 }

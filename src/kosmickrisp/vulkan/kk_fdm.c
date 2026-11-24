@@ -2393,3 +2393,99 @@ kk_implicit_copy_map(struct kk_cmd_buffer *cmd, struct kk_image *src, struct kk_
    dst->rate_params_serial = params->serial;
    simple_mtx_unlock(&kk_fdm_lock);
 }
+
+/*
+ * Diagnostic: for draws whose fragment shader's MSL hash is listed in a file named after
+ * the capture trigger file plus ".watch" (hex hashes, as the MSL dump names them), log
+ * the pass's target and every sampled image the bound sets give the shader: whether it
+ * is foveated and which map its parameters carry. Shows a texture read in a layout its
+ * parameters do not describe. At most 400 lines.
+ */
+void
+kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash)
+{
+   static uint32_t watched[16], watched_count;
+   static int loaded;
+   static uint32_t lines;
+   if (!loaded) {
+      loaded = 1;
+      const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
+      char path[1024];
+      if (trigger) {
+         snprintf(path, sizeof(path), "%s.watch", trigger);
+         FILE *f = fopen(path, "r");
+         if (f) {
+            unsigned v;
+            while (watched_count < ARRAY_SIZE(watched) && fscanf(f, " %x", &v) == 1)
+               watched[watched_count++] = v;
+            fclose(f);
+            mesa_logi("kk-watch: %u shader(s) from %s", watched_count, path);
+         }
+      }
+   }
+   bool hit = false;
+   for (uint32_t i = 0; i < watched_count; i++)
+      hit |= watched[i] == fs_hash;
+   if (!hit || lines >= 400)
+      return;
+
+   struct kk_rendering_state *render = &cmd->state.gfx.render;
+   const struct kk_image_view *tv =
+      render->color_att_count && render->color_att[0].iview ? render->color_att[0].iview
+                                                            : render->depth_att.iview;
+   const struct kk_image *target = tv ? container_of(tv->vk.image, struct kk_image, vk) : NULL;
+   simple_mtx_lock(&kk_fdm_lock);
+   const uint64_t latched = kk_implicit.latched.serial;
+   simple_mtx_unlock(&kk_fdm_lock);
+   lines++;
+   mesa_logi("kk-watch: FS-%08x draw into %p %ux%u fmt %d fdm=%d map=%llu latched=%llu",
+             fs_hash, (const void *)target, target ? target->vk.extent.width : 0,
+             target ? target->vk.extent.height : 0, target ? (int)target->vk.format : 0,
+             target ? target->implicit_fdm : 0,
+             target && target->rate_ref ? (unsigned long long)target->rate_ref->serial : 0ull,
+             (unsigned long long)latched);
+
+   struct kk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   for (uint32_t s = 0; s < KK_MAX_SETS; s++) {
+      const struct kk_descriptor_set *set = desc->sets[s];
+      if (set == NULL || set->layout == NULL || set->mapped_ptr == NULL)
+         continue;
+      const struct kk_descriptor_set_layout *layout = set->layout;
+      for (uint32_t b = 0; b < layout->binding_count; b++) {
+         const struct kk_descriptor_set_binding_layout *bl = &layout->binding[b];
+         if (bl->type != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+             bl->type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            continue;
+         for (uint32_t e = 0; e < MIN2(bl->array_size, 4); e++) {
+            const uint32_t at = bl->offset + e * bl->stride;
+            if (at + sizeof(struct kk_sampled_image_descriptor) > set->size)
+               break;
+            const struct kk_sampled_image_descriptor *d =
+               (const void *)((const uint8_t *)set->mapped_ptr + at);
+            if (!d->image_gpu_resource_id)
+               continue;
+            if (!d->rate_params) {
+               lines++;
+               mesa_logi("kk-watch:   set %u binding %u[%u] @%u: no map", s, b, e, at);
+               continue;
+            }
+            simple_mtx_lock(&kk_rate_registry_lock);
+            const struct kk_image *img = kk_rate_registry_find_locked(d->rate_params);
+            lines++;
+            if (img)
+               mesa_logi("kk-watch:   set %u binding %u[%u] @%u: %p %ux%u fmt %d s%u fdm=%d "
+                         "map=%llu params_serial=%llu%s",
+                         s, b, e, at, (const void *)img, img->vk.extent.width,
+                         img->vk.extent.height, (int)img->vk.format, img->vk.samples,
+                         img->implicit_fdm,
+                         img->rate_ref ? (unsigned long long)img->rate_ref->serial : 0ull,
+                         (unsigned long long)img->rate_params_serial,
+                         img == target ? " (the target)" : "");
+            else
+               mesa_logi("kk-watch:   set %u binding %u[%u] @%u: params of an unknown image", s,
+                         b, e, at);
+            simple_mtx_unlock(&kk_rate_registry_lock);
+         }
+      }
+   }
+}

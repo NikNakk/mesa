@@ -121,4 +121,7 @@ void kk_vrs_note_draw(struct kk_cmd_buffer *cmd);
 void kk_vrs_end(struct kk_cmd_buffer *cmd);
 void kk_vrs_frame(void);
 
+struct kk_cmd_buffer;
+void kk_implicit_watch_draw(struct kk_cmd_buffer *cmd, uint32_t fs_hash);
+
 #endif

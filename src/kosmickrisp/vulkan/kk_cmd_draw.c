@@ -2157,6 +2157,8 @@ kk_flush_gfx_state(struct kk_cmd_buffer *cmd)
    }
 
    struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
+   if (fs && getenv("KK_CAPTURE_TRIGGER_FILE"))
+      kk_implicit_watch_draw(cmd, fs->diagnostic_msl_hash);
    if (debug_get_option_kk_descriptor_diag() && fs &&
        fs->diagnostic_msl_hash == 0x0e188069) {
       static_assert(offsetof(struct kk_root_descriptor_table, sets[0]) == 928, "set 0");
