@@ -1682,6 +1682,32 @@ kk_compile_tile_variant(struct kk_physical_device *pdev, struct kk_shader *shade
    ralloc_free(tile);
 }
 
+/* KK_MSL_DUMP_DIR, or else a directory named after the capture trigger file plus ".msl"
+ * when one exists (so a dump can be turned on without relaunching): each shader's MSL,
+ * whether compiled now or loaded from a pipeline cache. */
+static void
+kk_dump_msl(mesa_shader_stage stage, const char *code)
+{
+   const char *msl_dump_dir = getenv("KK_MSL_DUMP_DIR");
+   char trigger_dir[1024];
+   const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
+   if (!msl_dump_dir && trigger) {
+      snprintf(trigger_dir, sizeof(trigger_dir), "%s.msl", trigger);
+      if (access(trigger_dir, F_OK) == 0)
+         msl_dump_dir = trigger_dir;
+   }
+   if (!msl_dump_dir || !code)
+      return;
+   char path[1024];
+   snprintf(path, sizeof(path), "%s/%s-%08x.metal", msl_dump_dir,
+            _mesa_shader_stage_to_abbrev(stage), _mesa_hash_string(code));
+   FILE *f = fopen(path, "wx");
+   if (f) {
+      fputs(code, f);
+      fclose(f);
+   }
+}
+
 static VkResult
 kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
@@ -1982,27 +2008,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       mesa_logi("kk-gpu-diag: instrumented FS-0e188069 root_offset=%zu",
                 offsetof(struct kk_root_descriptor_table, diagnostic_gpu));
    }
-   /* KK_MSL_DUMP_DIR, or else a directory named after the capture trigger file plus
-    * ".msl" when one exists (so a dump can be turned on without relaunching). */
-   const char *msl_dump_dir = getenv("KK_MSL_DUMP_DIR");
-   char trigger_dir[1024];
-   const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
-   if (!msl_dump_dir && trigger) {
-      snprintf(trigger_dir, sizeof(trigger_dir), "%s.msl", trigger);
-      if (access(trigger_dir, F_OK) == 0)
-         msl_dump_dir = trigger_dir;
-   }
-   if (msl_dump_dir) {
-      char path[1024];
-      snprintf(path, sizeof(path), "%s/%s-%08x.metal", msl_dump_dir,
-               _mesa_shader_stage_to_abbrev(stage),
-               _mesa_hash_string(data->code));
-      FILE *f = fopen(path, "wx");
-      if (f) {
-         fputs(data->code, f);
-         fclose(f);
-      }
-   }
+   kk_dump_msl(stage, data->code);
 
    ralloc_free(nir);
 
@@ -2929,6 +2935,7 @@ kk_msl_deserialize(struct blob_reader *blob, mesa_shader_stage stage,
    if (blob->overrun)
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
+   kk_dump_msl(stage, data->code);
    return VK_SUCCESS;
 }
 
