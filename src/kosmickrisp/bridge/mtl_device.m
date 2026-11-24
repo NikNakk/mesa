@@ -120,13 +120,24 @@ mtl_gpu_capture_active(void)
    return active;
 }
 
+/* `foveated`: the caller is submitting work that used implicit foveation. With
+ * KK_CAPTURE_FOVEATED_ONLY=1 only such a submission starts the triggered capture, so
+ * it records the device that renders the eyes rather than whichever of the process's
+ * devices (an OpenXR layer's, say) begins a command buffer first. */
 void
-mtl_poll_gpu_capture(mtl_device *device)
+mtl_poll_gpu_capture_foveated(mtl_device *device, bool foveated)
 {
    const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
    if (!trigger)
       return;
+   static int foveated_only = -1;
+   if (foveated_only < 0) {
+      const char *v = getenv("KK_CAPTURE_FOVEATED_ONLY");
+      foveated_only = v && !strcmp(v, "1");
+   }
    @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+      if (foveated_only && !foveated && !capture_window_active)
+         return;
       if (capture_window_active && capture_window_end > 0.0 &&
           capture_time() >= capture_window_end) {
          [[MTLCaptureManager sharedCaptureManager] stopCapture];
@@ -143,6 +154,12 @@ mtl_poll_gpu_capture(mtl_device *device)
          capture_window_end = capture_time() + (duration > 0 && duration <= 5 ? duration : 0.25);
       }
    }
+}
+
+void
+mtl_poll_gpu_capture(mtl_device *device)
+{
+   mtl_poll_gpu_capture_foveated(device, false);
 }
 
 void

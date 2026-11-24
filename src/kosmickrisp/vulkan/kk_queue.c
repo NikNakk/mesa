@@ -657,6 +657,19 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       }
    }
 
+   /* KK_CAPTURE_FOVEATED_ONLY=1: a triggered capture starts at a submission that used
+    * implicit foveation (mtl_poll_gpu_capture_foveated). */
+   if (getenv("KK_CAPTURE_TRIGGER_FILE")) {
+      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+         struct kk_cmd_buffer *cmd =
+            container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+         if (util_dynarray_num_elements(&cmd->fdm_params, struct kk_fdm_params *)) {
+            mtl_poll_gpu_capture_foveated(dev->mtl_handle, true);
+            break;
+         }
+      }
+   }
+
    bool tripwire = !strcmp(debug_get_option("KK_TURN_PROBE", ""), "tripwire");
    if (dev->diagnostic_bo && tripwire && (++dev->diagnostic_submits % 60 == 0)) {
       uint32_t d[320];

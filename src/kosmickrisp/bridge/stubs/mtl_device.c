@@ -41,6 +41,11 @@ mtl_poll_gpu_capture(mtl_device *device)
 {
 }
 
+void
+mtl_poll_gpu_capture_foveated(mtl_device *device, bool foveated)
+{
+}
+
 /* Device feature query */
 void
 mtl_device_get_name(mtl_device *dev, char buffer[256])
