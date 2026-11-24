@@ -6,6 +6,7 @@
  */
 
 #include "kk_shader.h"
+#include <unistd.h>
 #include "kk_fdm.h"
 
 #include "kk_cmd_buffer.h"
@@ -1981,7 +1982,16 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       mesa_logi("kk-gpu-diag: instrumented FS-0e188069 root_offset=%zu",
                 offsetof(struct kk_root_descriptor_table, diagnostic_gpu));
    }
+   /* KK_MSL_DUMP_DIR, or else a directory named after the capture trigger file plus
+    * ".msl" when one exists (so a dump can be turned on without relaunching). */
    const char *msl_dump_dir = getenv("KK_MSL_DUMP_DIR");
+   char trigger_dir[1024];
+   const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
+   if (!msl_dump_dir && trigger) {
+      snprintf(trigger_dir, sizeof(trigger_dir), "%s.msl", trigger);
+      if (access(trigger_dir, F_OK) == 0)
+         msl_dump_dir = trigger_dir;
+   }
    if (msl_dump_dir) {
       char path[1024];
       snprintf(path, sizeof(path), "%s/%s-%08x.metal", msl_dump_dir,
