@@ -60,6 +60,9 @@ write_desc(struct kk_descriptor_set *set, uint32_t binding, uint32_t elem,
    memcpy(dst, desc_data, desc_size);
 }
 
+/* Diagnostic: which entry point is writing descriptors on this thread. */
+static _Thread_local const char *kk_desc_path = "?";
+
 static void
 get_sampled_image_view_desc(VkDescriptorType descriptor_type,
                             const VkDescriptorImageInfo *const info, void *dst,
@@ -99,6 +102,17 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          desc[plane].rate_params =
             image->rate_params && !is_input_attachment && !kk_implicit_raw_active()
                ? image->rate_params->gpu : 0;
+         /* Diagnostic: a foveatable image written without its parameters, once each. */
+         if (image->implicit_candidate && !desc[plane].rate_params &&
+             !((struct kk_image *)image)->implicit_unwarp_logged) {
+            static uint32_t told;
+            if (told++ < 64)
+               mesa_logi("kk-desc: %ux%u fmt %d image %p written without map (%s, type %d, %s)",
+                         image->vk.extent.width, image->vk.extent.height, image->vk.format,
+                         (const void *)image,
+                         !image->rate_params ? "no parameters" :
+                         is_input_attachment ? "input attachment" : "raw", descriptor_type, kk_desc_path);
+         }
          desc[plane].rate_base_layer = view->vk.base_array_layer;
          /* A foveated image keeps one normalised layout at every mip level, so its
           * translation works in level-0 pixels whatever the view's base level. */
@@ -358,6 +372,7 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   kk_desc_path = "update";
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *write = &pDescriptorWrites[w];
       VK_FROM_HANDLE(kk_descriptor_set, set, write->dstSet);
@@ -479,6 +494,7 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
                               uint32_t write_count,
                               const VkWriteDescriptorSet *writes)
 {
+   kk_desc_path = "push";
    struct kk_descriptor_set_layout *layout = push_set->layout;
    assert(layout->non_variable_descriptor_buffer_size < sizeof(push_set->data));
    struct kk_descriptor_set set = {
@@ -691,6 +707,7 @@ kk_descriptor_set_create(struct kk_device *dev, struct kk_descriptor_pool *pool,
                          uint32_t variable_count,
                          struct kk_descriptor_set **out_set)
 {
+   kk_desc_path = "create";
    struct kk_descriptor_set *set;
    VkResult result = VK_SUCCESS;
 
@@ -842,6 +859,7 @@ kk_descriptor_set_write_template(
    struct kk_descriptor_set *set,
    const struct vk_descriptor_update_template *template, const void *data)
 {
+   kk_desc_path = "template";
    for (uint32_t i = 0; i < template->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
 

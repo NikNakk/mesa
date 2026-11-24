@@ -556,10 +556,40 @@ kk_implicit_poll_runtime_locked(void)
 /* Set while the driver creates its own images (the unwarp copies): never candidates. */
 static _Thread_local bool kk_implicit_internal_image;
 
+/* Formats left unfoveated: VkFormat numbers in a "nofoveate-formats" file in Monado's
+ * session recording folder at launch (a diagnostic, to find the image whose foveation
+ * breaks an effect). */
+static bool
+kk_implicit_format_excluded(VkFormat format)
+{
+   static int loaded;
+   static uint32_t formats[16], count;
+   if (!loaded) {
+      loaded = 1;
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      char path[1024];
+      if (session) {
+         snprintf(path, sizeof(path), "%s/nofoveate-formats", session);
+         FILE *f = fopen(path, "r");
+         if (f) {
+            unsigned v;
+            while (count < ARRAY_SIZE(formats) && fscanf(f, " %u", &v) == 1)
+               formats[count++] = v;
+            fclose(f);
+            mesa_logi("kk-implicit: %u format(s) left unfoveated (%s)", count, path);
+         }
+      }
+   }
+   for (uint32_t i = 0; i < count; i++)
+      if (formats[i] == (uint32_t)format)
+         return true;
+   return false;
+}
+
 bool
 kk_implicit_fdm_image(const VkImageCreateInfo *info)
 {
-   if (kk_implicit_internal_image)
+   if (kk_implicit_internal_image || kk_implicit_format_excluded(info->format))
       return false;
    /* Every multisampled attachment is a candidate: the size that marks an eye target
     * may only be known later, and descriptors copy the parameter address when written. */
