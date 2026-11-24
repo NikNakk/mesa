@@ -198,6 +198,29 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
    if (lod0 && foveatable)
       for (uint8_t plane = 0; plane < plane_count; plane++)
          desc[plane].sampler_lod_bias_fp16 = _mesa_float_to_half(-16.0f);
+   /* Diagnostic: a "lodbias" file (a number) in the session folder at launch adds that
+    * bias to every sampled image's reads. */
+   static int bias_read;
+   static float bias;
+   if (!bias_read) {
+      bias_read = 1;
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      char path[1024];
+      if (session) {
+         snprintf(path, sizeof(path), "%s/lodbias", session);
+         FILE *f = fopen(path, "r");
+         if (f) {
+            if (fscanf(f, " %f", &bias) != 1)
+               bias = 0.0f;
+            fclose(f);
+            mesa_logi("kk-desc: LOD bias %.2f on every sampled image (%s)", bias, path);
+         }
+      }
+   }
+   if (bias != 0.0f && descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER)
+      for (uint8_t plane = 0; plane < plane_count; plane++)
+         desc[plane].sampler_lod_bias_fp16 = _mesa_float_to_half(
+            _mesa_half_to_float(desc[plane].sampler_lod_bias_fp16) + bias);
 
    assert(sizeof(desc[0]) * plane_count <= dst_size);
    memcpy(dst, desc, sizeof(desc[0]) * plane_count);
