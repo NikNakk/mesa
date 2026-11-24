@@ -668,6 +668,34 @@ kk_implicit_fdm_frame_boundary(void)
       kk_implicit_fdm_present();
 }
 
+/* The application's finished frames as the OpenXR runtime counts them (threshold-foveation
+ * API level 5), or 0 when it doesn't count them or KK_IMPLICIT_BOUNDARY=present asks
+ * for presents alone (diagnostic). */
+static uint64_t
+kk_implicit_runtime_frames(void)
+{
+#ifdef THRESHOLD_SHARED_FOVEATION
+   typedef uint64_t (*frame_count_fn)(void);
+   static frame_count_fn frame_count;
+   static int looked;
+   if (!looked) {
+      const char *v = getenv("KK_IMPLICIT_BOUNDARY");
+      if (!v || strcmp(v, "present"))
+         frame_count = (frame_count_fn)dlsym(RTLD_DEFAULT, "tf_process_frame_count");
+      looked = 1;
+   }
+   const uint64_t frames = frame_count ? frame_count() : 0;
+   static bool reported;
+   if (frames && !reported) {
+      reported = true;
+      mesa_logi("kk-implicit: frame boundaries from the OpenXR runtime");
+   }
+   return frames;
+#else
+   return 0;
+#endif
+}
+
 /* The driver-made density map for a target of this size. `new_frame`: the pass does
  * not load the target, so a new profile cannot leave it in two layouts. Called with
  * kk_fdm_lock held. */
@@ -686,11 +714,22 @@ kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool ne
     * first pass ends the chance whether or not the profile changed: a profile arriving
     * later in the frame (a runtime publishes one at each swapchain acquire) waits for the
     * next present. An application that never presents keeps the old rule. */
-   const bool presents = kk_implicit_last_present_ns &&
-                         os_time_get_nano() - kk_implicit_last_present_ns < 200000000ull;
-   const bool frame_start = new_frame && (presents ? kk_implicit_frame_boundary : true);
-   if (frame_start)
-      kk_implicit_frame_boundary = false;
+   /* A runtime that counts the application's frames says where they end: the first such
+    * pass after the count changes starts a frame, whatever the application presents. */
+   static uint64_t frames_seen;
+   const uint64_t frames = kk_implicit_runtime_frames();
+   bool frame_start;
+   if (frames) {
+      frame_start = new_frame && frames != frames_seen;
+      if (frame_start)
+         frames_seen = frames;
+   } else {
+      const bool presents = kk_implicit_last_present_ns &&
+                            os_time_get_nano() - kk_implicit_last_present_ns < 200000000ull;
+      frame_start = new_frame && (presents ? kk_implicit_frame_boundary : true);
+      if (frame_start)
+         kk_implicit_frame_boundary = false;
+   }
    if (kk_implicit.latched.serial != kk_implicit.pending.serial &&
        (frame_start || !kk_implicit.latched.serial)) {
       kk_implicit.latched = kk_implicit.pending;
