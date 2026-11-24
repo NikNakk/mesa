@@ -6,6 +6,7 @@
  */
 
 #include "kk_descriptor_set.h"
+#include <unistd.h>
 
 #include "kk_bo.h"
 #include "kosmickrisp/bridge/mtl_buffer.h"
@@ -70,6 +71,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
 {
    struct kk_sampled_image_descriptor desc[3] = {};
    uint8_t plane_count = 1;
+   bool foveatable = false;
 
    if (descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER && info &&
        info->imageView != VK_NULL_HANDLE) {
@@ -99,6 +101,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
 
          const struct kk_image *image =
             container_of(view->vk.image, struct kk_image, vk);
+         foveatable |= image->implicit_candidate;
          desc[plane].rate_params =
             image->rate_params && !is_input_attachment && !kk_implicit_raw_active()
                ? image->rate_params->gpu : 0;
@@ -177,6 +180,24 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
                 sizeof(sampler->custom_border));
       }
    }
+
+   /* Diagnostic: an "lod0" file in Monado's session recording folder at launch makes
+    * foveatable images sample their first level (a -16 bias). */
+   static int lod0 = -1;
+   if (lod0 < 0) {
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      char path[1024];
+      lod0 = 0;
+      if (session) {
+         snprintf(path, sizeof(path), "%s/lod0", session);
+         lod0 = access(path, F_OK) == 0;
+         if (lod0)
+            mesa_logi("kk-desc: foveatable images sample level 0 (%s)", path);
+      }
+   }
+   if (lod0 && foveatable)
+      for (uint8_t plane = 0; plane < plane_count; plane++)
+         desc[plane].sampler_lod_bias_fp16 = _mesa_float_to_half(-16.0f);
 
    assert(sizeof(desc[0]) * plane_count <= dst_size);
    memcpy(dst, desc, sizeof(desc[0]) * plane_count);
