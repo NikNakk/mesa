@@ -144,9 +144,66 @@ static struct {
 } kk_view_ids[8192];
 static uint32_t kk_view_id_count;
 
+/* Diagnostic: sampled view ids listed (hex) in a "watch-resources" file in Monado's
+ * session recording folder. Their images are logged at view creation, kept here for
+ * the mark logs and dumps, and traced. */
+static struct {
+   uint64_t ids[16];
+   uint32_t count;
+   int loaded;
+   struct { uint64_t id; struct kk_image *image; } views[64];
+   uint32_t view_count;
+} kk_watched_res;
+static struct kk_image *kk_watched_res_traced[8];
+
+static bool
+kk_watched_res_listed(uint64_t id)
+{
+   if (!kk_watched_res.loaded) {
+      kk_watched_res.loaded = 1;
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      char path[1024];
+      if (session) {
+         snprintf(path, sizeof(path), "%s/watch-resources", session);
+         FILE *f = fopen(path, "r");
+         if (f) {
+            char word[64];
+            while (kk_watched_res.count < ARRAY_SIZE(kk_watched_res.ids) &&
+                   fscanf(f, " %63s", word) == 1)
+               kk_watched_res.ids[kk_watched_res.count++] = strtoull(word, NULL, 16);
+            fclose(f);
+            mesa_logi("kk-res: watching %u resource id(s)", kk_watched_res.count);
+         }
+      }
+   }
+   for (uint32_t i = 0; i < kk_watched_res.count; i++)
+      if (kk_watched_res.ids[i] == id)
+         return true;
+   return false;
+}
+
 void
 kk_implicit_note_view_id(uint64_t id, struct kk_image *image)
 {
+   if (id && image && kk_watched_res_listed(id)) {
+      mesa_logi("kk-res: view %llx is image %p %ux%u fmt %d usage 0x%x flags 0x%x mips %u "
+                "layers %u samples %u candidate %d", (unsigned long long)id, (void *)image,
+                image->vk.extent.width, image->vk.extent.height, image->vk.format,
+                (unsigned)image->vk.usage, (unsigned)image->vk.create_flags, image->vk.mip_levels,
+                image->vk.array_layers, (unsigned)image->vk.samples, image->implicit_candidate);
+      simple_mtx_lock(&kk_rate_registry_lock);
+      if (kk_watched_res.view_count < ARRAY_SIZE(kk_watched_res.views)) {
+         kk_watched_res.views[kk_watched_res.view_count].id = id;
+         kk_watched_res.views[kk_watched_res.view_count++].image = image;
+      }
+      for (uint32_t i = 0; i < ARRAY_SIZE(kk_watched_res_traced); i++) {
+         if (!kk_watched_res_traced[i] || kk_watched_res_traced[i] == image) {
+            kk_watched_res_traced[i] = image;
+            break;
+         }
+      }
+      simple_mtx_unlock(&kk_rate_registry_lock);
+   }
    if (!id || !image || !image->rate_params)
       return;
    simple_mtx_lock(&kk_rate_registry_lock);
@@ -163,6 +220,12 @@ kk_implicit_forget_view_id(uint64_t id)
    if (!id)
       return;
    simple_mtx_lock(&kk_rate_registry_lock);
+   for (uint32_t i = 0; i < kk_watched_res.view_count; i++) {
+      if (kk_watched_res.views[i].id == id) {
+         kk_watched_res.views[i] = kk_watched_res.views[--kk_watched_res.view_count];
+         break;
+      }
+   }
    for (uint32_t i = 0; i < kk_view_id_count; i++) {
       if (kk_view_ids[i].id == id) {
          kk_view_ids[i] = kk_view_ids[--kk_view_id_count];
@@ -176,6 +239,9 @@ kk_implicit_forget_view_id(uint64_t id)
 static struct kk_image *
 kk_view_id_find_locked(uint64_t id)
 {
+   for (uint32_t i = 0; i < kk_watched_res.view_count; i++)
+      if (kk_watched_res.views[i].id == id)
+         return kk_watched_res.views[i].image;
    for (uint32_t i = 0; i < kk_view_id_count; i++) {
       if (kk_view_ids[i].id != id)
          continue;
@@ -1765,6 +1831,17 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
 void
 kk_implicit_trace(const char *what, const struct vk_image *a, const struct vk_image *b)
 {
+   for (uint32_t i = 0; i < ARRAY_SIZE(kk_watched_res_traced) && kk_watched_res_traced[i]; i++) {
+      const struct vk_image *w = &kk_watched_res_traced[i]->vk;
+      static uint32_t told;
+      if ((a == w || b == w) && told < 64) {
+         told++;
+         mesa_logi("kk-res: %s %p fmt %d %ux%u -> %p fmt %d %ux%u", what, (const void *)a,
+                   a ? a->format : 0, a ? a->extent.width : 0, a ? a->extent.height : 0,
+                   (const void *)b, b ? b->format : 0, b ? b->extent.width : 0,
+                   b ? b->extent.height : 0);
+      }
+   }
    static int enabled = -1;
    if (enabled < 0) {
       enabled = debug_get_bool_option("KK_IMPLICIT_TRACE", false);
@@ -2756,10 +2833,12 @@ static struct {
 } kk_dump = {.lock = SIMPLE_MTX_INITIALIZER};
 static volatile bool kk_dump_busy;
 
+static bool kk_watched_res_image(const struct kk_image *image);
+
 static void
 kk_dump_note(struct kk_image *image, uint32_t mark)
 {
-   if (!image || !image->rate_params)
+   if (!image || (!image->rate_params && !kk_watched_res_image(image)))
       return;
    simple_mtx_lock(&kk_dump.lock);
    if (kk_dump.mark != mark) {
@@ -2963,6 +3042,8 @@ kk_implicit_dump_begin(struct kk_cmd_buffer *cmd)
          simple_mtx_lock(&kk_rate_registry_lock);
          for (uint32_t j = 0; j < kk_rate_registry_count; j++)
             alive |= kk_rate_registry[j] == image;
+         for (uint32_t j = 0; j < kk_watched_res.view_count; j++)
+            alive |= kk_watched_res.views[j].image == image;
          simple_mtx_unlock(&kk_rate_registry_lock);
          if (!alive || vk_format_is_depth_or_stencil(image->vk.format) ||
              image->vk.samples != VK_SAMPLE_COUNT_1_BIT || image->vk.array_layers != 1)
@@ -2987,4 +3068,15 @@ kk_implicit_dump_begin(struct kk_cmd_buffer *cmd)
    simple_mtx_lock(&kk_dump.lock);
    kk_dump_busy = kk_dump.pending || kk_dump.cap_count;
    simple_mtx_unlock(&kk_dump.lock);
+}
+
+static bool
+kk_watched_res_image(const struct kk_image *image)
+{
+   bool found = false;
+   simple_mtx_lock(&kk_rate_registry_lock);
+   for (uint32_t i = 0; i < kk_watched_res.view_count; i++)
+      found |= kk_watched_res.views[i].image == image;
+   simple_mtx_unlock(&kk_rate_registry_lock);
+   return found;
 }
