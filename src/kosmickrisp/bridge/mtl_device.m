@@ -145,11 +145,22 @@ mtl_poll_gpu_capture_foveated(mtl_device *device, bool foveated)
          fprintf(stderr, "kk-capture: stopped\n");
       }
       if (!capture_window_attempted && access(trigger, F_OK) == 0) {
+         /* The trigger file may carry settings, so they can change without relaunching:
+          * "foveated" (as KK_CAPTURE_FOVEATED_ONLY=1) and "seconds=N". */
+         char text[128] = {0};
+         FILE *file = fopen(trigger, "r");
+         if (file) {
+            fread(text, 1, sizeof(text) - 1, file);
+            fclose(file);
+         }
+         if (strstr(text, "foveated") && !foveated)
+            return;
          capture_window_attempted = true;
-         fprintf(stderr, "kk-capture: trigger observed\n");
+         fprintf(stderr, "kk-capture: trigger observed%s\n", foveated ? " (foveated work)" : "");
          capture_window_active = start_gpu_capture(device,
                             getenv("MESA_KK_GPU_CAPTURE_DIRECTORY"));
-         const char *seconds = getenv("KK_CAPTURE_SECONDS");
+         const char *seconds = strstr(text, "seconds=") ? strstr(text, "seconds=") + 8
+                                                        : getenv("KK_CAPTURE_SECONDS");
          double duration = seconds ? atof(seconds) : 0.25;
          capture_window_end = capture_time() + (duration > 0 && duration <= 5 ? duration : 0.25);
       }
