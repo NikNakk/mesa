@@ -688,12 +688,15 @@ kk_implicit_format_excluded(VkFormat format)
 bool
 kk_implicit_fdm_image(const VkImageCreateInfo *info)
 {
-   if (kk_implicit_internal_image || kk_implicit_format_excluded(info->format))
+   if (kk_implicit_internal_image || kk_implicit_format_excluded(info->format) ||
+       vk_find_struct_const(info->pNext, IMPORT_METAL_TEXTURE_INFO_EXT) ||
+       vk_find_struct_const(info->pNext, IMPORT_METAL_IO_SURFACE_INFO_EXT))
       return false;
    /* Every multisampled attachment is a candidate: the size that marks an eye target
     * may only be known later, and descriptors copy the parameter address when written. */
    if (!kk_implicit_fdm_enabled() || info->imageType != VK_IMAGE_TYPE_2D ||
-       info->arrayLayers != 1 ||
+       (info->arrayLayers != 1 &&
+        !(info->arrayLayers == 2 && debug_get_bool_option("KK_IMPLICIT_MULTIVIEW", false))) ||
        (info->mipLevels != 1 && info->samples != VK_SAMPLE_COUNT_1_BIT) ||
        !(info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
@@ -742,6 +745,9 @@ kk_implicit_eyes(const struct kk_image *image)
    if (half < 0)
       half = debug_get_bool_option("KK_IMPLICIT_HALF", false) &&
              debug_get_bool_option("KK_IMPLICIT_SINGLE", false);
+   if (image->vk.array_layers == 2)
+      return image->vk.extent.width == kk_implicit.view_width &&
+             image->vk.extent.height == kk_implicit.view_height ? 1 : 0;
    if (half && image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
        image->vk.extent.width == DIV_ROUND_UP(kk_implicit.view_width, 2) &&
        image->vk.extent.height == DIV_ROUND_UP(kk_implicit.view_height, 2))
@@ -799,23 +805,23 @@ kk_implicit_fill(struct kk_image *density, uint32_t width, uint32_t height, uint
    const struct kk_implicit_profile *p = &kk_implicit.latched;
    const uint32_t w = density->fdm.width, h = density->fdm.height;
    const float eye_width = (float)width / eyes;
-   for (uint32_t y = 0; y < h; y++) {
-      float py = MIN2((y + 0.5f) * 32.0f, height - 0.5f);
-      uint32_t vi = MIN2((uint32_t)(py / height * p->count), p->count - 1);
-      for (uint32_t x = 0; x < w; x++) {
-         float px = MIN2((x + 0.5f) * 32.0f, width - 0.5f);
-         uint32_t eye = MIN2((uint32_t)(px / eye_width), eyes - 1);
-         uint32_t hi = MIN2((uint32_t)((px - eye * eye_width) / eye_width * p->count), p->count - 1);
-         uint8_t *texel = density->fdm.cpu + ((size_t)y * w + x) * 2;
-         /* A one-eye target may hold either eye (Talos renders each eye to its own image
-          * of the same size), and the two eyes' fields of view are not mirror images:
-          * take the higher of the two eyes' rates, so neither eye's sharp region lands
-          * off its gaze. */
-         float hrate = p->horizontal[eye][hi];
-         if (eyes == 1)
-            hrate = MAX2(p->horizontal[0][hi], p->horizontal[1][hi]);
-         texel[0] = (uint8_t)lroundf(255.0f * hrate);
-         texel[1] = (uint8_t)lroundf(255.0f * p->vertical[vi]);
+   for (uint32_t layer = 0; layer < density->fdm.layers; layer++) {
+      for (uint32_t y = 0; y < h; y++) {
+         float py = MIN2((y + 0.5f) * 32.0f, height - 0.5f);
+         uint32_t vi = MIN2((uint32_t)(py / height * p->count), p->count - 1);
+         for (uint32_t x = 0; x < w; x++) {
+            float px = MIN2((x + 0.5f) * 32.0f, width - 0.5f);
+            uint32_t eye = MIN2((uint32_t)(px / eye_width), eyes - 1);
+            uint32_t hi = MIN2((uint32_t)((px - eye * eye_width) / eye_width * p->count), p->count - 1);
+            uint8_t *texel = density->fdm.cpu + (((size_t)layer * h + y) * w + x) * 2;
+            float hrate = p->horizontal[eye][hi];
+            if (density->fdm.layers == 2)
+               hrate = p->horizontal[layer][hi];
+            else if (eyes == 1)
+               hrate = MAX2(p->horizontal[0][hi], p->horizontal[1][hi]);
+            texel[0] = (uint8_t)lroundf(255.0f * hrate);
+            texel[1] = (uint8_t)lroundf(255.0f * p->vertical[vi]);
+         }
       }
    }
    density->fdm.version++;
@@ -948,7 +954,8 @@ kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool ne
    }
    for (uint32_t i = 0; i < kk_implicit.target_count; i++) {
       if (kk_implicit.targets[i].width == image->vk.extent.width &&
-          kk_implicit.targets[i].height == image->vk.extent.height)
+          kk_implicit.targets[i].height == image->vk.extent.height &&
+          kk_implicit.targets[i].density->fdm.layers == image->vk.array_layers)
          return kk_implicit.targets[i].density;
    }
    if (kk_implicit.target_count == ARRAY_SIZE(kk_implicit.targets))
@@ -959,8 +966,10 @@ kk_implicit_density(struct kk_device *dev, const struct kk_image *image, bool ne
    vk_object_base_init(&dev->vk, &density->vk.base, VK_OBJECT_TYPE_IMAGE);
    const uint32_t w = DIV_ROUND_UP(image->vk.extent.width, 32), h = DIV_ROUND_UP(image->vk.extent.height, 32);
    density->vk.extent = (VkExtent3D){w, h, 1};
-   density->fdm.width = w; density->fdm.height = h; density->fdm.layers = 1;
-   density->fdm.cpu = malloc((size_t)w * h * 2);
+   density->fdm.width = w;
+   density->fdm.height = h;
+   density->fdm.layers = image->vk.array_layers;
+   density->fdm.cpu = malloc((size_t)w * h * density->fdm.layers * 2);
    if (density->fdm.cpu == NULL) {
       free(density);
       return NULL;
@@ -978,6 +987,7 @@ kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
                          const struct kk_image_view *dst)
 {
    if (!src->implicit_fdm || dst == NULL ||
+       dst->vk.layer_count != src->vk.array_layers ||
        (dst->vk.image->create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT) ||
        debug_get_bool_option("KK_IMPLICIT_NATIVE_RESOLVE", false))
       return NULL;
@@ -992,7 +1002,7 @@ kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
          .format = dst->vk.view_format,
          .extent = src->vk.extent,
          .mipLevels = 1,
-         .arrayLayers = 1,
+         .arrayLayers = src->vk.array_layers,
          .samples = VK_SAMPLE_COUNT_1_BIT,
          .tiling = VK_IMAGE_TILING_OPTIMAL,
          .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -1024,9 +1034,9 @@ kk_implicit_resolve_view(struct kk_device *dev, struct kk_image *src,
          const VkImageViewCreateInfo view_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = image,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .viewType = src->vk.array_layers == 2 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
             .format = dst->vk.view_format,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, src->vk.array_layers},
          };
          result = disp->CreateImageView(device, &view_info, NULL, &view);
       }
@@ -1785,7 +1795,7 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
 
    bool implicit_density = false;
    simple_mtx_lock(&kk_fdm_lock);
-   if (!density && kk_implicit_fdm_enabled() && !gfx->in_custom_resolve && !kk_implicit_raw_active() &&
+   if (!explicit_fdm_present && !density && kk_implicit_fdm_enabled() && !gfx->in_custom_resolve && !kk_implicit_raw_active() &&
        !kk_implicit_nomap()) {
       const struct kk_image_view *first =
          render->color_att_count && render->color_att[0].iview ? render->color_att[0].iview
@@ -2073,7 +2083,7 @@ kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
          .format = src->vk.format,
          .extent = src->vk.extent,
          .mipLevels = 1,
-         .arrayLayers = 1,
+         .arrayLayers = src->vk.array_layers,
          .samples = VK_SAMPLE_COUNT_1_BIT,
          .tiling = VK_IMAGE_TILING_OPTIMAL,
          .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -2122,9 +2132,9 @@ kk_implicit_unwarp_for_copy(struct kk_cmd_buffer *cmd, struct kk_image *src,
     * translated in implicit mode) and renders an ordinary image. */
    const VkImageBlit2 region = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
-      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, src->vk.array_layers},
       .srcOffsets = {{0, 0, 0}, {(int32_t)src->vk.extent.width, (int32_t)src->vk.extent.height, 1}},
-      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, src->vk.array_layers},
       .dstOffsets = {{0, 0, 0}, {(int32_t)src->vk.extent.width, (int32_t)src->vk.extent.height, 1}},
    };
    const VkBlitImageInfo2 blit = {
@@ -2227,7 +2237,10 @@ kk_implicit_match_pass(struct kk_cmd_buffer *cmd, struct kk_rendering_state *ren
    for (uint32_t i = 0; i < n; i++) {
       const struct kk_image *image = container_of(views[i]->vk.image, struct kk_image, vk);
       any |= image->implicit_candidate || image->implicit_fdm;
-      const char *w = kk_implicit_why_not(image, views[i]);
+      const char *w = image->vk.array_layers == 2 &&
+                         (render->view_mask != 3 || views[i]->vk.layer_count != 2)
+                         ? "not a full stereo multiview pass"
+                         : kk_implicit_why_not(image, views[i]);
       if (w && !why) {
          why = w;
          blocker = image;

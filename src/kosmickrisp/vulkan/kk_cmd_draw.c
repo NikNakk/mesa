@@ -330,14 +330,17 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    VkExtent2D framebuffer_extent = {.width = 0u, .height = 0u};
    bool does_any_attachment_clear = false;
+   const bool implicit = kk_implicit_fdm_enabled() && !cmd->state.gfx.fdm.carry &&
+      !vk_find_struct_const(pRenderingInfo->pNext, RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT);
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       kk_attachment_init(&render->color_att[i],
                          &pRenderingInfo->pColorAttachments[i]);
       /* The multisampled route needs the match before choosing the hidden resolve. */
-      if (render->color_att[i].iview && kk_implicit_fdm_enabled() &&
-          !debug_get_bool_option("KK_IMPLICIT_SINGLE", false))
+      if (render->color_att[i].iview && implicit &&
+          (!debug_get_bool_option("KK_IMPLICIT_SINGLE", false) ||
+           (pRenderingInfo->viewMask == 3 && debug_get_bool_option("KK_IMPLICIT_MULTIVIEW", false))))
          kk_implicit_fdm_match(container_of(render->color_att[i].iview->vk.image, struct kk_image, vk));
-      if (render->color_att[i].iview && render->color_att[i].resolve_iview &&
+      if (implicit && render->color_att[i].iview && render->color_att[i].resolve_iview &&
           render->color_att[i].resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT) {
          struct kk_image_view *hidden = kk_implicit_resolve_view(
             dev, container_of(render->color_att[i].iview->vk.image, struct kk_image, vk),
@@ -373,7 +376,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    kk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    kk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
-   if (kk_implicit_fdm_enabled())
+   if (implicit)
       kk_implicit_match_pass(cmd, render);
    kk_merge_render_iview(&framebuffer_extent,
                          render->depth_att.iview ?: render->stencil_att.iview);
@@ -1052,10 +1055,10 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
                              implicit_area.offset.y + (int32_t)implicit_area.extent.height, 1};
       const VkImageBlit2 region = {
          .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
-         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, implicit_src[i]->vk.layer_count},
          .srcOffsets = {lo, hi},
          .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, implicit_dst[i]->vk.base_mip_level,
-                            implicit_dst[i]->vk.base_array_layer, 1},
+                            implicit_dst[i]->vk.base_array_layer, implicit_src[i]->vk.layer_count},
          .dstOffsets = {lo, hi},
       };
       const VkBlitImageInfo2 blit = {
