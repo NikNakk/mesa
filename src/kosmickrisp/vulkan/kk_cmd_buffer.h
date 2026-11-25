@@ -46,6 +46,11 @@ struct kk_root_descriptor_table {
       } draw;
       struct {
          uint32_t base_group[3];
+         /* KK_IMPLICIT_COMPACT: the application's group counts, and the rate
+          * parameters of the foveated image the dispatch covers (0 when the
+          * dispatch runs as recorded). */
+         uint32_t compact_groups[3];
+         uint64_t compact_params;
       } cs;
    };
 
@@ -116,10 +121,20 @@ struct kk_attachment {
    /* Resolve in the render pass even though it does not cover the whole
     * framebuffer or is a depth/stencil resolve. */
    bool resolve_in_pass;
+
+   /* Implicit foveation: the application's resolve target, replaced for the pass
+    * by the source's hidden foveated image. */
+   struct kk_image_view *implicit_dst;
 };
 
 struct kk_rendering_state {
    VkRenderingFlagBits flags;
+
+   /* KK_FAKE_VRS: what the pass asked for (kk_vrs_* in kk_fdm.c). */
+   struct {
+      VkExtent2D texel;
+      bool pipeline_rate;
+   } vrs_note;
 
    VkRect2D area;
    uint32_t layer_count;
@@ -309,6 +324,8 @@ struct kk_cmd_buffer {
    void *drawable;
    bool wsi_signal_only;
    struct util_dynarray wsi_direct_images;
+   /* KK_PASS_TIMING=1: GPU timestamps at encoder boundaries (struct kk_pass_timing). */
+   void *pass_timing;
    mtl_argument_table *argument_table;
    bool no_stitch;
 
@@ -501,5 +518,13 @@ void kk_dispatch_precomp(struct kk_cmd_buffer *cmd, struct kk_grid grid,
 void kk_cmd_write(struct kk_cmd_buffer *cmd, struct libkk_imm_write write);
 
 void kk_cmd_buffer_set_label(struct kk_cmd_buffer *cb, const char *label);
+
+/* KK_PASS_TIMING=1 (diagnostic): per-encoder GPU time, summed by pass shape and
+ * logged every five seconds per presented frame. */
+void kk_pass_timing_end_cmdbuf(struct kk_cmd_buffer *cmd);
+bool kk_pass_timing_dispatch_enabled(void);
+void kk_pass_timing_dispatch(struct kk_cmd_buffer *cmd, const char *label);
+void kk_pass_timing_frame(void);
+void kk_pass_timing_free(struct kk_cmd_buffer *cmd);
 
 #endif

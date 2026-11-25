@@ -521,6 +521,20 @@ mtl_compute_write_timestamp(mtl_compute_encoder *encoder,
 }
 
 void
+mtl_render_write_timestamp_precise(mtl_render_encoder *encoder,
+                                   enum mtl_render_stages stage,
+                                   mtl_counter_heap *heap, uint32_t index)
+{
+   @autoreleasepool {
+      id<MTL4RenderCommandEncoder> enc = (id<MTL4RenderCommandEncoder>)encoder;
+      [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                              afterStage:(MTLRenderStages)stage
+                                intoHeap:(id<MTL4CounterHeap>)heap
+                                 atIndex:index];
+   }
+}
+
+void
 mtl_render_write_timestamp(mtl_render_encoder *encoder,
                            enum mtl_render_stages stage, mtl_counter_heap *heap,
                            uint32_t index)

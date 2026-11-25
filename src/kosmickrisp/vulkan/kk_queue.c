@@ -82,6 +82,12 @@ static void
 kk_queue_add_timing_handler(mtl_commit_options *options, uint32_t count,
                             bool wsi_present)
 {
+   if (wsi_present) {
+      kk_pass_timing_frame();
+      kk_fdm_runtime_poll();
+      kk_vrs_frame();
+      kk_implicit_fdm_present();
+   }
    if (!debug_get_bool_option("KK_QUEUE_TIMING", false))
       return;
 
@@ -646,6 +652,19 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
          if (cmd->diagnostic_target_draws) {
             if (mtl_trigger_gpu_capture(dev->mtl_handle))
                mesa_logi("kk-capture: target submissions active");
+            break;
+         }
+      }
+   }
+
+   /* KK_CAPTURE_FOVEATED_ONLY=1: a triggered capture starts at a submission that used
+    * implicit foveation (mtl_poll_gpu_capture_foveated). */
+   if (getenv("KK_CAPTURE_TRIGGER_FILE")) {
+      for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+         struct kk_cmd_buffer *cmd =
+            container_of(submit->command_buffers[i], struct kk_cmd_buffer, vk);
+         if (util_dynarray_num_elements(&cmd->fdm_params, struct kk_fdm_params *)) {
+            mtl_poll_gpu_capture_foveated(dev->mtl_handle, true);
             break;
          }
       }

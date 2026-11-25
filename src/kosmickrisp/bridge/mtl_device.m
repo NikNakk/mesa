@@ -120,13 +120,24 @@ mtl_gpu_capture_active(void)
    return active;
 }
 
+/* `foveated`: the caller is submitting work that used implicit foveation. With
+ * KK_CAPTURE_FOVEATED_ONLY=1 only such a submission starts the triggered capture, so
+ * it records the device that renders the eyes rather than whichever of the process's
+ * devices (an OpenXR layer's, say) begins a command buffer first. */
 void
-mtl_poll_gpu_capture(mtl_device *device)
+mtl_poll_gpu_capture_foveated(mtl_device *device, bool foveated)
 {
    const char *trigger = getenv("KK_CAPTURE_TRIGGER_FILE");
    if (!trigger)
       return;
+   static int foveated_only = -1;
+   if (foveated_only < 0) {
+      const char *v = getenv("KK_CAPTURE_FOVEATED_ONLY");
+      foveated_only = v && !strcmp(v, "1");
+   }
    @synchronized ([MTLCaptureManager sharedCaptureManager]) {
+      if (foveated_only && !foveated && !capture_window_active)
+         return;
       if (capture_window_active && capture_window_end > 0.0 &&
           capture_time() >= capture_window_end) {
          [[MTLCaptureManager sharedCaptureManager] stopCapture];
@@ -134,15 +145,32 @@ mtl_poll_gpu_capture(mtl_device *device)
          fprintf(stderr, "kk-capture: stopped\n");
       }
       if (!capture_window_attempted && access(trigger, F_OK) == 0) {
+         /* The trigger file may carry settings, so they can change without relaunching:
+          * "foveated" (as KK_CAPTURE_FOVEATED_ONLY=1) and "seconds=N". */
+         char text[128] = {0};
+         FILE *file = fopen(trigger, "r");
+         if (file) {
+            fread(text, 1, sizeof(text) - 1, file);
+            fclose(file);
+         }
+         if (strstr(text, "foveated") && !foveated)
+            return;
          capture_window_attempted = true;
-         fprintf(stderr, "kk-capture: trigger observed\n");
+         fprintf(stderr, "kk-capture: trigger observed%s\n", foveated ? " (foveated work)" : "");
          capture_window_active = start_gpu_capture(device,
                             getenv("MESA_KK_GPU_CAPTURE_DIRECTORY"));
-         const char *seconds = getenv("KK_CAPTURE_SECONDS");
+         const char *seconds = strstr(text, "seconds=") ? strstr(text, "seconds=") + 8
+                                                        : getenv("KK_CAPTURE_SECONDS");
          double duration = seconds ? atof(seconds) : 0.25;
          capture_window_end = capture_time() + (duration > 0 && duration <= 5 ? duration : 0.25);
       }
    }
+}
+
+void
+mtl_poll_gpu_capture(mtl_device *device)
+{
+   mtl_poll_gpu_capture_foveated(device, false);
 }
 
 void

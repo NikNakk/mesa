@@ -6,6 +6,7 @@
  */
 
 #include "kk_descriptor_set.h"
+#include <unistd.h>
 
 #include "kk_bo.h"
 #include "kosmickrisp/bridge/mtl_buffer.h"
@@ -60,6 +61,9 @@ write_desc(struct kk_descriptor_set *set, uint32_t binding, uint32_t elem,
    memcpy(dst, desc_data, desc_size);
 }
 
+/* Diagnostic: which entry point is writing descriptors on this thread. */
+static _Thread_local const char *kk_desc_path = "?";
+
 static void
 get_sampled_image_view_desc(VkDescriptorType descriptor_type,
                             const VkDescriptorImageInfo *const info, void *dst,
@@ -67,6 +71,7 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
 {
    struct kk_sampled_image_descriptor desc[3] = {};
    uint8_t plane_count = 1;
+   bool foveatable = false;
 
    if (descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER && info &&
        info->imageView != VK_NULL_HANDLE) {
@@ -96,14 +101,28 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
 
          const struct kk_image *image =
             container_of(view->vk.image, struct kk_image, vk);
+         foveatable |= image->implicit_candidate;
          desc[plane].rate_params =
-            image->rate_params && !is_input_attachment ? image->rate_params->gpu
-                                                       : 0;
+            image->rate_params && !is_input_attachment && !kk_implicit_raw_active()
+               ? image->rate_params->gpu : 0;
+         /* Diagnostic: a foveatable image written without its parameters, once each. */
+         if (image->implicit_candidate && !desc[plane].rate_params &&
+             !((struct kk_image *)image)->implicit_unwarp_logged) {
+            static uint32_t told;
+            if (told++ < 64)
+               mesa_logi("kk-desc: %ux%u fmt %d image %p written without map (%s, type %d, %s)",
+                         image->vk.extent.width, image->vk.extent.height, image->vk.format,
+                         (const void *)image,
+                         !image->rate_params ? "no parameters" :
+                         is_input_attachment ? "input attachment" : "raw", descriptor_type, kk_desc_path);
+         }
          desc[plane].rate_base_layer = view->vk.base_array_layer;
-         desc[plane].rate_image_size[0] =
-            u_minify(view->vk.image->extent.width, view->vk.base_mip_level);
-         desc[plane].rate_image_size[1] =
-            u_minify(view->vk.image->extent.height, view->vk.base_mip_level);
+         /* A foveated image keeps one normalised layout at every mip level, so its
+          * translation works in level-0 pixels whatever the view's base level. */
+         const uint32_t rate_level = image->implicit_candidate && image->vk.samples == 1
+                                        ? 0 : view->vk.base_mip_level;
+         desc[plane].rate_image_size[0] = u_minify(view->vk.image->extent.width, rate_level);
+         desc[plane].rate_image_size[1] = u_minify(view->vk.image->extent.height, rate_level);
          kk_fdm_note_view(&view->vk, is_input_attachment ? "input" : "sampled");
          if (is_input_attachment)
             kk_fdm_note_use(&image->vk, "input attachment");
@@ -162,6 +181,47 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
       }
    }
 
+   /* Diagnostic: an "lod0" file in Monado's session recording folder at launch makes
+    * foveatable images sample their first level (a -16 bias). */
+   static int lod0 = -1;
+   if (lod0 < 0) {
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      char path[1024];
+      lod0 = 0;
+      if (session) {
+         snprintf(path, sizeof(path), "%s/lod0", session);
+         lod0 = access(path, F_OK) == 0;
+         if (lod0)
+            mesa_logi("kk-desc: foveatable images sample level 0 (%s)", path);
+      }
+   }
+   if (lod0 && foveatable)
+      for (uint8_t plane = 0; plane < plane_count; plane++)
+         desc[plane].sampler_lod_bias_fp16 = _mesa_float_to_half(-16.0f);
+   /* Diagnostic: a "lodbias" file (a number) in the session folder at launch adds that
+    * bias to every sampled image's reads. */
+   static int bias_read;
+   static float bias;
+   if (!bias_read) {
+      bias_read = 1;
+      const char *session = getenv("XRT_SESSION_RECORD_DIR");
+      char path[1024];
+      if (session) {
+         snprintf(path, sizeof(path), "%s/lodbias", session);
+         FILE *f = fopen(path, "r");
+         if (f) {
+            if (fscanf(f, " %f", &bias) != 1)
+               bias = 0.0f;
+            fclose(f);
+            mesa_logi("kk-desc: LOD bias %.2f on every sampled image (%s)", bias, path);
+         }
+      }
+   }
+   if (bias != 0.0f && descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER)
+      for (uint8_t plane = 0; plane < plane_count; plane++)
+         desc[plane].sampler_lod_bias_fp16 = _mesa_float_to_half(
+            _mesa_half_to_float(desc[plane].sampler_lod_bias_fp16) + bias);
+
    assert(sizeof(desc[0]) * plane_count <= dst_size);
    memcpy(dst, desc, sizeof(desc[0]) * plane_count);
 }
@@ -208,6 +268,16 @@ get_storage_image_view_desc(
 
       assert(view->planes[plane].storage_gpu_resource_id);
       desc.image_gpu_resource_id = view->planes[plane].storage_gpu_resource_id;
+      const struct kk_image *image = container_of(view->vk.image, struct kk_image, vk);
+      if (image->rate_params && !kk_implicit_raw_active()) {
+         desc.rate_params = image->rate_params->gpu;
+         desc.rate_base_layer = view->vk.base_array_layer;
+         /* Level-0 pixels, as for sampled reads of a foveated image. */
+         const uint32_t level = image->implicit_candidate && image->vk.samples == 1
+                                   ? 0 : view->vk.base_mip_level;
+         desc.rate_image_size[0] = u_minify(image->vk.extent.width, level);
+         desc.rate_image_size[1] = u_minify(image->vk.extent.height, level);
+      }
    }
 
    assert(sizeof(desc) <= dst_size);
@@ -346,6 +416,7 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   kk_desc_path = "update";
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *write = &pDescriptorWrites[w];
       VK_FROM_HANDLE(kk_descriptor_set, set, write->dstSet);
@@ -467,6 +538,7 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
                               uint32_t write_count,
                               const VkWriteDescriptorSet *writes)
 {
+   kk_desc_path = "push";
    struct kk_descriptor_set_layout *layout = push_set->layout;
    assert(layout->non_variable_descriptor_buffer_size < sizeof(push_set->data));
    struct kk_descriptor_set set = {
@@ -679,6 +751,7 @@ kk_descriptor_set_create(struct kk_device *dev, struct kk_descriptor_pool *pool,
                          uint32_t variable_count,
                          struct kk_descriptor_set **out_set)
 {
+   kk_desc_path = "create";
    struct kk_descriptor_set *set;
    VkResult result = VK_SUCCESS;
 
@@ -830,6 +903,7 @@ kk_descriptor_set_write_template(
    struct kk_descriptor_set *set,
    const struct vk_descriptor_update_template *template, const void *data)
 {
+   kk_desc_path = "template";
    for (uint32_t i = 0; i < template->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
 

@@ -71,12 +71,19 @@ kk_pool_is_ts(struct kk_query_pool *pool)
    return pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP;
 }
 
+/* Whether the pool's results are in the device's shared visibility buffer. */
+static inline bool
+kk_pool_uses_vis_buffer(struct kk_query_pool *pool)
+{
+   return kk_pool_is_oq(pool) && !pool->oq.overflow;
+}
+
 static uint64_t
 kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
                      uint32_t query)
 {
    struct kk_bo *bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+      kk_pool_uses_vis_buffer(pool) ? dev->occlusion_queries.bo : pool->bo;
 
    uint32_t index =
       kk_pool_is_ts(pool) ? query : kk_pool_index_ptr(pool)[query];
@@ -95,7 +102,7 @@ kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
                     uint32_t query)
 {
    struct kk_bo *bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+      kk_pool_uses_vis_buffer(pool) ? dev->occlusion_queries.bo : pool->bo;
 
    uint64_t *queries = (uint64_t *)(bo->cpu + pool->query_start);
    uint32_t index =
@@ -165,8 +172,28 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    uint32_t reports_per_query = kk_reports_per_query(pool);
    pool->query_stride = reports_per_query * sizeof(struct kk_query_report);
 
-   /* For occlusion queries, results come from the global visibility buffer */
+   /* For occlusion queries, results come from the global visibility buffer,
+    * unless it cannot hold this pool. The visibility buffer is limited to
+    * KK_MAX_OCCLUSION_QUERIES for the whole device; some games (The Talos
+    * Principle VR) create more and use a failed pool's null handle anyway. */
    if (kk_pool_is_oq(pool)) {
+      simple_mtx_lock(&dev->occlusion_queries.mutex);
+      uint32_t free_q = dev->occlusion_queries.free_count +
+                        (dev->occlusion_queries.max_alloc -
+                         dev->occlusion_queries.next_query);
+      simple_mtx_unlock(&dev->occlusion_queries.mutex);
+      pool->oq.overflow = pool->vk.query_count > free_q;
+      if (pool->oq.overflow) {
+         static bool warned;
+         if (!warned) {
+            warned = true;
+            mesa_logw("kk: occlusion query pool of %u exceeds the %u free "
+                      "visibility slots; its queries report visible",
+                      pool->vk.query_count, free_q);
+         }
+      }
+   }
+   if (kk_pool_uses_vis_buffer(pool)) {
       pool->query_start = 0;
    } else {
       pool->query_start = bo_size;
@@ -179,7 +206,12 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
-   if (kk_pool_is_oq(pool)) {
+   if (kk_pool_is_oq(pool) && pool->oq.overflow) {
+      /* Results in this pool's own bo, indexed directly. */
+      uint16_t *remap_index = kk_pool_index_ptr(pool);
+      for (unsigned i = 0; i < pool->vk.query_count; ++i)
+         remap_index[i] = i;
+   } else if (kk_pool_is_oq(pool)) {
       uint16_t *remap_index = kk_pool_index_ptr(pool);
 
       for (unsigned i = 0; i < pool->vk.query_count; ++i) {
@@ -234,7 +266,7 @@ kk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
    if (!pool)
       return;
 
-   if (kk_pool_is_oq(pool)) {
+   if (kk_pool_uses_vis_buffer(pool)) {
       uint16_t *remap_index = kk_pool_index_ptr(pool);
       for (unsigned i = 0; i < pool->oq.queries; ++i) {
          kk_query_table_remove(dev, &dev->occlusion_queries, remap_index[i]);
@@ -266,7 +298,7 @@ emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
    struct kk_bo *results_bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+      kk_pool_uses_vis_buffer(pool) ? dev->occlusion_queries.bo : pool->bo;
 
    struct libkk_reset_query_args info = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,
@@ -462,6 +494,8 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   if (pool->oq.overflow)
+      return;
    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;
@@ -476,8 +510,19 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
-   cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
-   cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+   if (pool->oq.overflow) {
+      /* Nothing was counted: report visible, the conservative answer. */
+      struct kk_device *dev = kk_cmd_buffer_device(cmd);
+      uint32_t n = kk_mv_query_count(cmd);
+      for (uint32_t i = 0; i < n; i++) {
+         uint64_t r = kk_query_report_addr(dev, pool, query + i);
+         kk_cmd_write(cmd, (struct libkk_imm_write){r, 1});
+         kk_cmd_write(cmd, (struct libkk_imm_write){r + 4, 0});
+      }
+   } else {
+      cmd->state.gfx.occlusion.mode = MTL_VISIBILITY_RESULT_MODE_DISABLED;
+      cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
+   }
 
    /* Make the query available. The Vulkan spec states:
     * If queries are used while executing a render pass instance that has
@@ -620,7 +665,7 @@ kk_CmdCopyQueryPoolResultsToMemoryKHR(
    mtl_barrier_after_queue_stages(encoder, MTL_STAGE_BLIT, MTL_STAGE_DISPATCH);
 
    struct kk_bo *results_bo =
-      kk_pool_is_oq(pool) ? dev->occlusion_queries.bo : pool->bo;
+      kk_pool_uses_vis_buffer(pool) ? dev->occlusion_queries.bo : pool->bo;
 
    struct libkk_copy_queries_args args = {
       .availability = kk_pool_is_ts(pool) ? 0u : pool->bo->gpu,

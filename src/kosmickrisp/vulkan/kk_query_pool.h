@@ -21,6 +21,10 @@ struct kk_ts_state {
 
 struct kk_oq_state {
    unsigned queries;
+   /* The device-wide visibility buffer (KK_MAX_OCCLUSION_QUERIES) was full
+    * when the pool was created. Its results live in `bo` instead, nothing is
+    * counted, and every ended query reports "visible". */
+   bool overflow;
 };
 
 struct kk_query_pool {

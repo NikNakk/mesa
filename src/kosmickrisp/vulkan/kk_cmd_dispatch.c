@@ -12,6 +12,7 @@
 #include "kk_device.h"
 #include "kk_entrypoints.h"
 #include "kk_shader.h"
+#include "kk_fdm.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
 
@@ -80,6 +81,17 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
    struct mtl_size local_size = cs->info.cs.local_size;
 
+   const uint32_t groups[3] = {groupCountX, groupCountY, groupCountZ};
+   uint64_t compact = 0;
+   if (!cmd->state.cond_render.enabled && !baseGroupX && !baseGroupY && !baseGroupZ)
+      compact = kk_implicit_compact_dispatch(cmd, cs, &groupCountX, &groupCountY, groupCountZ);
+   desc->root_dirty |= desc->root.cs.compact_params != compact;
+   desc->root.cs.compact_params = compact;
+   if (compact && memcmp(desc->root.cs.compact_groups, groups, sizeof(groups))) {
+      memcpy(desc->root.cs.compact_groups, groups, sizeof(groups));
+      desc->root_dirty = true;
+   }
+
    mtl_compute_encoder *encoder = cs_get_compute(cmd);
    if (cmd->state.cond_render.enabled) {
       /* Convert to indirect for predication */
@@ -110,6 +122,13 @@ kk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
       kk_flush_compute_state(cmd);
       mtl_dispatch_threads(encoder, grid_size, local_size);
    }
+   if (unlikely(kk_pass_timing_dispatch_enabled())) {
+      char label[64];
+      snprintf(label, sizeof(label), "cs %p %ux%u %s", (void *)cs,
+               (unsigned)(groups[0] * local_size.x), (unsigned)(groups[1] * local_size.y),
+               compact ? "COMPACT" : cs->info.cs.compact_count ? "eligible" : cs->info.cs.compact_reject);
+      kk_pass_timing_dispatch(cmd, label);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -125,6 +144,8 @@ kk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
    desc->root.cs.base_group[0] = 0;
    desc->root.cs.base_group[1] = 0;
    desc->root.cs.base_group[2] = 0;
+   desc->root_dirty |= desc->root.cs.compact_params != 0;
+   desc->root.cs.compact_params = 0;
 
    struct kk_shader *cs = cmd->state.shaders[MESA_SHADER_COMPUTE];
    struct mtl_size local_size = cs->info.cs.local_size;

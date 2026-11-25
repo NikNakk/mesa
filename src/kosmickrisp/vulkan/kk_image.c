@@ -6,6 +6,7 @@
  */
 
 #include "kk_image.h"
+#include "kk_fdm.h"
 
 #include "kk_device.h"
 #include "kk_device_memory.h"
@@ -137,6 +138,10 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
    if (vk_format == VK_FORMAT_R8G8_UNORM && tiling == VK_IMAGE_TILING_OPTIMAL &&
        pdev->vk.supported_extensions.EXT_fragment_density_map)
       features |= VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT;
+
+   if (vk_format == VK_FORMAT_R8_UINT && tiling == VK_IMAGE_TILING_OPTIMAL &&
+       pdev->vk.supported_extensions.KHR_fragment_shading_rate)
+      features |= VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
    if (features != 0) {
       features |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT;
@@ -651,6 +656,7 @@ kk_image_finish(struct kk_device *dev, struct kk_image *image,
 #ifdef VK_USE_PLATFORM_METAL_EXT
    kk_image_release_metal_import(dev, image);
 #endif
+   kk_implicit_image_finish(dev, image);
    kk_fdm_image_finish(dev, image);
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       kk_image_plane_finish(dev, &image->planes[plane], image->vk.create_flags,
@@ -684,6 +690,10 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return result;
    }
 
+   if (kk_implicit_fdm_image(pCreateInfo)) {
+      image->implicit_candidate = true;
+      image->vk.create_flags |= VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT;
+   }
    result = kk_fdm_image_init(dev, image);
    if (result != VK_SUCCESS) {
       kk_image_finish(dev, image, pAllocator);

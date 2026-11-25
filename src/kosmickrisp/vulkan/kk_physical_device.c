@@ -183,6 +183,10 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_metal = true,
       .EXT_fragment_density_map = KK_EXPERIMENTAL(FDM),
+      /* KK_FAKE_VRS=1 (diagnostic): attachment shading rates are accepted and ignored
+       * (every fragment shaded), so an application shows which passes it would
+       * shade coarsely (kk_vrs_* in kk_fdm.c). */
+      .KHR_fragment_shading_rate = debug_get_bool_option("KK_FAKE_VRS", false),
       .EXT_fragment_density_map_offset = KK_EXPERIMENTAL(FDM_RATE) &&
          debug_get_bool_option("KK_FDM_OFFSET_PROBE", false),
 #ifdef VK_USE_PLATFORM_METAL_EXT
@@ -247,6 +251,9 @@ kk_get_device_features(
       .independentBlend = true,
       .inheritedQueries = true,
       .largePoints = true,
+      /* KK_FAKE_WIDE_LINES=1: claim wide lines (still drawn one pixel wide; Metal has
+       * none) for games that otherwise stop on a driver warning (No Man's Sky). */
+      .wideLines = debug_get_bool_option("KK_FAKE_WIDE_LINES", false),
       .logicOp = true,
       .multiViewport = true,
       .occlusionQueryPrecise = true,
@@ -462,6 +469,11 @@ kk_get_device_features(
       /* VK_EXT_custom_resolve */
       .customResolve = true,
 
+      /* VK_KHR_fragment_shading_rate (KK_FAKE_VRS) */
+      .pipelineFragmentShadingRate = supported_extensions->KHR_fragment_shading_rate,
+      .primitiveFragmentShadingRate = false,
+      .attachmentFragmentShadingRate = supported_extensions->KHR_fragment_shading_rate,
+
       /* VK_EXT_fragment_density_map */
       .fragmentDensityMap = supported_extensions->EXT_fragment_density_map,
       .fragmentDensityMapDynamic = false,
@@ -672,9 +684,9 @@ kk_get_device_properties(
       .maxCombinedClipAndCullDistances = 8,
       .discreteQueuePriorities = 2,
       .pointSizeRange = {1.0f, 511.0f},
-      .lineWidthRange = {1.0f, 1.0f},
+      .lineWidthRange = {1.0f, debug_get_bool_option("KK_FAKE_WIDE_LINES", false) ? 8.0f : 1.0f},
       .pointSizeGranularity = 0.0625f,
-      .lineWidthGranularity = 0.0f,
+      .lineWidthGranularity = debug_get_bool_option("KK_FAKE_WIDE_LINES", false) ? 1.0f : 0.0f,
       .strictLines = false,
       .standardSampleLocations = true,
       .optimalBufferCopyOffsetAlignment = 1,
@@ -861,6 +873,25 @@ kk_get_device_properties(
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT32_MAX,
 
+      /* VK_KHR_fragment_shading_rate (KK_FAKE_VRS) */
+      .minFragmentShadingRateAttachmentTexelSize = {8, 8},
+      .maxFragmentShadingRateAttachmentTexelSize = {32, 32},
+      .maxFragmentShadingRateAttachmentTexelSizeAspectRatio = 4,
+      .primitiveFragmentShadingRateWithMultipleViewports = false,
+      .layeredShadingRateAttachments = true,
+      .fragmentShadingRateNonTrivialCombinerOps = true,
+      .maxFragmentSize = {4, 4},
+      .maxFragmentSizeAspectRatio = 4,
+      .maxFragmentShadingRateCoverageSamples = 16,
+      .maxFragmentShadingRateRasterizationSamples = VK_SAMPLE_COUNT_4_BIT,
+      .fragmentShadingRateWithShaderDepthStencilWrites = true,
+      .fragmentShadingRateWithSampleMask = true,
+      .fragmentShadingRateWithShaderSampleMask = false,
+      .fragmentShadingRateWithConservativeRasterization = false,
+      .fragmentShadingRateWithFragmentShaderInterlock = false,
+      .fragmentShadingRateWithCustomSampleLocations = false,
+      .fragmentShadingRateStrictMultiplyCombiner = false,
+
       /* VK_EXT_fragment_density_map */
       .minFragmentDensityTexelSize = {32, 32},
       .maxFragmentDensityTexelSize = {1024, 1024},
@@ -997,6 +1028,19 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
 
    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                        sizeof(instance->driver_build_sha));
+   /* Implicit foveation changes how shaders are lowered; an application's saved
+    * pipeline cache from one mode must not be used in another. */
+   const char *implicit_mode[] = {"KK_IMPLICIT_FDM", "KK_IMPLICIT_SINGLE", "KK_IMPLICIT_HALF",
+                                  "KK_IMPLICIT_STORAGE", "KK_IMPLICIT_SCALED", "KK_IMPLICIT_COMPACT", "KK_IMPLICIT_NO_FRAGCOORD",
+                                  "KK_IMPLICIT_NO_SAMPLE", "KK_IMPLICIT_NO_FETCH",
+                                  "KK_IMPLICIT_NO_FETCH_APP", "KK_IMPLICIT_SAMPLE_GRADIENTS",
+                                  "MESA_KK_EXPERIMENTAL"};
+   for (unsigned i = 0; i < ARRAY_SIZE(implicit_mode); i++) {
+      const char *v = getenv(implicit_mode[i]);
+      _mesa_blake3_update(&blake3_ctx, implicit_mode[i], strlen(implicit_mode[i]));
+      if (v)
+         _mesa_blake3_update(&blake3_ctx, v, strlen(v));
+   }
 
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
@@ -1462,4 +1506,24 @@ kk_GetPhysicalDeviceMultisamplePropertiesEXT(
    } else {
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){0, 0};
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+kk_GetPhysicalDeviceFragmentShadingRatesKHR(
+   VkPhysicalDevice physicalDevice, uint32_t *pFragmentShadingRateCount,
+   VkPhysicalDeviceFragmentShadingRateKHR *pFragmentShadingRates)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceFragmentShadingRateKHR, out,
+                          pFragmentShadingRates, pFragmentShadingRateCount);
+   static const VkExtent2D sizes[] = {
+      {4, 4}, {4, 2}, {2, 4}, {2, 2}, {2, 1}, {1, 2}, {1, 1},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(sizes); i++) {
+      vk_outarray_append_typed(VkPhysicalDeviceFragmentShadingRateKHR, &out, rate) {
+         rate->fragmentSize = sizes[i];
+         rate->sampleCounts =
+            VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+      }
+   }
+   return vk_outarray_status(&out);
 }

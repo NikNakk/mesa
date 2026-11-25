@@ -36,6 +36,8 @@
 #include "vk_pipeline_layout.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(kk_batch_timestamp_resolves, "KK_BATCH_TIMESTAMP_RESOLVES", false);
+DEBUG_GET_ONCE_BOOL_OPTION(kk_occlusion_split_trace, "KK_OCCLUSION_SPLIT_TRACE", false);
+DEBUG_GET_ONCE_BOOL_OPTION(kk_trace_resolve_order, "KK_TRACE_RESOLVE_ORDER", false);
 
 static void
 kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
@@ -75,6 +77,250 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->ts_stage_map);
 }
 
+
+/* --- KK_PASS_TIMING ---------------------------------------------------------- */
+#include "kk_bo.h"
+#include "util/os_time.h"
+#define KK_PT_MAX 512
+#define KK_PT_LABEL 64
+struct kk_pass_timing {
+   mtl_counter_heap *heap;
+   uint32_t count;
+   char labels[KK_PT_MAX][KK_PT_LABEL];
+};
+struct kk_pt_pending {
+   struct kk_device *dev;
+   struct kk_bo *bo;
+   mtl_counter_heap *heap;
+   uint32_t count;
+   uint64_t recorded_ns;
+   char (*labels)[KK_PT_LABEL];
+   struct kk_pt_pending *next;
+};
+static struct {
+   simple_mtx_t lock;
+   struct kk_pt_pending *pending;
+   struct { char label[KK_PT_LABEL]; uint64_t ticks, count; } stats[256];
+   uint32_t stat_count;
+   uint64_t frames, last_print_ns, dropped, buffers;
+   struct kk_device *dev;
+} kk_pt = {.lock = SIMPLE_MTX_INITIALIZER};
+
+static bool
+kk_pass_timing_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("KK_PASS_TIMING", false);
+   return enabled;
+}
+
+static void kk_pt_collect_locked(bool all);
+static void kk_pt_stamp(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder, bool render,
+                        const char *label);
+
+/* KK_PASS_TIMING_DISPATCH=1 (with KK_PASS_TIMING): a stamp after every dispatch,
+ * labelled by shader and grid. */
+bool
+kk_pass_timing_dispatch_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = kk_pass_timing_enabled() &&
+                debug_get_bool_option("KK_PASS_TIMING_DISPATCH", false);
+   return enabled;
+}
+
+void
+kk_pass_timing_dispatch(struct kk_cmd_buffer *cmd, const char *label)
+{
+   if (kk_pass_timing_dispatch_enabled() && cmd->metal.compute)
+      kk_pt_stamp(cmd, cmd->metal.compute, false, label);
+}
+static void kk_pt_print_locked(struct kk_device *dev);
+
+void
+kk_pass_timing_frame(void)
+{
+   if (!kk_pass_timing_enabled())
+      return;
+   p_atomic_inc(&kk_pt.frames);
+   simple_mtx_lock(&kk_pt.lock);
+   kk_pt_collect_locked(false);
+   if (kk_pt.dev)
+      kk_pt_print_locked(kk_pt.dev);
+   simple_mtx_unlock(&kk_pt.lock);
+}
+
+static void
+kk_pt_label_render(struct kk_cmd_buffer *cmd, char *out)
+{
+   const struct kk_rendering_state *r = &cmd->state.gfx.render;
+   const struct kk_image_view *c = r->color_att_count ? r->color_att[0].iview : NULL;
+   const struct kk_image_view *d = r->depth_att.iview;
+   const struct kk_image_view *v = c ? c : d;
+   if (!v) {
+      snprintf(out, KK_PT_LABEL, "render (no attachment)");
+      return;
+   }
+   snprintf(out, KK_PT_LABEL, "render %ux%u%s c%d d%d s%u x%u%s",
+            u_minify(v->vk.image->extent.width, v->vk.base_mip_level),
+            u_minify(v->vk.image->extent.height, v->vk.base_mip_level),
+            v->vk.base_mip_level ? " mip" : "", c ? (int)c->vk.view_format : 0,
+            d ? (int)d->vk.view_format : 0, (unsigned)v->vk.image->samples,
+            r->color_att_count, cmd->state.gfx.fdm.density ? " MAPPED" : "");
+}
+
+static void
+kk_pt_stamp(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder, bool render,
+            const char *label)
+{
+   struct kk_pass_timing *pt = cmd->pass_timing;
+   if (!pt) {
+      pt = cmd->pass_timing = calloc(1, sizeof(*pt));
+      if (!pt)
+         return;
+   }
+   if (pt->count >= KK_PT_MAX)
+      return;
+   if (!pt->heap) {
+      struct kk_device *dev = kk_cmd_buffer_device(cmd);
+      pt->heap = mtl_new_timestamp_counter_heap(dev->mtl_handle, KK_PT_MAX);
+      if (!pt->heap)
+         return;
+   }
+   if (render)
+      mtl_render_write_timestamp_precise(encoder, MTL_RENDER_STAGE_FRAGMENT, pt->heap, pt->count);
+   else
+      mtl_compute_write_timestamp(encoder, pt->heap, pt->count);
+   snprintf(pt->labels[pt->count++], KK_PT_LABEL, "%s", label);
+}
+
+static void
+kk_pt_collect_locked(bool all)
+{
+   uint64_t now = os_time_get_nano();
+   for (struct kk_pt_pending **link = &kk_pt.pending; *link;) {
+      struct kk_pt_pending *p = *link;
+      const uint64_t *t = p->bo->cpu;
+      bool done = t[p->count - 1] != 0;
+      if (!done && !all && now - p->recorded_ns < 3000000000ull) {
+         link = &p->next;
+         continue;
+      }
+      if (done) {
+         for (uint32_t i = 1; i < p->count; i++) {
+            if (!t[i] || !t[i - 1] || t[i] < t[i - 1])
+               continue;
+            uint32_t s;
+            for (s = 0; s < kk_pt.stat_count && strcmp(kk_pt.stats[s].label, p->labels[i]); s++)
+               ;
+            if (s == kk_pt.stat_count) {
+               if (s == ARRAY_SIZE(kk_pt.stats))
+                  continue;
+               snprintf(kk_pt.stats[s].label, KK_PT_LABEL, "%s", p->labels[i]);
+               kk_pt.stat_count++;
+            }
+            kk_pt.stats[s].ticks += t[i] - t[i - 1];
+            kk_pt.stats[s].count++;
+         }
+      } else {
+         kk_pt.dropped++;
+      }
+      *link = p->next;
+      kk_destroy_bo(p->dev, p->bo);
+      mtl_release(p->heap);
+      free(p->labels);
+      free(p);
+   }
+}
+
+static void
+kk_pt_print_locked(struct kk_device *dev)
+{
+   uint64_t now = os_time_get_nano();
+   if (!kk_pt.last_print_ns) {
+      kk_pt.last_print_ns = now;
+      return;
+   }
+   if (now - kk_pt.last_print_ns < 5000000000ull)
+      return;
+   uint64_t frames = p_atomic_xchg(&kk_pt.frames, 0);
+   double freq = (double)mtl_device_timestamp_frequency(dev->mtl_handle);
+   if (frames && freq > 0) {
+      /* Largest first. */
+      uint32_t order[ARRAY_SIZE(kk_pt.stats)];
+      for (uint32_t i = 0; i < kk_pt.stat_count; i++)
+         order[i] = i;
+      for (uint32_t i = 0; i < kk_pt.stat_count; i++)
+         for (uint32_t j = i + 1; j < kk_pt.stat_count; j++)
+            if (kk_pt.stats[order[j]].ticks > kk_pt.stats[order[i]].ticks) {
+               uint32_t x = order[i]; order[i] = order[j]; order[j] = x;
+            }
+      double total = 0;
+      for (uint32_t i = 0; i < kk_pt.stat_count; i++)
+         total += kk_pt.stats[i].ticks;
+      mesa_logi("kk-pass-timing: %llu frames, %.2f ms GPU per frame between stamps "
+                "(%llu command buffers, %llu dropped)",
+                (unsigned long long)frames, total / freq * 1000.0 / frames,
+                (unsigned long long)kk_pt.buffers, (unsigned long long)kk_pt.dropped);
+      for (uint32_t i = 0; i < MIN2(kk_pt.stat_count, 30); i++) {
+         const __typeof__(kk_pt.stats[0]) *e = &kk_pt.stats[order[i]];
+         mesa_logi("kk-pass-timing: %7.3f ms %6.1f/frame  %s", e->ticks / freq * 1000.0 / frames,
+                   (double)e->count / frames, e->label);
+      }
+   }
+   memset(kk_pt.stats, 0, sizeof(kk_pt.stats));
+   kk_pt.stat_count = 0;
+   kk_pt.dropped = 0;
+   kk_pt.buffers = 0;
+   kk_pt.last_print_ns = now;
+}
+
+void
+kk_pass_timing_end_cmdbuf(struct kk_cmd_buffer *cmd)
+{
+   struct kk_pass_timing *pt = cmd->pass_timing;
+   if (!kk_pass_timing_enabled() || !pt || !pt->heap)
+      return;
+   struct kk_device *dev = kk_cmd_buffer_device(cmd);
+   if (pt->count >= 2) {
+      struct kk_pt_pending *p = calloc(1, sizeof(*p));
+      struct kk_bo *bo = NULL;
+      if (p && kk_alloc_bo(dev, &cmd->vk.base, pt->count * sizeof(uint64_t), 8, &bo) == VK_SUCCESS &&
+          (p->labels = malloc(pt->count * KK_PT_LABEL))) {
+         memset(bo->cpu, 0, pt->count * sizeof(uint64_t));
+         mtl_command_resolve_counter_heap(cmd->metal.cmd_buf, pt->heap, 0, pt->count, bo->gpu);
+         memcpy(p->labels, pt->labels, pt->count * KK_PT_LABEL);
+         p->dev = dev; p->bo = bo; p->heap = pt->heap; p->count = pt->count;
+         p->recorded_ns = os_time_get_nano();
+         simple_mtx_lock(&kk_pt.lock);
+         p->next = kk_pt.pending; kk_pt.pending = p;
+         kk_pt.dev = dev;
+         kk_pt.buffers++;
+         simple_mtx_unlock(&kk_pt.lock);
+         pt->heap = NULL; /* owned by the pending record until the GPU is done */
+      } else {
+         if (bo)
+            kk_destroy_bo(dev, bo);
+         free(p);
+      }
+   }
+   pt->count = 0;
+}
+
+void
+kk_pass_timing_free(struct kk_cmd_buffer *cmd)
+{
+   struct kk_pass_timing *pt = cmd->pass_timing;
+   if (!pt)
+      return;
+   if (pt->heap)
+      mtl_release(pt->heap);
+   free(pt);
+   cmd->pass_timing = NULL;
+}
+
 /* Ends Metal command buffer recording and returns allocator to pool for reuse */
 static void
 end_recording(struct kk_cmd_buffer *cmd)
@@ -84,6 +330,7 @@ end_recording(struct kk_cmd_buffer *cmd)
 
    cs_end(cmd);
    kk_flush_timestamp_resolves(cmd);
+   kk_pass_timing_end_cmdbuf(cmd);
    mtl_end_command_buffer(cmd->metal.cmd_buf);
    if (cmd->state.gfx.stitch.starts_resumed ||
        cmd->state.gfx.stitch.ends_suspended)
@@ -105,6 +352,7 @@ kk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
 
    /* Ensure closed command buffer for safe returns to pool */
    end_recording(cmd);
+   kk_pass_timing_free(cmd);
    if (cmd->metal.held_allocator)
       kk_cmd_pool_return_allocator(pool, cmd->metal.held_allocator);
    cmd->metal.held_allocator = NULL;
@@ -271,7 +519,8 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    memset(cmd->fdm_offsets, 0, sizeof(cmd->fdm_offsets));
    cmd->one_time_submit =
       (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) &&
-      !debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false);
+      !debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false) &&
+      !debug_get_option_kk_trace_resolve_order();
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */
@@ -285,6 +534,7 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    cmd->state.gfx.pending_barrier_src = MTL_STAGE_ALL;
    cmd->state.gfx.pending_barrier_dst = MTL_STAGE_ALL;
 
+   kk_implicit_dump_begin(cmd);
    return VK_SUCCESS;
 
 fail_allocator:
@@ -292,6 +542,80 @@ fail_allocator:
    cmd->metal.cmd_buf = NULL;
 fail_cmd:
    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+static void
+kk_trace_resolve_barriers(const struct vk_cmd_queue_entry *entry, uint32_t id)
+{
+   const VkDependencyInfo *dep = entry->type == VK_CMD_PIPELINE_BARRIER2
+      ? entry->u.pipeline_barrier2.dependency_info : NULL;
+   const struct vk_cmd_pipeline_barrier *legacy = &entry->u.pipeline_barrier;
+   if (!dep && entry->type != VK_CMD_PIPELINE_BARRIER)
+      return;
+
+   const uint32_t image_count = dep ? dep->imageMemoryBarrierCount : legacy->image_memory_barrier_count;
+   mesa_logi("kk-resolve-order %u:   %u memory, %u buffer, %u image barriers", id,
+             dep ? dep->memoryBarrierCount : legacy->memory_barrier_count,
+             dep ? dep->bufferMemoryBarrierCount : legacy->buffer_memory_barrier_count,
+             image_count);
+   for (uint32_t i = 0; i < image_count; i++) {
+      const VkImageMemoryBarrier2 *barrier = dep ? &dep->pImageMemoryBarriers[i] : NULL;
+      const VkImageMemoryBarrier *old = dep ? NULL : &legacy->image_memory_barriers[i];
+      mesa_logi("kk-resolve-order %u:   image %p layout %d -> %d, stage/access %#llx/%#llx -> %#llx/%#llx",
+                id, (void *)vk_image_from_handle(barrier ? barrier->image : old->image),
+                barrier ? barrier->oldLayout : old->oldLayout,
+                barrier ? barrier->newLayout : old->newLayout,
+                (unsigned long long)(barrier ? barrier->srcStageMask : legacy->src_stage_mask),
+                (unsigned long long)(barrier ? barrier->srcAccessMask : old->srcAccessMask),
+                (unsigned long long)(barrier ? barrier->dstStageMask : legacy->dst_stage_mask),
+                (unsigned long long)(barrier ? barrier->dstAccessMask : old->dstAccessMask));
+   }
+}
+
+static void
+kk_trace_resolve_commands(struct kk_cmd_buffer *cmd)
+{
+   static uint32_t count;
+   if (p_atomic_read(&count) >= 24)
+      return;
+
+   const struct list_head *head = &cmd->vk.cmd_queue.cmds;
+   list_for_each_entry(const struct vk_cmd_queue_entry, entry, head, cmd_link) {
+      const VkResolveImageInfo2 *info = entry->type == VK_CMD_RESOLVE_IMAGE2
+         ? entry->u.resolve_image2.resolve_image_info : NULL;
+      const struct vk_cmd_resolve_image *legacy = &entry->u.resolve_image;
+      if (!info && entry->type != VK_CMD_RESOLVE_IMAGE)
+         continue;
+      VK_FROM_HANDLE(kk_image, src, info ? info->srcImage : legacy->src_image);
+      VK_FROM_HANDLE(kk_image, dst, info ? info->dstImage : legacy->dst_image);
+      if (!src->implicit_fdm)
+         continue;
+
+      const uint32_t id = p_atomic_inc_return(&count);
+      if (id > 24)
+         return;
+      const VkExtent3D extent = info ? info->pRegions[0].extent : legacy->regions[0].extent;
+      const VkOffset3D offset = info ? info->pRegions[0].dstOffset : legacy->regions[0].dstOffset;
+      mesa_logi("kk-resolve-order %u: cmd %p %s %p -> %p, %u region(s), first %ux%u at %d,%d, destination %ux%u",
+                id, (void *)cmd, vk_cmd_queue_type_names[entry->type],
+                (void *)&src->vk, (void *)&dst->vk,
+                info ? info->regionCount : legacy->region_count,
+                extent.width, extent.height, offset.x, offset.y,
+                dst->vk.extent.width, dst->vk.extent.height);
+      const struct list_head *prev = entry->cmd_link.prev;
+      for (unsigned i = 0; prev != head && i < 16; i++, prev = prev->prev) {
+         const struct vk_cmd_queue_entry *command =
+            list_entry(prev, const struct vk_cmd_queue_entry, cmd_link);
+         mesa_logi("kk-resolve-order %u:  -%u %s", id, i + 1,
+                   vk_cmd_queue_type_names[command->type]);
+         kk_trace_resolve_barriers(command, id);
+         if (command->type == VK_CMD_END_RENDERING ||
+             command->type == VK_CMD_END_RENDERING2_KHR ||
+             command->type == VK_CMD_END_RENDER_PASS ||
+             command->type == VK_CMD_END_RENDER_PASS2)
+            break;
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -303,6 +627,10 @@ kk_EndCommandBuffer(VkCommandBuffer commandBuffer)
       cmd->defer_encoding = false;
       kk_fdm_execute_commands(cmd, &cmd->vk.cmd_queue);
    }
+   if (debug_get_option_kk_trace_resolve_order() &&
+       cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+       vk_command_buffer_get_record_result(&cmd->vk) == VK_SUCCESS)
+      kk_trace_resolve_commands(cmd);
    end_recording(cmd);
 
    return vk_command_buffer_end(&cmd->vk);
@@ -445,9 +773,19 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    if (cmd->metal.head)
       cmd->metal.tail_used = true;
 
-   if (KK_EXPERIMENTAL(STITCH_PASSES))
-      mtl_render_pass_descriptor_set_visibility_accumulate(
-         state->render_pass_descriptor, options != 0);
+   const bool continues_query = state->render.encoders > 1 &&
+                                state->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED;
+   mtl_render_pass_descriptor_set_visibility_accumulate(
+      state->render_pass_descriptor, options != 0 || continues_query);
+
+   if (continues_query && debug_get_option_kk_occlusion_split_trace()) {
+      static uint32_t count;
+      const uint32_t n = p_atomic_inc_return(&count);
+      if (n <= 16 || (n & (n - 1)) == 0)
+         mesa_logi("kk-occlusion: continuing query %u across encoder %u at %ux MSAA (restart %u)",
+                   (unsigned)state->occlusion.index, state->render.encoders,
+                   (unsigned)state->render.samples, n);
+   }
    cmd->metal.render =
       options ? mtl_new_render_command_encoder_with_options(
                    cmd->metal.cmd_buf, state->render_pass_descriptor, options)
@@ -468,6 +806,9 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    kk_encoder_stat(state->need_to_start_render_pass ? "render restart" : "render", false);
 
    kk_encoder_update_debug(cmd, cmd->metal.render);
+   if (kk_pass_timing_enabled() &&
+       (!cmd->pass_timing || !((struct kk_pass_timing *)cmd->pass_timing)->count))
+      kk_pt_stamp(cmd, cmd->metal.render, true, "(start)");
    if (kk_label_passes())
       kk_label_render_encoder(cmd);
    /* Starting a new render pass means we already flushed and no barrier is
@@ -572,6 +913,9 @@ cs_get_compute_from(struct kk_cmd_buffer *cmd, const char *caller)
       }
       mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
       kk_encoder_update_debug(cmd, cmd->metal.compute);
+      if (kk_pass_timing_enabled() &&
+          (!cmd->pass_timing || !((struct kk_pass_timing *)cmd->pass_timing)->count))
+         kk_pt_stamp(cmd, cmd->metal.compute, false, "(start)");
       if (kk_label_passes())
          mtl_encoder_set_label(cmd->metal.compute, caller);
    }
@@ -585,6 +929,15 @@ end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
    /* TODO_KOSMICKRISP This is probably overkill */
    if (!KK_EXPERIMENTAL(LIGHT_BARRIERS))
       mtl_barrier_after_stages(encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   if (kk_pass_timing_enabled()) {
+      char label[KK_PT_LABEL];
+      const bool render = encoder == cmd->metal.render;
+      if (render)
+         kk_pt_label_render(cmd, label);
+      else
+         snprintf(label, sizeof(label), "compute/transfer");
+      kk_pt_stamp(cmd, encoder, render, label);
+   }
    mtl_end_encoding(encoder);
    mtl_release(encoder);
 
@@ -645,6 +998,7 @@ cs_end(struct kk_cmd_buffer *cmd)
           cmd->metal.allocator) {
          cmd->state.gfx.render.resuming_encoder = false;
          kk_flush_timestamp_resolves(cmd);
+         kk_pass_timing_end_cmdbuf(cmd);
          mtl_end_command_buffer(cmd->metal.cmd_buf);
          cmd->metal.head = cmd->metal.cmd_buf;
          cmd->metal.cmd_buf = kk_cmd_pool_get_cmd_buf(kk_cmd_buffer_pool(cmd));
@@ -945,6 +1299,11 @@ kk_cmd_barrier(struct kk_cmd_buffer *cmd, const VkDependencyInfo *dep)
       mtl_barrier_after_encoder_stages(cmd->metal.compute,
                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT,
                                        MTL_STAGE_DISPATCH | MTL_STAGE_BLIT);
+      /* With light barriers a render encoder starts with only the accumulated
+       * barrier: carry this one over too, or a pass after the compute encoder can
+       * read its results before they are written (NMS's sky and clouds). */
+      if (KK_EXPERIMENTAL(LIGHT_BARRIERS))
+         kk_accumulate_barrier(cmd, dep);
    } else {
       kk_encoder_stat("barrier with no encoder open", false);
       kk_barrier_histogram(dep);
