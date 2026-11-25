@@ -3137,6 +3137,9 @@ kk_msl_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
 {
    const uint32_t entrypoint_length = blob_read_uint32(blob);
    const uint32_t code_length = blob_read_uint32(blob);
+   if (!entrypoint_length || !code_length)
+      return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+
    data->entrypoint_name = ralloc_array(NULL, char, entrypoint_length);
    if (data->entrypoint_name == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -3148,11 +3151,10 @@ kk_msl_deserialize(struct blob_reader *blob, struct msl_compile_data *data)
    blob_copy_bytes(blob, (void *)data->entrypoint_name, entrypoint_length);
    blob_copy_bytes(blob, (void *)data->code, code_length);
 
-   if (blob->overrun)
+   if (blob->overrun || data->entrypoint_name[entrypoint_length - 1] != '\0' ||
+       data->code[code_length - 1] != '\0')
       return VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
 
-   shader->diagnostic_msl_hash = _mesa_hash_string(data->code);
-   kk_dump_msl(stage, data->code);
    return VK_SUCCESS;
 }
 
@@ -3178,6 +3180,9 @@ kk_deserialize_shader_impl(struct vk_device *vk_dev, struct blob_reader *blob,
    if (result != VK_SUCCESS)
       goto fail;
 
+   const char *code = shader->msl_data[info.stage].code;
+   shader->diagnostic_msl_hash = _mesa_hash_string(code);
+   kk_dump_msl(info.stage, code);
    shader->info = info;
 
    if (shader->info.stage == MESA_SHADER_VERTEX) {
@@ -3185,6 +3190,7 @@ kk_deserialize_shader_impl(struct vk_device *vk_dev, struct blob_reader *blob,
          result = kk_msl_deserialize(blob, &shader->msl_data[stage]);
          if (result != VK_SUCCESS)
             goto fail;
+         kk_dump_msl(stage, shader->msl_data[stage].code);
       }
    }
    if (shader->info.has_tile) {
