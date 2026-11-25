@@ -23,6 +23,24 @@ clone_input() {
   git clone --depth 1 --branch "$ref" "$url" "$destination"
   printf '%s %s\n' "$url" "$(git -C "$destination" rev-parse HEAD)" >> "$PREFIX/build-inputs.txt"
 }
+build_threshold_foveation() {
+  local revision=58c1aa3099fc83814c79440c6ee5036c7b0ef206
+  local url=https://github.com/NikNakk/threshold-foveation.git
+  local source=${THRESHOLD_FOVEATION_SOURCE:-$url}
+  local checkout="$work/threshold-foveation-source"
+  local install="$work/threshold-foveation"
+  git init -q "$checkout"
+  git -C "$checkout" fetch --depth 1 "$source" "$revision"
+  git -C "$checkout" checkout --detach FETCH_HEAD
+  printf '%s %s\n' "$url" "$(git -C "$checkout" rev-parse HEAD)" >> "$PREFIX/build-inputs.txt"
+  cmake -S "$checkout" -B "$work/threshold-foveation-build" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX="$install"
+  cmake --build "$work/threshold-foveation-build" --parallel 3
+  cmake --install "$work/threshold-foveation-build"
+  cp -P "$install/lib/"libthreshold_foveation*.dylib "$PREFIX/lib/"
+  mkdir -p "$PREFIX/licenses/threshold-foveation"
+  cp "$install/share/licenses/threshold-foveation/"* "$PREFIX/licenses/threshold-foveation/"
+}
 case "$COMPONENT" in
 monado)
   brew install eigen glslang jpeg-turbo libusb molten-vk vulkan-headers vulkan-loader
@@ -75,16 +93,30 @@ xrizer)
   test -f xrizer.vrdrivermanifest && cp xrizer.vrdrivermanifest "$PREFIX/" || true
   ;;
 kosmickrisp)
-  brew install meson bison flex molten-vk vulkan-headers llvm spirv-llvm-translator spirv-tools
+  brew install meson bison flex molten-vk vulkan-headers vulkan-loader llvm spirv-llvm-translator spirv-tools
   python3 -m venv "$work/venv"
   "$work/venv/bin/pip" install mako pyyaml packaging
   export PKG_CONFIG_PATH="$(brew --prefix spirv-llvm-translator)/lib/pkgconfig:$(brew --prefix spirv-tools)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
   export PATH="$(brew --prefix llvm)/bin:$work/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+  build_threshold_foveation
   meson setup "$work/build" --prefix "$PREFIX" --buildtype release -Dplatforms=macos \
-    -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false -Dzstd=disabled --prefer-static
+    -Dvulkan-drivers=kosmickrisp -Dgallium-drivers= -Dopengl=false -Dzstd=disabled --prefer-static \
+    -Dthreshold-foveation-root="$work/threshold-foveation"
   meson compile -C "$work/build"
   meson install -C "$work/build"
   test -n "$(find "$PREFIX" -name '*kosmickrisp*.json' -print -quit)"
+  # Zink and the ICD come from this checkout, with separate build options.
+  zink_rpath='-Wl,-rpath,@loader_path/../../../../../lib'
+  meson setup "$work/zink-build" --buildtype release -Dplatforms=macos \
+    -Dgallium-drivers=zink -Dvulkan-drivers= -Degl=enabled -Dgles1=disabled \
+    -Dgles2=enabled -Dopengl=true -Dglx=disabled -Dgbm=disabled -Dllvm=disabled \
+    -Dc_link_args="$zink_rpath" -Dcpp_link_args="$zink_rpath"
+  meson compile -C "$work/zink-build"
+  for directory in src/egl src/mesa/glapi/es2api src/gallium/targets/dri; do
+    mkdir -p "$PREFIX/zink/$directory"
+    cp -P "$work/zink-build/$directory"/lib*.dylib "$PREFIX/zink/$directory/"
+  done
+  cp -L "$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib" "$PREFIX/lib/"
   ;;
 klepton)
   make build/klepton-ld
