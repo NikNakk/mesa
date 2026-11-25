@@ -1727,7 +1727,9 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
       if (target && target->implicit_fdm) {
          const struct kk_attachment *att = render->color_att_count && render->color_att[0].iview
                                               ? &render->color_att[0] : &render->depth_att;
-         density = kk_implicit_density(dev, target, att->load_op != VK_ATTACHMENT_LOAD_OP_LOAD);
+         const bool replaces_contents = render->rendering_to_whole_framebuffer &&
+                                        att->load_op != VK_ATTACHMENT_LOAD_OP_LOAD;
+         density = kk_implicit_density(dev, target, replaces_contents);
          implicit_density = density != NULL;
       }
    }
@@ -1742,7 +1744,8 @@ kk_fdm_setup_rendering(struct kk_cmd_buffer *cmd,
       for (uint32_t i = 0; i <= render->color_att_count; i++) {
          const struct kk_attachment *att =
             i < render->color_att_count ? &render->color_att[i] : &render->depth_att;
-         if (!att->iview || att->load_op != VK_ATTACHMENT_LOAD_OP_LOAD)
+         if (!att->iview || (render->rendering_to_whole_framebuffer &&
+                             att->load_op != VK_ATTACHMENT_LOAD_OP_LOAD))
             continue;
          struct kk_image *img = container_of(att->iview->vk.image, struct kk_image, vk);
          if (!img->rate_ref || img->rate_ref == use)
@@ -3179,12 +3182,12 @@ kk_watched_res_image(const struct kk_image *image)
 
 /* Diagnostic (session recordings): each distinct transfer out of a foveated image, with
  * the path it took, once. */
-void
+bool
 kk_implicit_fov_op(const char *what, const struct kk_image *src, const struct kk_image *dst,
                    uint32_t level, const char *path)
 {
    if (!src || !src->implicit_fdm || !getenv("XRT_SESSION_RECORD_DIR"))
-      return;
+      return false;
    static struct { const char *what, *path; const void *src, *dst; uint32_t level; } seen[256];
    static uint32_t count;
    simple_mtx_lock(&kk_fdm_lock);
@@ -3192,10 +3195,11 @@ kk_implicit_fov_op(const char *what, const struct kk_image *src, const struct kk
       if (seen[i].what == what && seen[i].path == path && seen[i].src == src &&
           seen[i].dst == dst && seen[i].level == level) {
          simple_mtx_unlock(&kk_fdm_lock);
-         return;
+         return false;
       }
    }
-   if (count < ARRAY_SIZE(seen)) {
+   const bool log = count < ARRAY_SIZE(seen);
+   if (log) {
       seen[count++] = (__typeof__(seen[0])){what, path, src, dst, level};
       mesa_logi("kk-fovop: %s %p %ux%u fmt %d level %u -> %p %ux%u fmt %d fdm=%d: %s", what,
                 (const void *)src, src->vk.extent.width, src->vk.extent.height, src->vk.format,
@@ -3204,6 +3208,7 @@ kk_implicit_fov_op(const char *what, const struct kk_image *src, const struct kk
                 dst ? dst->implicit_fdm : 0, path);
    }
    simple_mtx_unlock(&kk_fdm_lock);
+   return log;
 }
 
 /* Diagnostic: right after an armed mark, the next copy out of a foveated image is

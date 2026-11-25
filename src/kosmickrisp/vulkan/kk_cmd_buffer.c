@@ -34,6 +34,8 @@
 #include "vk_pipeline_layout.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(kk_batch_timestamp_resolves, "KK_BATCH_TIMESTAMP_RESOLVES", false);
+DEBUG_GET_ONCE_BOOL_OPTION(kk_occlusion_split_trace, "KK_OCCLUSION_SPLIT_TRACE", false);
+DEBUG_GET_ONCE_BOOL_OPTION(kk_trace_resolve_order, "KK_TRACE_RESOLVE_ORDER", false);
 
 static void
 kk_descriptor_state_fini(struct kk_cmd_buffer *cmd,
@@ -515,7 +517,8 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    memset(cmd->fdm_offsets, 0, sizeof(cmd->fdm_offsets));
    cmd->one_time_submit =
       (pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) &&
-      !debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false);
+      !debug_get_bool_option("KK_WSI_DIRECT_ALPHA_ONE", false) &&
+      !debug_get_option_kk_trace_resolve_order();
 
    /* vk_command_buffer_begin will reset the command buffer meaning the
     * allocator may be returned to the pool. Request a new one. */
@@ -539,6 +542,80 @@ fail_cmd:
    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
+static void
+kk_trace_resolve_barriers(const struct vk_cmd_queue_entry *entry, uint32_t id)
+{
+   const VkDependencyInfo *dep = entry->type == VK_CMD_PIPELINE_BARRIER2
+      ? entry->u.pipeline_barrier2.dependency_info : NULL;
+   const struct vk_cmd_pipeline_barrier *legacy = &entry->u.pipeline_barrier;
+   if (!dep && entry->type != VK_CMD_PIPELINE_BARRIER)
+      return;
+
+   const uint32_t image_count = dep ? dep->imageMemoryBarrierCount : legacy->image_memory_barrier_count;
+   mesa_logi("kk-resolve-order %u:   %u memory, %u buffer, %u image barriers", id,
+             dep ? dep->memoryBarrierCount : legacy->memory_barrier_count,
+             dep ? dep->bufferMemoryBarrierCount : legacy->buffer_memory_barrier_count,
+             image_count);
+   for (uint32_t i = 0; i < image_count; i++) {
+      const VkImageMemoryBarrier2 *barrier = dep ? &dep->pImageMemoryBarriers[i] : NULL;
+      const VkImageMemoryBarrier *old = dep ? NULL : &legacy->image_memory_barriers[i];
+      mesa_logi("kk-resolve-order %u:   image %p layout %d -> %d, stage/access %#llx/%#llx -> %#llx/%#llx",
+                id, (void *)vk_image_from_handle(barrier ? barrier->image : old->image),
+                barrier ? barrier->oldLayout : old->oldLayout,
+                barrier ? barrier->newLayout : old->newLayout,
+                (unsigned long long)(barrier ? barrier->srcStageMask : legacy->src_stage_mask),
+                (unsigned long long)(barrier ? barrier->srcAccessMask : old->srcAccessMask),
+                (unsigned long long)(barrier ? barrier->dstStageMask : legacy->dst_stage_mask),
+                (unsigned long long)(barrier ? barrier->dstAccessMask : old->dstAccessMask));
+   }
+}
+
+static void
+kk_trace_resolve_commands(struct kk_cmd_buffer *cmd)
+{
+   static uint32_t count;
+   if (p_atomic_read(&count) >= 24)
+      return;
+
+   const struct list_head *head = &cmd->vk.cmd_queue.cmds;
+   list_for_each_entry(const struct vk_cmd_queue_entry, entry, head, cmd_link) {
+      const VkResolveImageInfo2 *info = entry->type == VK_CMD_RESOLVE_IMAGE2
+         ? entry->u.resolve_image2.resolve_image_info : NULL;
+      const struct vk_cmd_resolve_image *legacy = &entry->u.resolve_image;
+      if (!info && entry->type != VK_CMD_RESOLVE_IMAGE)
+         continue;
+      VK_FROM_HANDLE(kk_image, src, info ? info->srcImage : legacy->src_image);
+      VK_FROM_HANDLE(kk_image, dst, info ? info->dstImage : legacy->dst_image);
+      if (!src->implicit_fdm)
+         continue;
+
+      const uint32_t id = p_atomic_inc_return(&count);
+      if (id > 24)
+         return;
+      const VkExtent3D extent = info ? info->pRegions[0].extent : legacy->regions[0].extent;
+      const VkOffset3D offset = info ? info->pRegions[0].dstOffset : legacy->regions[0].dstOffset;
+      mesa_logi("kk-resolve-order %u: cmd %p %s %p -> %p, %u region(s), first %ux%u at %d,%d, destination %ux%u",
+                id, (void *)cmd, vk_cmd_queue_type_names[entry->type],
+                (void *)&src->vk, (void *)&dst->vk,
+                info ? info->regionCount : legacy->region_count,
+                extent.width, extent.height, offset.x, offset.y,
+                dst->vk.extent.width, dst->vk.extent.height);
+      const struct list_head *prev = entry->cmd_link.prev;
+      for (unsigned i = 0; prev != head && i < 16; i++, prev = prev->prev) {
+         const struct vk_cmd_queue_entry *command =
+            list_entry(prev, const struct vk_cmd_queue_entry, cmd_link);
+         mesa_logi("kk-resolve-order %u:  -%u %s", id, i + 1,
+                   vk_cmd_queue_type_names[command->type]);
+         kk_trace_resolve_barriers(command, id);
+         if (command->type == VK_CMD_END_RENDERING ||
+             command->type == VK_CMD_END_RENDERING2_KHR ||
+             command->type == VK_CMD_END_RENDER_PASS ||
+             command->type == VK_CMD_END_RENDER_PASS2)
+            break;
+      }
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
@@ -548,6 +625,10 @@ kk_EndCommandBuffer(VkCommandBuffer commandBuffer)
       cmd->defer_encoding = false;
       kk_fdm_execute_commands(cmd, &cmd->vk.cmd_queue);
    }
+   if (debug_get_option_kk_trace_resolve_order() &&
+       cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
+       vk_command_buffer_get_record_result(&cmd->vk) == VK_SUCCESS)
+      kk_trace_resolve_commands(cmd);
    end_recording(cmd);
 
    return vk_command_buffer_end(&cmd->vk);
@@ -690,9 +771,19 @@ cs_start_render(struct kk_cmd_buffer *cmd)
    if (cmd->metal.head)
       cmd->metal.tail_used = true;
 
-   if (KK_EXPERIMENTAL(STITCH_PASSES))
-      mtl_render_pass_descriptor_set_visibility_accumulate(
-         state->render_pass_descriptor, options != 0);
+   const bool continues_query = state->render.encoders > 1 &&
+                                state->occlusion.mode != MTL_VISIBILITY_RESULT_MODE_DISABLED;
+   mtl_render_pass_descriptor_set_visibility_accumulate(
+      state->render_pass_descriptor, options != 0 || continues_query);
+
+   if (continues_query && debug_get_option_kk_occlusion_split_trace()) {
+      static uint32_t count;
+      const uint32_t n = p_atomic_inc_return(&count);
+      if (n <= 16 || (n & (n - 1)) == 0)
+         mesa_logi("kk-occlusion: continuing query %u across encoder %u at %ux MSAA (restart %u)",
+                   (unsigned)state->occlusion.index, state->render.encoders,
+                   (unsigned)state->render.samples, n);
+   }
    cmd->metal.render =
       options ? mtl_new_render_command_encoder_with_options(
                    cmd->metal.cmd_buf, state->render_pass_descriptor, options)

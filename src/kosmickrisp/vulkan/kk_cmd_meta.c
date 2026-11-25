@@ -12,11 +12,18 @@
 
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
+#include "kk_debug.h"
+#include "kk_format.h"
 #include "kk_physical_device.h"
 
 #include "kosmickrisp/bridge/mtl_bridge.h"
+#include "kosmickrisp/bridge/mtl_rate_map.h"
 
 #include "kk_entrypoints.h"
+#include "util/u_debug.h"
+#include "vk_format.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(kk_native_full_resolve, "KK_NATIVE_FULL_RESOLVE", false);
 
 static VkResult
 kk_cmd_bind_map_buffer(struct vk_command_buffer *vk_cmd,
@@ -285,6 +292,69 @@ kk_CmdBlitImage2(VkCommandBuffer commandBuffer,
    kk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
+static bool
+kk_native_full_resolve(struct kk_cmd_buffer *cmd, struct kk_image *src,
+                       struct kk_image *dst, const VkResolveImageInfo2 *info)
+{
+   if (!debug_get_option_kk_native_full_resolve() || info->regionCount != 1 ||
+       !src->implicit_fdm || !dst->implicit_fdm || !dst->rate_params ||
+       !src->rate_ref || !src->rate_ref->map || kk_implicit_raw_active() ||
+       info->pNext || src->metal_imported || dst->metal_imported ||
+       src->wsi_direct || dst->wsi_direct ||
+       src->vk.image_type != VK_IMAGE_TYPE_2D || dst->vk.image_type != VK_IMAGE_TYPE_2D ||
+       src->vk.array_layers != 1 || dst->vk.array_layers != 1 ||
+       src->vk.samples <= VK_SAMPLE_COUNT_1_BIT || dst->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       src->vk.format != dst->vk.format || !vk_format_is_color(src->vk.format) ||
+       vk_format_is_int(src->vk.format) || vk_format_is_srgb(src->vk.format) ||
+       !(src->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       !(dst->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       !kk_get_va_format(vk_format_to_pipe_format(src->vk.format))->resolve)
+      return false;
+
+   const VkImageResolve2 *region = info->pRegions;
+   if (region->srcSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+       region->dstSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+       region->srcSubresource.mipLevel || region->dstSubresource.mipLevel ||
+       region->srcOffset.x || region->srcOffset.y || region->srcOffset.z ||
+       region->dstOffset.x || region->dstOffset.y || region->dstOffset.z ||
+       region->extent.width != src->vk.extent.width ||
+       region->extent.height != src->vk.extent.height ||
+       region->extent.width != dst->vk.extent.width ||
+       region->extent.height != dst->vk.extent.height)
+      return false;
+
+   mtl_render_pass_descriptor *pass = mtl_new_render_pass_descriptor();
+   mtl_render_pass_attachment_descriptor *color =
+      mtl_render_pass_descriptor_get_color_attachment(pass, 0);
+   mtl_render_pass_attachment_descriptor_set_texture(color, src->planes[0].mtl_handle);
+   mtl_render_pass_attachment_descriptor_set_resolve_texture(color, dst->planes[0].mtl_handle);
+   mtl_render_pass_attachment_descriptor_set_load_action(color, MTL_LOAD_ACTION_LOAD);
+   mtl_render_pass_attachment_descriptor_set_store_action(color, MTL_STORE_ACTION_UNKNOWN);
+   mtl_render_pass_descriptor_set_render_target_width(pass, region->extent.width);
+   mtl_render_pass_descriptor_set_render_target_height(pass, region->extent.height);
+   mtl_render_pass_descriptor_set_render_target_array_length(pass, 1);
+   mtl_render_pass_descriptor_set_rate_map(pass, src->rate_ref->map);
+
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   assert(!gfx->render_pass_descriptor);
+   gfx->render_pass_descriptor = pass;
+   gfx->render.samples = src->vk.samples;
+   gfx->restart_barrier |= KK_EXPERIMENTAL(LIGHT_BARRIERS);
+
+   cs_start_render(cmd);
+   mtl_render_set_color_store_action(cmd->metal.render,
+                                    MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE, 0);
+   if (KK_EXPERIMENTAL(LIGHT_BARRIERS))
+      mtl_barrier_after_stages(cmd->metal.render, MTL_STAGE_ALL, MTL_STAGE_ALL);
+   cs_end(cmd);
+
+   gfx->render_pass_descriptor = NULL;
+   memset(&gfx->render, 0, sizeof(gfx->render));
+   mtl_release(pass);
+   kk_implicit_copy_map(cmd, src, dst);
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
                     const VkResolveImageInfo2 *pResolveImageInfo)
@@ -292,18 +362,26 @@ kk_CmdResolveImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
-   struct kk_meta_save save;
-   kk_implicit_trace("resolve", vk_image_from_handle(pResolveImageInfo->srcImage), vk_image_from_handle(pResolveImageInfo->dstImage));
-   kk_implicit_fov_op("resolve",
-                      container_of(vk_image_from_handle(pResolveImageInfo->srcImage), struct kk_image, vk),
-                      container_of(vk_image_from_handle(pResolveImageInfo->dstImage), struct kk_image, vk),
-                      0, "resolve");
-   /* Diagnostic: leave only the resolve-attachment path, to look at its blit. */
-   if (container_of(vk_image_from_handle(pResolveImageInfo->srcImage), struct kk_image, vk)->implicit_fdm &&
-       debug_get_bool_option("KK_IMPLICIT_SKIP_EXPLICIT", false))
+   VK_FROM_HANDLE(kk_image, src, pResolveImageInfo->srcImage);
+   VK_FROM_HANDLE(kk_image, dst, pResolveImageInfo->dstImage);
+   kk_implicit_trace("resolve", &src->vk, &dst->vk);
+   if (src->implicit_fdm && debug_get_bool_option("KK_IMPLICIT_SKIP_EXPLICIT", false))
       return;
-   kk_fdm_note_use(vk_image_from_handle(pResolveImageInfo->srcImage), "resolve source");
-   kk_fdm_note_use(vk_image_from_handle(pResolveImageInfo->dstImage), "resolve destination");
+
+   kk_fdm_note_use(&src->vk, "resolve source");
+   kk_fdm_note_use(&dst->vk, "resolve destination");
+   const bool native = kk_native_full_resolve(cmd, src, dst, pResolveImageInfo);
+   kk_implicit_fov_op("resolve", src, dst, pResolveImageInfo->pRegions[0].srcSubresource.mipLevel,
+                     native ? "native full-image resolve" : "resolve");
+   if (native) {
+      static uint32_t resolved;
+      if (p_atomic_inc_return(&resolved) == 1)
+         mesa_logi("kk: Metal native full-image resolve in use (%ux%u, %ux MSAA)",
+                   dst->vk.extent.width, dst->vk.extent.height, (unsigned)src->vk.samples);
+      return;
+   }
+
+   struct kk_meta_save save;
    kk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS,
                  "meta:vkCmdResolveImage2");
    vk_meta_resolve_image2(&cmd->vk, &dev->meta, pResolveImageInfo);

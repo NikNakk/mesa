@@ -1029,7 +1029,8 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
    const char *implicit_mode[] = {"KK_IMPLICIT_FDM", "KK_IMPLICIT_SINGLE", "KK_IMPLICIT_HALF",
                                   "KK_IMPLICIT_STORAGE", "KK_IMPLICIT_SCALED", "KK_IMPLICIT_COMPACT", "KK_IMPLICIT_NO_FRAGCOORD",
                                   "KK_IMPLICIT_NO_SAMPLE", "KK_IMPLICIT_NO_FETCH",
-                                  "KK_IMPLICIT_NO_FETCH_APP", "MESA_KK_EXPERIMENTAL"};
+                                  "KK_IMPLICIT_NO_FETCH_APP", "KK_IMPLICIT_SAMPLE_GRADIENTS",
+                                  "MESA_KK_EXPERIMENTAL"};
    for (unsigned i = 0; i < ARRAY_SIZE(implicit_mode); i++) {
       const char *v = getenv(implicit_mode[i]);
       _mesa_blake3_update(&blake3_ctx, implicit_mode[i], strlen(implicit_mode[i]));

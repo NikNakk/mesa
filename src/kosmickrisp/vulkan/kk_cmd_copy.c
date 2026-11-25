@@ -374,6 +374,77 @@ copy_image(struct kk_cmd_buffer *cmd, struct kk_image *src, uint32_t src_index,
    }
 }
 
+static bool
+kk_copy_covers_images(const struct kk_image *src, const struct kk_image *dst,
+                     const VkImageCopy2 *region)
+{
+   return region->srcSubresource.mipLevel == 0 && region->dstSubresource.mipLevel == 0 &&
+          !region->srcOffset.x && !region->srcOffset.y && !region->srcOffset.z &&
+          !region->dstOffset.x && !region->dstOffset.y && !region->dstOffset.z &&
+          region->extent.width == src->vk.extent.width &&
+          region->extent.height == src->vk.extent.height &&
+          region->extent.width == dst->vk.extent.width &&
+          region->extent.height == dst->vk.extent.height;
+}
+
+static bool
+kk_copy_can_translate(const struct kk_image *src, const struct kk_image *dst,
+                      const VkCopyImageInfo2 *info)
+{
+   if (info->pNext || src == dst || !src->implicit_fdm || !dst->implicit_fdm ||
+       !src->rate_ref || !src->rate_ref->map || !dst->rate_ref || !dst->rate_ref->map ||
+       src->vk.format != dst->vk.format ||
+       src->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       dst->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       !(src->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+       !(dst->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+      return false;
+
+   for (uint32_t r = 0; r < info->regionCount; r++) {
+      const VkImageCopy2 *region = &info->pRegions[r];
+      if (region->pNext || region->srcSubresource.mipLevel != 0 ||
+          region->dstSubresource.mipLevel != 0 ||
+          region->srcSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          region->dstSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+         return false;
+   }
+   return true;
+}
+
+static void
+kk_copy_foveated_regions(VkCommandBuffer cmd, const VkCopyImageInfo2 *info)
+{
+   for (uint32_t r = 0; r < info->regionCount; r++) {
+      const VkImageCopy2 *region = &info->pRegions[r];
+      const VkImageBlit2 blit = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+         .srcSubresource = region->srcSubresource,
+         .srcOffsets = {
+            region->srcOffset,
+            {region->srcOffset.x + region->extent.width,
+             region->srcOffset.y + region->extent.height, 1},
+         },
+         .dstSubresource = region->dstSubresource,
+         .dstOffsets = {
+            region->dstOffset,
+            {region->dstOffset.x + region->extent.width,
+             region->dstOffset.y + region->extent.height, 1},
+         },
+      };
+      const VkBlitImageInfo2 blit_info = {
+         .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+         .srcImage = info->srcImage,
+         .srcImageLayout = info->srcImageLayout,
+         .dstImage = info->dstImage,
+         .dstImageLayout = info->dstImageLayout,
+         .regionCount = 1,
+         .pRegions = &blit,
+         .filter = VK_FILTER_NEAREST,
+      };
+      kk_CmdBlitImage2(cmd, &blit_info);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
                  const VkCopyImageInfo2 *pCopyImageInfo)
@@ -402,22 +473,29 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
    bool level0 = true;
    for (uint32_t r = 0; r < pCopyImageInfo->regionCount; r++)
       level0 &= pCopyImageInfo->pRegions[r].srcSubresource.mipLevel == 0;
-   VkImage unwarp = level0 ? kk_implicit_unwarp_for_copy(cmd, src, pCopyImageInfo->srcImageLayout, dst)
-                           : VK_NULL_HANDLE;
-   for (uint32_t r = 0; r < pCopyImageInfo->regionCount; r++)
-      kk_implicit_fov_op("copy", src, dst, pCopyImageInfo->pRegions[r].srcSubresource.mipLevel,
-                         unwarp ? "unwarped" : dst->implicit_fdm ? "as stored (both foveated)" : "RAW");
-   /* Diagnostic (session marks): copies out of foveated images, first few. */
+   const bool whole_image = pCopyImageInfo->regionCount == 1 &&
+                            kk_copy_covers_images(src, dst, pCopyImageInfo->pRegions);
+   const bool translate = !whole_image && kk_copy_can_translate(src, dst, pCopyImageInfo);
+   VkImage unwarp = level0 && !translate
+      ? kk_implicit_unwarp_for_copy(cmd, src, pCopyImageInfo->srcImageLayout, dst)
+      : VK_NULL_HANDLE;
    if (src->implicit_fdm && getenv("XRT_SESSION_RECORD_DIR")) {
-      static uint32_t told;
-      for (uint32_t r = 0; r < pCopyImageInfo->regionCount && told < 48; r++, told++) {
-         const VkImageCopy2 *g = &pCopyImageInfo->pRegions[r];
-         mesa_logi("kk-copy: %p -> %p (dst fdm=%d) region %u: src level %u layer %u off %d,%d "
-                   "dst level %u off %d,%d extent %ux%u; %s",
-                   (void *)src, (void *)dst, dst->implicit_fdm, r, g->srcSubresource.mipLevel,
-                   g->srcSubresource.baseArrayLayer, g->srcOffset.x, g->srcOffset.y,
-                   g->dstSubresource.mipLevel, g->dstOffset.x, g->dstOffset.y, g->extent.width,
-                   g->extent.height, unwarp ? "through the unwarp" : "raw");
+      for (uint32_t r = 0; r < pCopyImageInfo->regionCount; r++) {
+         const VkImageCopy2 *region = &pCopyImageInfo->pRegions[r];
+         const char *path = unwarp ? "unwarped" : "RAW";
+         if (translate)
+            path = "translated (subregion)";
+         else if (!unwarp && dst->implicit_fdm)
+            path = whole_image ? "as stored (whole image)" : "as stored (subregion)";
+         if (kk_implicit_fov_op("copy", src, dst, region->srcSubresource.mipLevel, path)) {
+            mesa_logi("kk-copy: %p -> %p region %u: src level %u layer %u off %d,%d "
+                      "dst level %u layer %u off %d,%d extent %ux%u; %s",
+                      (void *)src, (void *)dst, r, region->srcSubresource.mipLevel,
+                      region->srcSubresource.baseArrayLayer, region->srcOffset.x,
+                      region->srcOffset.y, region->dstSubresource.mipLevel,
+                      region->dstSubresource.baseArrayLayer, region->dstOffset.x,
+                      region->dstOffset.y, region->extent.width, region->extent.height, path);
+         }
       }
    }
    if (unwarp != VK_NULL_HANDLE) {
@@ -428,11 +506,14 @@ kk_CmdCopyImage2(VkCommandBuffer commandBuffer,
       kk_implicit_dump_after_copy(cmd, src, dst);
       return;
    }
+   if (translate) {
+      kk_copy_foveated_regions(commandBuffer, pCopyImageInfo);
+      kk_implicit_dump_after_copy(cmd, src, dst);
+      return;
+   }
    kk_fdm_note_use(&src->vk, "copy source");
    kk_fdm_note_use(&dst->vk, "copy destination");
-   const bool carry_map = src->implicit_fdm && dst->implicit_fdm && level0 &&
-                          src->vk.extent.width == dst->vk.extent.width &&
-                          src->vk.extent.height == dst->vk.extent.height;
+   const bool carry_map = src->implicit_fdm && dst->implicit_fdm && whole_image;
 
    size_t buffer_size = 0u;
 

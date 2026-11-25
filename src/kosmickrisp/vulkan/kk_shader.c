@@ -893,9 +893,8 @@ kk_is_frag_coord(const nir_instr *instr, UNUSED const void *data)
 }
 
 static nir_def *
-kk_lower_fdm_frag_coord(nir_builder *b, nir_instr *instr, UNUSED void *data)
+kk_fdm_screen_position(nir_builder *b, nir_def *physical)
 {
-   nir_def *phys = &nir_instr_as_intrinsic(instr)->def;
    nir_def *root = nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0);
    nir_def *addr = nir_build_load_global_constant(
       b, 1, 64,
@@ -905,13 +904,62 @@ kk_lower_fdm_frag_coord(nir_builder *b, nir_instr *instr, UNUSED void *data)
 
    nir_push_if(b, nir_ine_imm(b, addr, 0));
    nir_def *screen = nir_rate_map_physical_to_screen_kk(
-      b, nir_iadd_imm(b, addr, KK_RATE_PARAMS_HEADER_B),
-      nir_channels(b, phys, 0x3), nir_load_layer_id(b));
-   nir_def *mapped = nir_vec4(b, nir_channel(b, screen, 0),
-                              nir_channel(b, screen, 1), nir_channel(b, phys, 2),
-                              nir_channel(b, phys, 3));
+      b, nir_iadd_imm(b, addr, KK_RATE_PARAMS_HEADER_B), physical,
+      nir_load_layer_id(b));
    nir_pop_if(b, NULL);
-   return nir_if_phi(b, mapped, phys);
+   return nir_if_phi(b, screen, physical);
+}
+
+static nir_def *
+kk_lower_fdm_frag_coord(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   nir_def *phys = &nir_instr_as_intrinsic(instr)->def;
+   nir_def *screen = kk_fdm_screen_position(b, nir_channels(b, phys, 0x3));
+   return nir_vec4(b, nir_channel(b, screen, 0), nir_channel(b, screen, 1),
+                   nir_channel(b, phys, 2), nir_channel(b, phys, 3));
+}
+
+struct kk_implicit_sample_gradients {
+   nir_function_impl *impl;
+   nir_def *rate;
+};
+
+static bool
+kk_lower_implicit_sample_gradients(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   if ((tex->op != nir_texop_tex && tex->op != nir_texop_txb) ||
+       tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_shadow || tex->is_sparse)
+      return false;
+
+   struct kk_implicit_sample_gradients *ctx = data;
+   if (ctx->impl != b->impl) {
+      b->cursor = nir_before_impl(b->impl);
+      nir_def *physical = nir_channels(b, nir_load_frag_coord(b), 0x3);
+      nir_def *screen = kk_fdm_screen_position(b, physical);
+      nir_def *span_x = nir_fabs(b, nir_ddx(b, nir_channel(b, screen, 0)));
+      nir_def *span_y = nir_fabs(b, nir_ddy(b, nir_channel(b, screen, 1)));
+      nir_def *span = nir_vec2(b, span_x, span_y);
+      ctx->impl = b->impl;
+      ctx->rate = nir_frcp(b, nir_fmax(b, span, nir_imm_float(b, 1.0f)));
+   }
+
+   b->cursor = nir_before_instr(&tex->instr);
+   int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   assert(coord_index >= 0);
+   nir_def *coord = nir_f2f32(b, nir_channels(b, tex->src[coord_index].src.ssa, 0x3));
+   nir_def *scale_x = nir_channel(b, ctx->rate, 0);
+   nir_def *scale_y = nir_channel(b, ctx->rate, 1);
+   nir_def *bias = nir_steal_tex_src(tex, nir_tex_src_bias);
+   if (bias) {
+      nir_def *scale = nir_fexp2(b, nir_f2f32(b, bias));
+      scale_x = nir_fmul(b, scale_x, scale);
+      scale_y = nir_fmul(b, scale_y, scale);
+   }
+
+   tex->op = nir_texop_txd;
+   nir_tex_instr_add_src(tex, nir_tex_src_ddx, nir_fmul(b, nir_ddx(b, coord), scale_x));
+   nir_tex_instr_add_src(tex, nir_tex_src_ddy, nir_fmul(b, nir_ddy(b, coord), scale_y));
+   return true;
 }
 
 /* KK_IMPLICIT_COMPACT: a compute shader whose invocations are independent (no shared
@@ -1330,6 +1378,14 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
 
    NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts);
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
+       KK_EXPERIMENTAL(FDM_RATE) && kk_implicit_fdm_enabled() &&
+       debug_get_bool_option("KK_IMPLICIT_SAMPLE_GRADIENTS", false)) {
+      struct kk_implicit_sample_gradients gradients = {0};
+      NIR_PASS(_, nir, nir_shader_tex_pass, kk_lower_implicit_sample_gradients,
+               nir_metadata_none, &gradients);
+   }
 
    /* KK_WORKAROUND_16 - must be called after kk_nir_lower_descriptors(), which
     * lowers all image intrinsics to be bindless */
