@@ -1150,7 +1150,9 @@ brw_nir_lower_16bit_io(nir_shader *nir, nir_variable_mode mode)
 }
 
 static bool
-brw_nir_pack_vs_input(nir_shader *nir, struct brw_vs_prog_data *prog_data,
+brw_nir_pack_vs_input(nir_shader *nir,
+                      const struct brw_vs_prog_key *prog_key,
+                      uint32_t vf_component_packing[4],
                       unsigned *out_nr_packed_input_components)
 {
    struct vf_attribute {
@@ -1228,7 +1230,7 @@ brw_nir_pack_vs_input(nir_shader *nir, struct brw_vs_prog_data *prog_data,
     *     enabled."
     */
    if (nir->info.inputs_read == 0) {
-      if (prog_data->no_vf_slot_compaction) {
+      if (prog_key->no_vf_slot_compaction) {
          attributes[VERT_ATTRIB_GENERIC0].is_used = true;
          attributes[VERT_ATTRIB_GENERIC0].component_mask = 0x1;
       } else if (!BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_IS_INDEXED_DRAW) &&
@@ -1324,13 +1326,13 @@ brw_nir_pack_vs_input(nir_shader *nir, struct brw_vs_prog_data *prog_data,
    unsigned vf_element_count = 0;
    for (unsigned a = VERT_ATTRIB_GENERIC0; a < MAX_HW_VERT_ATTRIB && vf_element_count < 32; a++) {
       /* Consider all attributes used when no slot compaction is active */
-      if (!attributes[a].is_used && !prog_data->no_vf_slot_compaction)
+      if (!attributes[a].is_used && !prog_key->no_vf_slot_compaction)
          continue;
 
       uint32_t mask;
       /* Stores masks in attributes[a].component_mask are in terms of 32-bit
        * components, but the HW depending on the format will interpret
-       * prog_data->vf_component_packing[] bits as either a 32-bit or 64-bit
+       * vf_component_packing[] bits as either a 32-bit or 64-bit
        * component. So we need to only consider every other bit.
        */
       if (attributes[a].is_64bit) {
@@ -1343,7 +1345,7 @@ brw_nir_pack_vs_input(nir_shader *nir, struct brw_vs_prog_data *prog_data,
       /* We should only have 4bits enabled max */
       assert((mask & ~0xfu) == 0);
 
-      prog_data->vf_component_packing[vf_element_count / 8] |=
+      vf_component_packing[vf_element_count / 8] |=
          mask << (4 * (vf_element_count % 8));
       vf_element_count++;
    }
@@ -1359,10 +1361,13 @@ void
 brw_nir_lower_vs_inputs(nir_shader *nir,
                         const struct intel_device_info *devinfo,
                         const struct brw_vs_prog_key *prog_key,
-                        struct brw_vs_prog_data *prog_data,
+                        const struct intel_push_layout *push_layout,
+                        uint32_t vf_component_packing[4],
                         unsigned *out_nr_input_components,
                         unsigned *out_urb_read_length)
 {
+   const uint64_t inputs_read = nir->info.inputs_read;
+
    /* Start with the location of the variable's base. */
    nir_foreach_shader_in_variable(var, nir)
       var->data.driver_location = var->data.location;
@@ -1503,13 +1508,14 @@ brw_nir_lower_vs_inputs(nir_shader *nir,
       }
    }
 
-   memset(prog_data->vf_component_packing, 0,
-          sizeof(prog_data->vf_component_packing));
+   memset(vf_component_packing, 0,
+          4 * sizeof(*vf_component_packing));
    unsigned nr_packed_input_components = 0;
    if (prog_key->vf_component_packing)
-      NIR_PASS(_, nir, brw_nir_pack_vs_input, prog_data, &nr_packed_input_components);
+      NIR_PASS(_, nir, brw_nir_pack_vs_input, prog_key, vf_component_packing,
+               &nr_packed_input_components);
 
-   unsigned nr_input_slots = util_bitcount64(prog_data->inputs_read);
+   unsigned nr_input_slots = util_bitcount64(inputs_read);
    /* gl_VertexID and gl_InstanceID are system values, but arrive via an
     * incoming vertex attribute.  So, add an extra slot.
     */
@@ -1541,8 +1547,8 @@ brw_nir_lower_vs_inputs(nir_shader *nir,
    /* reserve space for the R0 & R1 header */
    max_size -= 2 * REG_SIZE * reg_unit(devinfo);
    /* reserve space for push constants */
-   for (uint32_t i = 0; i < ARRAY_SIZE(prog_data->base.base.push_sizes); i++)
-      max_size -= prog_data->base.base.push_sizes[i];
+   for (uint32_t i = 0; i < ARRAY_SIZE(push_layout->push_sizes); i++)
+      max_size -= push_layout->push_sizes[i];
 
    const unsigned max_push_bytes = MAX2(max_size, 0);
 
@@ -1847,7 +1853,7 @@ lower_fs_config_intel(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
 static uint32_t
 generate_fs_config_state_bits(const struct brw_fs_prog_key *key,
-                              const struct brw_fs_prog_data *prog_data,
+                              const struct intel_shader_info *info,
                               enum intel_sometimes comp_value)
 {
    uint32_t f = 0;
@@ -1855,10 +1861,10 @@ generate_fs_config_state_bits(const struct brw_fs_prog_key *key,
    if (key->multisample_fbo == comp_value)
       f |= INTEL_FS_CONFIG_MULTISAMPLE_FBO;
 
-   if (prog_data->alpha_to_coverage == comp_value)
+   if (info->fs.alpha_to_coverage == comp_value)
       f |= INTEL_FS_CONFIG_ALPHA_TO_COVERAGE;
 
-   if (prog_data->provoking_vertex_last == comp_value)
+   if (info->fs.provoking_vertex_last == comp_value)
       f |= INTEL_FS_CONFIG_PROVOKING_VERTEX_LAST;
 
    if (key->conservative_raster == comp_value)
@@ -1868,10 +1874,10 @@ generate_fs_config_state_bits(const struct brw_fs_prog_key *key,
       f |= INTEL_FS_CONFIG_PER_PRIMITIVE_REMAPPING;
 
    if (comp_value == INTEL_ALWAYS) {
-      if (prog_data->persample_dispatch)
+      if (info->fs.persample_dispatch)
          f |= INTEL_FS_CONFIG_PERSAMPLE_DISPATCH;
 
-      if (prog_data->coarse_pixel_dispatch)
+      if (info->fs.coarse_pixel_dispatch)
          f |= INTEL_FS_CONFIG_COARSE_RT_WRITES;
 
    }
@@ -1883,11 +1889,11 @@ generate_fs_config_state_bits(const struct brw_fs_prog_key *key,
 bool
 brw_nir_lower_fs_config_intel(nir_shader *nir,
                               const struct brw_fs_prog_key *key,
-                              const struct brw_fs_prog_data *prog_data)
+                              const struct intel_shader_info *info)
 {
    struct lower_fs_config_state state = {
-      .known_bits = ~generate_fs_config_state_bits(key, prog_data, INTEL_SOMETIMES),
-      .enabled_bits = generate_fs_config_state_bits(key, prog_data, INTEL_ALWAYS),
+      .known_bits = ~generate_fs_config_state_bits(key, info, INTEL_SOMETIMES),
+      .enabled_bits = generate_fs_config_state_bits(key, info, INTEL_ALWAYS),
    };
 
    return nir_shader_intrinsics_pass(nir, lower_fs_config_intel,
@@ -1928,6 +1934,19 @@ lower_sample_pos(nir_builder *b, nir_intrinsic_instr *intrin)
    nir_def_rewrite_uses_after(&intrin->def, pos);
 }
 
+static void
+lower_barycentric_at_sample(nir_builder *b, nir_intrinsic_instr *intrin)
+{
+   b->cursor = nir_before_instr(&intrin->instr);
+
+   nir_def *sample_id = nir_bcsel(
+      b,
+      nir_test_fs_config_intel(b, 1, INTEL_FS_CONFIG_MULTISAMPLE_FBO),
+      intrin->src[0].ssa, nir_imm_int(b, 0));
+
+   nir_src_rewrite(&intrin->src[0], sample_id);
+}
+
 static bool
 lower_msaa_config(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 {
@@ -1938,6 +1957,9 @@ lower_msaa_config(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    case nir_intrinsic_load_sample_pos:
    case nir_intrinsic_load_sample_pos_or_center:
       lower_sample_pos(b, intrin);
+      return true;
+   case nir_intrinsic_load_barycentric_at_sample:
+      lower_barycentric_at_sample(b, intrin);
       return true;
    default:
       return false;
@@ -3847,7 +3869,6 @@ brw_postprocess_nir_opts(brw_pass_tracker *pt)
    if (OPT(intel_nir_opt_peephole_ffma))
       OPT(nir_opt_shrink_vectors, false);
 
-   OPT(nir_opt_generate_bfi);
    OPT(nir_opt_reassociate_bfi);
 
    if (OPT(nir_opt_comparison_pre)) {

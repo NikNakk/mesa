@@ -30,6 +30,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include "drm-uapi/drm_fourcc.h"
+#include "c11/time.h"
 
 #ifdef HAVE_VALGRIND
 #include <valgrind.h>
@@ -96,6 +97,7 @@
 #include "vk_graphics_state.h"
 #include "vk_image.h"
 #include "vk_instance.h"
+#include "vk_memory.h"
 #include "vk_pipeline.h"
 #include "vk_pipeline_cache.h"
 #include "vk_pipeline_layout.h"
@@ -154,11 +156,6 @@ struct intel_perf_query_result;
 #include "util/log.h"
 #include "wsi_common.h"
 
-/* The "RAW" clocks on Linux are called "FAST" on FreeBSD */
-#if !defined(CLOCK_MONOTONIC_RAW) && defined(CLOCK_MONOTONIC_FAST)
-#define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC_FAST
-#endif
-
 #define NSEC_PER_SEC 1000000000ull
 
 /* 3DSTATE_BINDING_TABLE_POINTERS_*::PointertoBindingTable resolution */
@@ -202,6 +199,31 @@ get_max_vbs(const struct intel_device_info *devinfo) {
 /* The binding table entry is unknown.
  */
 #define ANV_COLOR_OUTPUT_UNKNOWN  (0xfd)
+
+static inline uint32_t
+anv_get_fs_color_map(const struct vk_color_attachment_location_state *cal,
+                     uint32_t color_att_count)
+{
+   assert(color_att_count <= MAX_RTS);
+
+   /* The surface states are layed out this way :
+    *   - null surface
+    *   - color attachment 0
+    *   - color attachment 1
+    *   - ...
+    *
+    * Hence we leave 0 if MESA_VK_ATTACHMENT_UNUSED and otherwise add 1 to
+    * the index.
+    */
+   uint32_t map = 0;
+   for (uint32_t i = 0; i < color_att_count; i++) {
+      if (cal->color_map[i] != MESA_VK_ATTACHMENT_UNUSED) {
+         assert(cal->color_map[i] < MAX_RTS);
+         map |= (1 + i) << (cal->color_map[i] * 4);
+      }
+   }
+   return map;
+}
 
 static inline uint64_t
 align_down_npot_u64(uint64_t v, uint64_t a)
@@ -940,7 +962,7 @@ struct anv_bo_pool {
 
    enum anv_bo_alloc_flags bo_alloc_flags;
 
-   struct util_sparse_array_free_list free_list[16];
+   struct util_sparse_array_free_list free_list[17];
 };
 
 void anv_bo_pool_init(struct anv_bo_pool *pool, struct anv_device *device,
@@ -1298,10 +1320,7 @@ struct anv_shader {
 
    struct anv_shader_alloc kernel;
 
-   const struct brw_stage_prog_data *prog_data;
-
-   struct genisa_stats stats[3];
-   uint32_t num_stats;
+   intel_shader_bin *bin;
 
    char *nir_str;
 
@@ -1447,22 +1466,6 @@ struct anv_memory_type {
    /* Whether this is the dynamic visible memory type */
    bool                    dynamic_visible;
    bool                    compressed;
-};
-
-/* Heaps tracking structure shared across multiple VkInstance */
-struct anv_memory_budget {
-   uint32_t ref_count;
-
-   struct list_head link;
-
-   int64_t local_major;
-   int64_t local_minor;
-
-   /** Driver-internal book-keeping, indexed by heap.
-    *
-    * Align it to 64 bits to make atomic operations faster on 32 bit platforms.
-    */
-   alignas(8) VkDeviceSize used[VK_MAX_MEMORY_HEAPS];
 };
 
 struct anv_memory_heap {
@@ -1626,7 +1629,7 @@ struct anv_physical_device {
       struct anv_memory_type                    types[VK_MAX_MEMORY_TYPES];
       uint32_t                                  heap_count;
       struct anv_memory_heap                    heaps[VK_MAX_MEMORY_HEAPS];
-      struct anv_memory_budget                 *heaps_budget;
+      struct vk_memory_budget                  *heaps_budget;
 #ifdef SUPPORT_INTEL_INTEGRATED_GPUS
       bool                                      need_flush;
 #endif
@@ -2494,6 +2497,11 @@ struct anv_gfx_dynamic_state {
    uint32_t first_vue_slot;
 
    /**
+    * Whether the HW has been programmed with non standard sample patterns.
+    */
+   bool non_standard_sample_pattern;
+
+   /**
     * DEPTH and STENCIL attachment write state for Wa_18019816803.
     */
    bool ds_write_state;
@@ -2725,6 +2733,7 @@ struct anv_device {
 
     struct anv_bo *                             dummy_aux_bo;
     struct anv_bo *                             mem_fence_bo;
+    struct anv_bo *                             urb_memory_bo;
 
     /**
      * Workarounds for game bugs.
@@ -3168,7 +3177,7 @@ VkResult anv_device_unmap_bo(struct anv_device *device,
                              void *map, size_t map_size,
                              bool replace);
 VkResult anv_device_import_bo_from_host_ptr(struct anv_device *device,
-                                            void *host_ptr, uint32_t size,
+                                            void *host_ptr, uint64_t size,
                                             enum anv_bo_alloc_flags alloc_flags,
                                             uint64_t client_address,
                                             struct anv_bo **bo_out);
@@ -5532,14 +5541,8 @@ struct anv_shader_upload_params {
    const void *key_data;
    uint32_t key_size;
 
-   const void *kernel_data;
-   uint32_t kernel_size;
-
-   const struct brw_stage_prog_data *prog_data;
-   uint32_t prog_data_size;
-
-   const struct genisa_stats *stats;
-   uint32_t num_stats;
+   /* Compile output bin; copied wholesale into the created shader. */
+   const intel_shader_bin *bin;
 
    const struct nir_xfb_info *xfb_info;
 
@@ -5583,13 +5586,8 @@ struct anv_shader_internal {
    void *code;
 
    struct anv_shader_alloc kernel;
-   uint32_t kernel_size;
 
-   const struct brw_stage_prog_data *prog_data;
-   uint32_t prog_data_size;
-
-   struct genisa_stats stats[3];
-   uint32_t num_stats;
+   intel_shader_bin *bin;
 };
 
 static inline struct anv_shader_internal *
@@ -5655,67 +5653,30 @@ anv_cmd_graphic_state_update_has_uint_rt(struct anv_cmd_graphics_state *state)
    }
 }
 
-#define ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(prefix, stage)             \
-static inline const struct brw_##prefix##_prog_data *                   \
-get_gfx_##prefix##_prog_data(                                           \
-   const struct anv_cmd_graphics_state *gfx)                            \
-{                                                                       \
-   if (anv_gfx_has_stage(gfx, stage)) {                                 \
-      return (const struct brw_##prefix##_prog_data *)                  \
-         (gfx)->shaders[stage]->prog_data;                              \
-   } else {                                                             \
-      return NULL;                                                      \
-   }                                                                    \
-}                                                                       \
-                                                                        \
-static inline const struct brw_##prefix##_prog_data *                   \
-get_shader_##prefix##_prog_data(const struct anv_shader *shader)        \
-{                                                                       \
-   return (const struct brw_##prefix##_prog_data *)                     \
-      shader->prog_data;                                                \
+static inline const struct intel_shader_info *
+get_gfx_fs_info(const struct anv_cmd_graphics_state *gfx)
+{
+   if (anv_gfx_has_stage(gfx, MESA_SHADER_FRAGMENT))
+      return &gfx->shaders[MESA_SHADER_FRAGMENT]->bin->info;
+   return NULL;
 }
-
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(vs, MESA_SHADER_VERTEX)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(tcs, MESA_SHADER_TESS_CTRL)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(tes, MESA_SHADER_TESS_EVAL)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(gs, MESA_SHADER_GEOMETRY)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(fs, MESA_SHADER_FRAGMENT)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(mesh, MESA_SHADER_MESH)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(task, MESA_SHADER_TASK)
 
 static inline const struct intel_vue_map *
 get_gfx_last_vue_map(const struct anv_cmd_graphics_state *gfx)
 {
    if (gfx->shaders[MESA_SHADER_MESH] != NULL) {
-      return &((const struct brw_mesh_prog_data *)
-               gfx->shaders[MESA_SHADER_MESH]->prog_data)->map.vue_map;
+      return &gfx->shaders[MESA_SHADER_MESH]->bin->info.mesh.map.vue_map;
    }
    if (gfx->shaders[MESA_SHADER_GEOMETRY] != NULL) {
-      return &((const struct brw_gs_prog_data *)
-               gfx->shaders[MESA_SHADER_GEOMETRY]->prog_data)->base.vue_map;
+      return &gfx->shaders[MESA_SHADER_GEOMETRY]->bin->info.vue.vue_map;
    }
    if (gfx->shaders[MESA_SHADER_TESS_EVAL] != NULL) {
-      return &((const struct brw_tes_prog_data *)
-               gfx->shaders[MESA_SHADER_TESS_EVAL]->prog_data)->base.vue_map;
+      return &gfx->shaders[MESA_SHADER_TESS_EVAL]->bin->info.vue.vue_map;
    }
    if (gfx->shaders[MESA_SHADER_VERTEX] != NULL) {
-      return &((const struct brw_vs_prog_data *)
-               gfx->shaders[MESA_SHADER_VERTEX]->prog_data)->base.vue_map;
+      return &gfx->shaders[MESA_SHADER_VERTEX]->bin->info.vue.vue_map;
    }
    UNREACHABLE("Invalid bound shaders");
-}
-
-static inline const struct brw_cs_prog_data *
-get_cs_prog_data(const struct anv_cmd_compute_state *comp_state)
-{
-   assert(comp_state->shader);
-   return (const struct brw_cs_prog_data *) comp_state->shader->prog_data;
-}
-
-static inline const struct brw_cs_prog_data *
-get_shader_cs_prog_data(const struct anv_shader *shader)
-{
-   return (const struct brw_cs_prog_data *) shader->prog_data;
 }
 
 VkResult
@@ -6833,6 +6794,10 @@ struct gfx8_border_color {
 
 extern const struct gfx8_border_color anv_default_border_colors[];
 
+union isl_color_value
+anv_sampler_border_color_value(const struct anv_physical_device *pdevice,
+                               VkFormat format, VkClearColorValue value);
+
 struct anv_sampler_state {
    /* Hashing key for embedded samplers */
    struct anv_embedded_sampler_key embedded_key;
@@ -7038,8 +7003,11 @@ struct anv_vid_mem {
 #define ANV_VIDEO_H264_MAX_DPB_SLOTS 17
 #define ANV_VIDEO_AV1_MAX_DPB_SLOTS 9 /* STD_VIDEO_AV1_NUM_REF_FRAMES + 1 */
 #define ANV_VIDEO_H264_MAX_NUM_REF_FRAME 16
+#define ANV_VIDEO_H264_MAX_NUM_SLICES 256
 #define ANV_VIDEO_H265_MAX_NUM_REF_FRAME 16
 #define ANV_VIDEO_H265_HCP_NUM_REF_FRAME 8
+/* The most slice segments the HuC HEVC BRC kernels handle. */
+#define ANV_HUC_HEVC_BRC_MAX_NUM_SLICES 70
 #define ANV_MAX_H265_CTB_SIZE 64
 #define ANV_MAX_VP9_CTB_SIZE 64
 #define ANV_VP9_SCALE_FACTOR_SHIFT 14

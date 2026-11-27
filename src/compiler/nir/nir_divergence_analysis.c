@@ -68,7 +68,7 @@ static bool
 visit_cf_list(struct exec_list *list, struct divergence_state *state);
 
 bool
-nir_def_is_divergent_at_use_block(nir_def *def, nir_block *block)
+nir_def_is_divergent_at_use_block(const nir_def *def, const nir_block *block)
 {
    if (def->divergent)
       return true;
@@ -209,6 +209,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_warp_id_arm:
    case nir_intrinsic_load_ttmp_register_wg_div_amd:
    case nir_intrinsic_load_scalar_arg_wg_div_amd:
+   case nir_intrinsic_load_gs_wave_id_amd:
+   case nir_intrinsic_load_merged_wave_info_amd:
       /* VS/TES/GS invocations of the same primitive can be in different
        * subgroups, so subgroup ops are always divergent between vertices of
        * the same primitive.
@@ -235,6 +237,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
 
    /* Intrinsics which are always uniform */
    case nir_intrinsic_load_preamble:
+   case nir_intrinsic_load_provoking_last:
    case nir_intrinsic_load_push_constant_zink:
    case nir_intrinsic_load_work_dim:
    case nir_intrinsic_load_num_workgroups:
@@ -307,7 +310,6 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_pipeline_stat_query_enabled_amd:
    case nir_intrinsic_load_prim_gen_query_enabled_amd:
    case nir_intrinsic_load_prim_xfb_query_enabled_amd:
-   case nir_intrinsic_load_merged_wave_info_amd:
    case nir_intrinsic_load_clamp_vertex_color_amd:
    case nir_intrinsic_load_cull_face_negative_determinant_enabled_amd:
    case nir_intrinsic_load_cull_face_positive_determinant_enabled_amd:
@@ -334,7 +336,6 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_num_vertices_per_primitive_amd:
    case nir_intrinsic_load_streamout_buffer_amd:
    case nir_intrinsic_load_ordered_id_amd:
-   case nir_intrinsic_load_gs_wave_id_amd:
    case nir_intrinsic_load_provoking_vtx_in_prim_amd:
    case nir_intrinsic_load_lds_ngg_gs_out_vertex_base_amd:
    case nir_intrinsic_load_btd_shader_type_intel:
@@ -402,6 +403,12 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_ttmp_register_amd:
    case nir_intrinsic_load_scalar_arg_amd:
    case nir_intrinsic_load_ro_sink_address_poly:
+   case nir_intrinsic_load_input_topology_poly:
+   case nir_intrinsic_load_vs_outputs_poly:
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+   case nir_intrinsic_load_tess_param_buffer_poly:
+   case nir_intrinsic_load_stat_query_address_poly:
    case nir_intrinsic_load_frame_arg_pan:
    case nir_intrinsic_load_noperspective_varyings_pan:
    case nir_intrinsic_load_multisampled_pan:
@@ -477,7 +484,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       is_divergent = src_divergent(instr->src[0], state);
 
       if (stage == MESA_SHADER_FRAGMENT) {
-         is_divergent |= !(options & nir_divergence_single_prim_per_subgroup);
+         is_divergent |= !(options & nir_divergence_single_prim_per_fs_subgroup);
       } else if (stage == MESA_SHADER_TESS_EVAL) {
          /* Patch input loads are uniform between vertices of the same primitive. */
          if (state->options & nir_divergence_vertex)
@@ -487,27 +494,25 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       } else {
          is_divergent = true;
       }
-      if (options & nir_divergence_across_subgroups)
-         is_divergent = true;
       break;
    case nir_intrinsic_load_per_vertex_input:
       is_divergent = src_divergent(instr->src[0], state) ||
                      src_divergent(instr->src[1], state);
-      if (stage == MESA_SHADER_TESS_CTRL)
+      if (stage == MESA_SHADER_TESS_CTRL) {
          is_divergent |= !(options & nir_divergence_single_patch_per_tcs_subgroup);
-      if (stage == MESA_SHADER_TESS_EVAL)
-         is_divergent |= !(options & nir_divergence_single_patch_per_tes_subgroup);
-      else
+      } else if (stage == MESA_SHADER_TESS_EVAL) {
+         is_divergent |= !(options & nir_divergence_single_patch_per_tes_subgroup) &&
+                         !(options & nir_divergence_vertex);
+      } else {
          is_divergent = true;
-      if (options & nir_divergence_across_subgroups)
-         is_divergent = true;
+      }
       break;
    case nir_intrinsic_load_input_vertex:
    case nir_intrinsic_load_input_vertex_amd:
       if (instr->intrinsic == nir_intrinsic_load_input_vertex)
          is_divergent |= src_divergent(instr->src[1], state);
       assert(stage == MESA_SHADER_FRAGMENT);
-      is_divergent |= !(options & nir_divergence_single_prim_per_subgroup);
+      is_divergent |= !(options & nir_divergence_single_prim_per_fs_subgroup);
       break;
    case nir_intrinsic_load_output:
       is_divergent = src_divergent(instr->src[0], state);
@@ -529,8 +534,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       }
       break;
    case nir_intrinsic_load_per_view_output:
-      is_divergent = instr->src[0].ssa->divergent ||
-                     instr->src[1].ssa->divergent ||
+      is_divergent = src_divergent(instr->src[0], state) ||
+                     src_divergent(instr->src[1], state) ||
                      (stage == MESA_SHADER_TESS_CTRL &&
                       !(options & nir_divergence_single_patch_per_tcs_subgroup));
       break;
@@ -553,7 +558,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_front_face_fsign:
    case nir_intrinsic_load_back_face_agx:
       assert(stage == MESA_SHADER_FRAGMENT || state->shader->info.internal);
-      is_divergent = !(options & nir_divergence_single_prim_per_subgroup);
+      is_divergent = !(options & nir_divergence_single_prim_per_fs_subgroup);
       break;
    case nir_intrinsic_load_view_index:
    case nir_intrinsic_load_amplification_id_kk:
@@ -561,14 +566,14 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       if (options & nir_divergence_view_index_uniform)
          is_divergent = false;
       else if (stage == MESA_SHADER_FRAGMENT)
-         is_divergent = !(options & nir_divergence_single_prim_per_subgroup);
+         is_divergent = !(options & nir_divergence_single_prim_per_fs_subgroup);
       else
          is_divergent = true;
       break;
    case nir_intrinsic_load_fs_input_interp_deltas:
       assert(stage == MESA_SHADER_FRAGMENT);
       is_divergent = src_divergent(instr->src[0], state);
-      is_divergent |= !(options & nir_divergence_single_prim_per_subgroup);
+      is_divergent |= !(options & nir_divergence_single_prim_per_fs_subgroup);
       break;
    case nir_intrinsic_load_instance_id:
       is_divergent = !(state->options & nir_divergence_vertex);
@@ -581,7 +586,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       break;
    case nir_intrinsic_load_primitive_id:
       if (stage == MESA_SHADER_FRAGMENT)
-         is_divergent = !(options & nir_divergence_single_prim_per_subgroup);
+         is_divergent = !(options & nir_divergence_single_prim_per_fs_subgroup);
       else if (stage == MESA_SHADER_TESS_CTRL)
          is_divergent = !(state->options & nir_divergence_vertex) &&
                         !(options & nir_divergence_single_patch_per_tcs_subgroup);
@@ -599,12 +604,14 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       break;
    case nir_intrinsic_load_tess_level_inner:
    case nir_intrinsic_load_tess_level_outer:
-      if (stage == MESA_SHADER_TESS_CTRL)
+      if (stage == MESA_SHADER_TESS_CTRL) {
          is_divergent = !(options & nir_divergence_single_patch_per_tcs_subgroup);
-      else if (stage == MESA_SHADER_TESS_EVAL)
-         is_divergent = !(options & nir_divergence_single_patch_per_tes_subgroup);
-      else
+      } else if (stage == MESA_SHADER_TESS_EVAL) {
+         is_divergent = !(options & nir_divergence_single_patch_per_tes_subgroup) &&
+                        !(options & nir_divergence_vertex);
+      } else {
          UNREACHABLE("Invalid stage for load_primitive_tess_level_*");
+      }
       break;
 
    case nir_intrinsic_load_shared_base_ptr:
@@ -658,7 +665,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_ldc_nv:
    case nir_intrinsic_ldcx_nv:
       is_divergent = (src_divergent(instr->src[0], state) &&
-                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
+                      ((nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM) ||
+                       (state->options & nir_divergence_vertex) ||
+                       (state->options & nir_divergence_across_subgroups))) ||
                      src_divergent(instr->src[1], state);
       break;
 
@@ -667,7 +676,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_uav_ir3:
    case nir_intrinsic_load_ssbo_intel:
       is_divergent = (src_divergent(instr->src[0], state) &&
-                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
+                      ((nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM) ||
+                       (state->options & nir_divergence_vertex) ||
+                       (state->options & nir_divergence_across_subgroups))) ||
                      src_divergent(instr->src[1], state) ||
                      load_may_tear(state, instr);
       break;
@@ -706,7 +717,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_deref_buffer_array_length:
    case nir_intrinsic_deref_buffer_address:
       is_divergent = src_divergent(instr->src[0], state) &&
-                     (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM);
+                     ((nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM) ||
+                      (state->options & nir_divergence_vertex) ||
+                      (state->options & nir_divergence_across_subgroups));
       break;
 
    case nir_intrinsic_image_samples_identical:
@@ -718,7 +731,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_bindless_image_fragment_mask_load_amd:
    case nir_intrinsic_image_heap_fragment_mask_load_amd:
       is_divergent = (src_divergent(instr->src[0], state) &&
-                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
+                      ((nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM) ||
+                       (state->options & nir_divergence_vertex) ||
+                       (state->options & nir_divergence_across_subgroups))) ||
                      src_divergent(instr->src[1], state) ||
                      load_may_tear(state, instr);
       break;
@@ -728,7 +743,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_bindless_image_texel_address:
    case nir_intrinsic_image_heap_texel_address:
       is_divergent = (src_divergent(instr->src[0], state) &&
-                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
+                      ((nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM) ||
+                       (state->options & nir_divergence_vertex) ||
+                       (state->options & nir_divergence_across_subgroups))) ||
                      src_divergent(instr->src[1], state) ||
                      src_divergent(instr->src[2], state);
       break;
@@ -743,7 +760,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_bindless_image_sparse_load:
    case nir_intrinsic_image_heap_sparse_load:
       is_divergent = (src_divergent(instr->src[0], state) &&
-                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
+                      ((nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM) ||
+                       (state->options & nir_divergence_vertex) ||
+                       (state->options & nir_divergence_across_subgroups))) ||
                      src_divergent(instr->src[1], state) ||
                      src_divergent(instr->src[2], state) ||
                      src_divergent(instr->src[3], state) ||
@@ -840,6 +859,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_texc2_pan:
    case nir_intrinsic_load_tex_pan:
    case nir_intrinsic_lea_tex_pan:
+   case nir_intrinsic_ro_to_rw_poly:
    case nir_intrinsic_atomic_counter_read:
    case nir_intrinsic_atomic_counter_read_deref:
    case nir_intrinsic_is_sparse_texels_resident:
@@ -851,7 +871,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_image_deref_load_param_intel:
    case nir_intrinsic_image_heap_load_param_intel:
    case nir_intrinsic_image_load_raw_intel:
-   case nir_intrinsic_load_buffer_ptr_deref:
+   case nir_intrinsic_load_heap_descriptor_deref:
    case nir_intrinsic_get_ubo_size:
    case nir_intrinsic_load_ssbo_address:
    case nir_intrinsic_load_global_bounded:
@@ -896,7 +916,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_smp_raw_pco:
    case nir_intrinsic_pack_pco:
    case nir_intrinsic_pck_prog_pco:
-   case nir_intrinsic_unpack_pco: {
+   case nir_intrinsic_unpack_pco:
+   case nir_intrinsic_is_null_descriptor: {
       unsigned num_srcs = nir_intrinsic_infos[instr->intrinsic].num_srcs;
       for (unsigned i = 0; i < num_srcs; i++) {
          if (src_divergent(instr->src[i], state)) {
@@ -1123,6 +1144,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_ipa_nv:
    case nir_intrinsic_ldtram_nv:
    case nir_intrinsic_cmat_muladd_nv:
+   case nir_intrinsic_ttuld_nv:
    case nir_intrinsic_printf:
    case nir_intrinsic_abort:
    case nir_intrinsic_load_gs_header_ir3:
@@ -1203,7 +1225,7 @@ visit_tex(nir_tex_instr *instr, struct divergence_state *state)
 
    if (instr->op == nir_texop_sparse_residency_intel ||
        instr->op == nir_texop_sparse_residency_txf_intel)
-      return true;
+      return false;
 
    bool is_divergent = false;
 
@@ -1214,14 +1236,18 @@ visit_tex(nir_tex_instr *instr, struct divergence_state *state)
       case nir_tex_src_sampler_handle:
       case nir_tex_src_sampler_offset:
          is_divergent |= src_divergent(instr->src[i].src, state) &&
-                         instr->sampler_non_uniform;
+                         (instr->sampler_non_uniform ||
+                          (state->options & nir_divergence_vertex) ||
+                          (state->options & nir_divergence_across_subgroups));
          break;
       case nir_tex_src_texture_deref:
       case nir_tex_src_texture_2_deref:
       case nir_tex_src_texture_handle:
       case nir_tex_src_texture_offset:
          is_divergent |= src_divergent(instr->src[i].src, state) &&
-                         instr->texture_non_uniform;
+                         (instr->texture_non_uniform ||
+                          (state->options & nir_divergence_vertex) ||
+                          (state->options & nir_divergence_across_subgroups));
          break;
       default:
          is_divergent |= src_divergent(instr->src[i].src, state);
@@ -1306,7 +1332,7 @@ nir_variable_is_uniform(nir_shader *shader, nir_variable *var,
    mesa_shader_stage stage = shader->info.stage;
 
    if (stage == MESA_SHADER_FRAGMENT &&
-       (options & nir_divergence_single_prim_per_subgroup) &&
+       (options & nir_divergence_single_prim_per_fs_subgroup) &&
        var->data.mode == nir_var_shader_in &&
        var->data.interpolation == INTERP_MODE_FLAT)
       return true;

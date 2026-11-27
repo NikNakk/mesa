@@ -663,7 +663,8 @@ anv_nir_compute_push_layout(nir_shader *nir,
                             enum brw_robustness_flags robust_flags,
                             const struct anv_nir_push_layout_info *push_info,
                             struct brw_base_prog_key *prog_key,
-                            struct brw_stage_prog_data *prog_data,
+                            struct intel_push_layout *push_layout,
+                            struct brw_cs_push_const_info *cs_push,
                             struct anv_pipeline_bind_map *map,
                             const struct anv_pipeline_push_map *push_map)
 {
@@ -717,7 +718,7 @@ anv_nir_compute_push_layout(nir_shader *nir,
 
    struct anv_push_range analysis_ranges[4] = {};
    if (data.push_ubo_ranges || data.push_pointer_ranges) {
-      anv_nir_analyze_push_constants_ranges(nir, devinfo, push_map,
+      anv_nir_analyze_push_constants_ranges(nir, pdevice, push_map,
                                             analysis_ranges);
    }
 
@@ -822,7 +823,7 @@ anv_nir_compute_push_layout(nir_shader *nir,
    ralloc_free(lower_state.lowered_pointer_instrs);
 
    /* Do this before calling brw_cs_fill_push_const_info(), it uses the data
-    * in prog_data->push_sizes[].
+    * in push_layout->push_sizes[].
     */
    for (uint32_t i = 0; i < 4; i++) {
       if (map->push_ranges[i].set == ANV_DESCRIPTOR_SET_PER_PRIM_PADDING)
@@ -832,51 +833,44 @@ anv_nir_compute_push_layout(nir_shader *nir,
       if (map->push_ranges[i].length > 0 &&
           map->push_ranges[i].set < MAX_SETS &&
           (robust_flags & BRW_ROBUSTNESS_UBO))
-         prog_data->robust_ubo_ranges |= (uint8_t) (1 << i);
+         push_layout->robust_ubo_ranges |= (uint8_t) (1 << i);
 
-      prog_data->push_sizes[i] = map->push_ranges[i].length * 32;
+      push_layout->push_sizes[i] = map->push_ranges[i].length * 32;
    }
 
    unsigned push_start = push_constant_range.start * 32;
-   if (prog_data->robust_ubo_ranges) {
+   if (push_layout->robust_ubo_ranges) {
       const uint32_t push_reg_mask_offset =
          anv_drv_const_offset(drv_data.gfx.push_reg_mask[nir->info.stage]);
       assert(push_reg_mask_offset >= push_start);
-      prog_data->push_reg_mask_param = (push_reg_mask_offset - push_start) / 4;
+      push_layout->push_reg_mask_param = (push_reg_mask_offset - push_start) / 4;
    }
 
    switch (nir->info.stage) {
    case MESA_SHADER_TESS_CTRL:
       if (data.needs_dyn_tess_config) {
-         struct brw_tcs_prog_data *tcs_prog_data = brw_tcs_prog_data(prog_data);
-
          const uint32_t tess_config_offset =
             anv_drv_const_offset(drv_data.gfx.tess_config);
          assert(tess_config_offset >= push_start);
-         tcs_prog_data->tess_config_param = tess_config_offset - push_start;
+         push_layout->tess_config_param = tess_config_offset - push_start;
       }
       break;
 
    case MESA_SHADER_TESS_EVAL:
       if (push_info->separate_tessellation) {
-         struct brw_tes_prog_data *tes_prog_data = brw_tes_prog_data(prog_data);
-
          const uint32_t tess_config_offset =
             anv_drv_const_offset(drv_data.gfx.tess_config);
          assert(tess_config_offset >= push_start);
-         tes_prog_data->tess_config_param = tess_config_offset - push_start;
+         push_layout->tess_config_param = tess_config_offset - push_start;
       }
       break;
 
    case MESA_SHADER_FRAGMENT: {
-      struct brw_fs_prog_data *fs_prog_data =
-         container_of(prog_data, struct brw_fs_prog_data, base);
-
       if (push_info->fragment_dynamic) {
          const uint32_t fs_config_offset =
             anv_drv_const_offset(drv_data.gfx.fs_config);
          assert(fs_config_offset >= push_start);
-         fs_prog_data->fs_config_param = fs_config_offset - push_start;
+         push_layout->fs_config_param = fs_config_offset - push_start;
       }
       break;
    }
@@ -885,8 +879,9 @@ anv_nir_compute_push_layout(nir_shader *nir,
       const int subgroup_id_index =
          BITSET_TEST(data.push_dwords, anv_drv_const_offset(subgroup_id) / 4) ?
          (anv_drv_const_offset(subgroup_id) - push_start) / 4 : -1;
-      struct brw_cs_prog_data *cs_prog_data = brw_cs_prog_data(prog_data);
-      brw_cs_fill_push_const_info(devinfo, cs_prog_data, subgroup_id_index);
+      assert(cs_push != NULL);
+      brw_cs_fill_push_const_info(devinfo, push_layout,
+                                  subgroup_id_index, cs_push);
       break;
    }
 
@@ -944,17 +939,17 @@ anv_nir_shrink_push_constant_ranges(nir_shader *shader)
 
 void
 anv_nir_validate_push_layout(const struct anv_physical_device *pdevice,
-                             struct brw_stage_prog_data *prog_data,
+                             const struct intel_push_layout *push_layout,
                              struct anv_pipeline_bind_map *map)
 {
 #ifndef NDEBUG
-   unsigned prog_data_push_size = 0;
+   unsigned push_layout_size = 0;
    for (unsigned i = 0; i < 4; i++)
-      prog_data_push_size += DIV_ROUND_UP(prog_data->push_sizes[i], 32);
+      push_layout_size += DIV_ROUND_UP(push_layout->push_sizes[i], 32);
 
    unsigned bind_map_push_size = 0;
    for (unsigned i = 0; i < 4; i++) {
-      /* This is dynamic and doesn't count against prog_data->ubo_ranges[] */
+      /* This is dynamic and doesn't count against push_layout->push_sizes[] */
       if (map->push_ranges[i].set == ANV_DESCRIPTOR_SET_PER_PRIM_PADDING)
          continue;
       bind_map_push_size += map->push_ranges[i].length;
@@ -964,6 +959,6 @@ anv_nir_validate_push_layout(const struct anv_physical_device *pdevice,
     * that they push the same number of registers.  This should alert us if
     * the back-end compiler decides to re-arrange stuff or shrink a range.
     */
-   assert(prog_data_push_size == bind_map_push_size);
+   assert(push_layout_size == bind_map_push_size);
 #endif
 }

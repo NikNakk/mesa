@@ -530,6 +530,9 @@ radv_rra_accel_struct_buffer_unref(struct radv_device *device, struct radv_rra_a
 void
 radv_rra_accel_struct_buffers_unref(struct radv_device *device, struct set *buffers)
 {
+   if (!buffers)
+      return;
+
    set_foreach_remove (buffers, entry)
       radv_rra_accel_struct_buffer_unref(device, (void *)entry->key);
 }
@@ -1277,7 +1280,7 @@ radv_gamma_dump_trace(VkQueue vk_queue, char *filename)
    fwrite(&header, sizeof(header), 1, file);
 
    struct gamma_chunk_header trace_info_chunk_header = {
-      .type = gamma_chunk_type_trace_info_radv,
+      .type = RADV_GAMMA_CHUNK_TYPE(trace_info),
       .size = sizeof(struct radv_gamma_trace_info),
    };
    fwrite(&trace_info_chunk_header, sizeof(trace_info_chunk_header), 1, file);
@@ -1320,7 +1323,7 @@ radv_gamma_dump_trace(VkQueue vk_queue, char *filename)
                               sizeof(struct radv_ray_history_header);
 
       struct gamma_chunk_header history_chunk_header = {
-         .type = gamma_chunk_type_ray_history_radv,
+         .type = RADV_GAMMA_CHUNK_TYPE(ray_history),
          .size = sizeof(struct radv_gamma_ray_history_header) +
                  dispatch_count * sizeof(struct radv_gamma_dispatch_info) + history_size,
       };

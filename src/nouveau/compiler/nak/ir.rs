@@ -698,11 +698,7 @@ impl SrcRef {
 
 impl From<bool> for SrcRef {
     fn from(b: bool) -> SrcRef {
-        if b {
-            SrcRef::True
-        } else {
-            SrcRef::False
-        }
+        if b { SrcRef::True } else { SrcRef::False }
     }
 }
 
@@ -1090,11 +1086,7 @@ impl Src {
         match self.src_ref {
             SrcRef::Imm32(i) => {
                 assert!(self.is_unmodified());
-                if (i & 0xfff) == 0 {
-                    None
-                } else {
-                    Some(i)
-                }
+                if (i & 0xfff) == 0 { None } else { Some(i) }
             }
             _ => None,
         }
@@ -1521,11 +1513,7 @@ impl OpFoldData<'_> {
     #[allow(dead_code)]
     pub fn get_u32_bnot_src(&self, op: &impl SrcsAsSlice, src: &Src) -> u32 {
         let x = self.get_u32_src(op, src);
-        if src.src_mod.is_bnot() {
-            !x
-        } else {
-            x
-        }
+        if src.src_mod.is_bnot() { !x } else { x }
     }
 
     #[allow(dead_code)]
@@ -7695,6 +7683,86 @@ impl_display_for_op!(OpMatch);
 
 #[repr(C)]
 #[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpTtuOpen {
+    /// Unofficial name
+    ///
+    /// Always set when a secondary ray traversal operation is set in TTU[0x80..0x90] range.
+    /// If TTU[0x80..0x90] is modified without that bit set, an error code will be
+    /// returned at TTU[0x300]. (0xe00000XX)
+    pub dual: bool,
+}
+
+impl DisplayOp for OpTtuOpen {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let dual_str = if self.dual { ".dual" } else { "" };
+        write!(f, "ttuopen{}", dual_str)
+    }
+}
+impl_display_for_op!(OpTtuOpen);
+
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpTtuSt {
+    #[src_type(GPR)]
+    pub srcs: [Src; 2],
+
+    pub offset: u16,
+}
+
+impl DisplayOp for OpTtuSt {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ttust [0x{:x}] {} {}",
+            self.offset, self.srcs[0], self.srcs[1],
+        )
+    }
+}
+impl_display_for_op!(OpTtuSt);
+
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpTtuLd {
+    pub dsts: [Dst; 2],
+
+    pub offset: u16,
+    pub close: bool,
+}
+
+impl DisplayOp for OpTtuLd {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let close = if self.close { ".close" } else { "" };
+        write!(f, "ttuld{} [0x{:x}]", close, self.offset)
+    }
+}
+impl_display_for_op!(OpTtuLd);
+
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpTtuGo {}
+
+impl DisplayOp for OpTtuGo {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ttugo")
+    }
+}
+impl_display_for_op!(OpTtuGo);
+
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpTtuMacroFuse {
+    pub imm: u8,
+}
+
+impl DisplayOp for OpTtuMacroFuse {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ttumacrofuse {:x}", self.imm)
+    }
+}
+impl_display_for_op!(OpTtuMacroFuse);
+
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpUndef {
     pub dst: Dst,
 }
@@ -8259,6 +8327,11 @@ pub enum Op {
     S2R(Box<OpS2R>),
     Vote(Box<OpVote>),
     Match(Box<OpMatch>),
+    TtuOpen(Box<OpTtuOpen>),
+    TtuSt(Box<OpTtuSt>),
+    TtuLd(Box<OpTtuLd>),
+    TtuGo(Box<OpTtuGo>),
+    TtuMacroFuse(Box<OpTtuMacroFuse>),
     Undef(Box<OpUndef>),
     SrcBar(Box<OpSrcBar>),
     PhiSrcs(Box<OpPhiSrcs>),
@@ -8434,6 +8507,12 @@ impl Op {
             // Geometry ops
             Op::Out(_) | Op::OutFinal(_) => false,
 
+            // TTU ops
+            Op::TtuOpen(_) | Op::TtuSt(_) | Op::TtuLd(_) | Op::TtuGo(_) => {
+                false
+            }
+            Op::TtuMacroFuse(_) => true,
+
             // Miscellaneous ops
             Op::Bar(_)
             | Op::TexDepBar(_)
@@ -8483,6 +8562,8 @@ impl Op {
                 | Op::Bra(_)
                 | Op::Nanosleep(_)
                 | Op::Exit(_)
+                | Op::TtuOpen(_)
+                | Op::TtuGo(_)
         )
     }
 
@@ -8619,6 +8700,13 @@ impl Op {
 
             // Geometry ops
             Op::Out(_) | Op::OutFinal(_) => false,
+
+            // TTU ops
+            Op::TtuOpen(_)
+            | Op::TtuSt(_)
+            | Op::TtuLd(_)
+            | Op::TtuGo(_)
+            | Op::TtuMacroFuse(_) => false,
 
             // Miscellaneous ops
             Op::Bar(_)
@@ -9024,7 +9112,12 @@ impl Instr {
             | Op::OutFinal(_)
             | Op::Isbewr(_)
             | Op::Nanosleep(_)
+            | Op::TtuOpen(_)
+            | Op::TtuSt(_)
+            | Op::TtuGo(_)
+            | Op::TtuMacroFuse(_)
             | Op::Annotate(_) => false,
+            Op::TtuLd(op) => !op.close,
             Op::BMov(op) => !op.clear,
             _ => true,
         }
@@ -9171,6 +9264,11 @@ impl Instr {
             | Op::S2R(_)
             | Op::Vote(_)
             | Op::Match(_)
+            | Op::TtuOpen(_)
+            | Op::TtuSt(_)
+            | Op::TtuLd(_)
+            | Op::TtuGo(_)
+            | Op::TtuMacroFuse(_)
             | Op::Undef(_)
             | Op::SrcBar(_)
             | Op::PhiSrcs(_)
@@ -9713,6 +9811,7 @@ pub struct ShaderInfo {
     pub uses_global_mem: bool,
     pub writes_global_mem: bool,
     pub uses_fp64: bool,
+    pub uses_ttu: bool,
     pub stage: ShaderStageInfo,
     pub io: ShaderIoInfo,
 }

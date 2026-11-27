@@ -85,7 +85,7 @@ process_block(struct ctx *ctx, jay_builder *b, jay_block *block)
          if (!cond) {
             cond = GEN_CONDITION_EQ;
             I->type = JAY_TYPE_U32;
-            x = y = jay_bare_reg(UGPR, 0);
+            x = y = jay_bare_reg(UGPR, 32, 0);
          }
 
          jay_inst *cmp = jay_CMP(b, I->type, cond, ctx->helper_flag, x, y);
@@ -158,12 +158,13 @@ jay_lower_helpers(jay_shader *shader)
    assert(shader->helpers_tracked);
    unsigned helper_flag_no =
       shader->num_regs[FLAG] - jay_phys_flag_per_virt(shader);
-   struct ctx ctx = { .helper_flag = jay_bare_reg(FLAG, helper_flag_no) };
+   struct ctx ctx = { .helper_flag = jay_bare_reg(FLAG, jay_flag_bits(entry),
+                                                  helper_flag_no) };
 
    /* Initialize the helper flag sensibly based on the dispatch mask (sr0.2) */
-   jay_def sr0_2 = jay_scalar(J_ARF, 32, GEN_ARF_STATE);
+   jay_def sr0_2 = jay_scalar(J_ARF, jay_flag_bits(entry), GEN_ARF_STATE);
    sr0_2.reg = 2;
-   jay_NOT(&b, ctx.helper_flag, sr0_2)->type = jay_flag_type(entry);
+   jay_NOT(&b, jay_flag_type(entry), ctx.helper_flag, sr0_2);
 
    jay_foreach_block_rev(entry, block) {
       process_block(&ctx, &b, block);

@@ -1042,6 +1042,10 @@ kk_physical_device_init_pipeline_cache(struct kk_physical_device *pdev)
          _mesa_blake3_update(&blake3_ctx, v, strlen(v));
    }
 
+   _mesa_blake3_update(&blake3_ctx,
+                       &instance->drirc.misc.position_always_invariant,
+                       sizeof(instance->drirc.misc.position_always_invariant));
+
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
 
@@ -1214,6 +1218,9 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
       settings->disabled_workarounds |= BITFIELD64_BIT(index);
    }
 
+   /* No longer needed workarounds (to be deleted in code eventually) */
+   settings->disabled_workarounds |= BITFIELD64_BIT(17);
+
    /* Workarounds resolved on macOS 27 */
    if (ns_is_os_version_at_least(27, 0, 0)) {
       /* 1-6 */
@@ -1222,8 +1229,8 @@ kk_parse_environment_options(struct kk_physical_device *pdev)
       settings->disabled_workarounds |= BITFIELD64_BIT(8);
       settings->disabled_workarounds |= BITFIELD64_BIT(11);
       settings->disabled_workarounds |= BITFIELD64_BIT(12);
-      settings->disabled_workarounds |= BITFIELD64_BIT(17);
       settings->disabled_workarounds |= BITFIELD64_BIT(18);
+      settings->disabled_workarounds |= BITFIELD64_BIT(20);
    }
    /* M5 only workarounds */
    if (pdev->info.gpu_apple_family >= 10) {

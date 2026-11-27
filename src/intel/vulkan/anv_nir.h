@@ -136,12 +136,13 @@ bool anv_nir_compute_push_layout(nir_shader *nir,
                                  enum brw_robustness_flags robust_flags,
                                  const struct anv_nir_push_layout_info *info,
                                  struct brw_base_prog_key *prog_key,
-                                 struct brw_stage_prog_data *prog_data,
+                                 struct intel_push_layout *push_layout,
+                                 struct brw_cs_push_const_info *cs_push,
                                  struct anv_pipeline_bind_map *map,
                                  const struct anv_pipeline_push_map *push_map);
 
 void anv_nir_validate_push_layout(const struct anv_physical_device *pdevice,
-                                  struct brw_stage_prog_data *prog_data,
+                                  const struct intel_push_layout *push_layout,
                                   struct anv_pipeline_bind_map *map);
 
 bool anv_nir_update_resource_intel_block(nir_shader *shader);
@@ -211,7 +212,7 @@ bool anv_nir_is_pushable_pointer(nir_intrinsic_instr *intrin,
                                  uint32_t *out_load_offset);
 
 void anv_nir_analyze_push_constants_ranges(nir_shader *nir,
-                                           const struct intel_device_info *devinfo,
+                                           const struct anv_physical_device *pdevice,
                                            const struct anv_pipeline_push_map *push_map,
                                            struct anv_push_range out_ranges[4]);
 

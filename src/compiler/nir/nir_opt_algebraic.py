@@ -39,16 +39,14 @@ d = 'd'
 e = 'e'
 NAN = math.nan
 
+when = nir_algebraic.TransformCondExpr
+
 has_fmulz = '(options->has_fmulz || \
               (options->has_fmulz_no_denorms && \
                !nir_is_denorm_preserve(info->float_controls_execution_mode, 32)))'
 
 has_ffmaz = '(options->has_ffmaz_no_denorms && \
               !nir_is_denorm_preserve(info->float_controls_execution_mode, 32))'
-
-denorm_ftz_16 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'
-denorm_ftz_32 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 32)'
-denorm_ftz_64 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 64)'
 
 # Written in the form (<search>, <replace>) where <search> is an expression
 # and <replace> is either an expression or a value.  An expression is
@@ -99,6 +97,23 @@ denorm_ftz_64 = 'nir_is_denorm_flush_to_zero(info->float_controls_execution_mode
 # means that the replacement expression won't preserve the sign of zero of the
 # result, and so it will be skipped if the matching instruction has the
 # 'signed_zero_preserve' flag set.
+#
+# In addition to <search> and <replace>, the tuple can contain the test status
+# and transform conditions. A transform condition is a C expression using the
+# "shader" (nir_shader *), "options" (nir_shader_compiler_options *), or "info"
+# (shader_info *) variables. If the condition is wrapped in an when(), it can
+# also use variables corresponding to names in the search expression:
+# - variables with a constant ('#<name>') source have <name>_def (nir_def *) and
+#   <name> variable with a double data type if all the variable's sources in the search
+#   expression are float, or the explicit type ('#<name>(type)';
+#   bool for bool and 1-bit values, uint64_t/int64_t for uint/int and double for float).
+# - other variables have a <name> (nir_def *) variable.
+# All variables in the search expression also have <name>_var (nir_match_variable *).
+# When the search expression has constant sources, the condition is run for each
+# component.
+#
+# A tuple can have at most one string transform condition and at most one when()
+# transform condition.
 
 # based on https://web.archive.org/web/20180105155939/http://forum.devmaster.net/t/fast-and-accurate-sine-cosine/9648
 def lowered_sincos(c):
@@ -158,9 +173,7 @@ optimize_fcanonicalize = [
    # another, because we don't know if they flush the same way.
    # Constant folding would also not flush, so there is already a lot of handwaving
    # involved, and this mode is supposed to be fast, not 100% reproducible.
-   (('fcanonicalize', 'a@16'), a, '!'+denorm_ftz_16),
-   (('fcanonicalize', 'a@32'), a, '!'+denorm_ftz_32),
-   (('fcanonicalize', 'a@64'), a, '!'+denorm_ftz_64),
+   (('fcanonicalize', a), a, when('!nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, a->bit_size)')),
 
    # If denormals are required to be flushed we can still
    # eliminate it if any denormals are already flushed or will be flushed.
@@ -1379,8 +1392,6 @@ for op in ['iand', 'ior', 'ixor']:
 
 # Integer sizes
 for s in [8, 16, 32, 64]:
-    amount_bits = int(math.log2(s))
-
     lower_umin = 'options->lower_umin'
     lower_umax = 'options->lower_umax'
     lower_imin = 'false'
@@ -1410,13 +1421,6 @@ for s in [8, 16, 32, 64]:
        (('bcsel', ('ige', 'a@{}'.format(s), b), b, a), ('imin', a, b), '!'+lower_imin),
        (('bcsel', ('ige', 'b@{}'.format(s), a), b, a), ('imax', a, b), '!'+lower_imax),
 
-       # SM5 32-bit shifts are defined to use the 5 least significant bits (or 4 bits for 16 bits)
-       (('ishl', 'a@{}'.format(s), ('iand', s - 1, b)), ('ishl', a, b)),
-       (('ishr', 'a@{}'.format(s), ('iand', s - 1, b)), ('ishr', a, b)),
-       (('ushr', 'a@{}'.format(s), ('iand', s - 1, b)), ('ushr', a, b)),
-       (('ushr', 'a@{}'.format(s), ('ishl(is_used_once)', ('iand', b, 1), amount_bits - 1)), ('ushr', a, ('ishl', b, amount_bits - 1))),
-       (('ushr', 'a@{}'.format(s), ('ishl(is_used_once)', ('iand', b, 3), amount_bits - 2)), ('ushr', a, ('ishl', b, amount_bits - 2))),
-
        (('ior', ('ilt(is_used_once)', f'a@{s}', b), ('ilt', a, c)), ('ilt', a, ('imax', b, c)), '!'+lower_imax),
        (('ior', ('ilt(is_used_once)', f'a@{s}', c), ('ilt', b, c)), ('ilt', ('imin', a, b), c), '!'+lower_imin),
        (('ior', ('ige(is_used_once)', f'a@{s}', b), ('ige', a, c)), ('ige', a, ('imin', b, c)), '!'+lower_imin),
@@ -1439,6 +1443,20 @@ for s in [8, 16, 32, 64]:
     if s == 32:
         # True/False are ~0 and 0 in NIR.  b2i of True is 1, and -1 is ~0 (True).
         optimizations.extend([(('ineg', ('b2i{}'.format(s), 'a@{}'.format(s))), a)])
+
+# SM5 32-bit shifts are defined to use the 5 least significant bits (or 4 bits for 16 bits)
+optimizations.extend([
+    (('ishl', a, ('iand', b, '#c(uint)')), ('ishl', a, b), when('c == (a->bit_size - 1)'), TestStatus.UNSUPPORTED),
+    (('ishr', a, ('iand', b, '#c(uint)')), ('ishr', a, b), when('c == (a->bit_size - 1)'), TestStatus.UNSUPPORTED),
+    (('ushr', a, ('iand', b, '#c(uint)')), ('ushr', a, b), when('c == (a->bit_size - 1)'), TestStatus.UNSUPPORTED),
+
+    (('ushr', a, ('ishl(is_used_once)', ('iand', b, 1), '#c(uint)')),
+     ('ushr', a, ('ishl', b, c)),
+     when('c == (util_logbase2(a->bit_size) - 1)')),
+    (('ushr', a, ('ishl(is_used_once)', ('iand', b, 3), '#c(uint)')),
+     ('ushr', a, ('ishl', b, c)),
+     when('c == (util_logbase2(a->bit_size) - 2)')),
+])
 
 optimizations.extend([
    # Common pattern like 'if (i == 0 || i == 1 || ...)'
@@ -1751,6 +1769,7 @@ optimizations.extend([
    (('ior',  ('inot', ('ior', a, b)), ('iand', a, b)),           ('inot', ('ixor', a, b))),
    (('iand', ('ior', ('inot', a), b), ('ior', a,  ('inot', b))), ('inot', ('ixor', a, b))),
    (('ior', ('iand', ('inot', a), b), ('iand', a, ('inot', b))),          ('ixor', a, b)),
+   (('iand', ('ior', a, '#b(uint)'), '#c(uint)'), c, when('(b & c) == c')),
 
    # It is common for sequences of (x & 1) to occur in large trees.  Replacing
    # an expression like ((a & 1) & (b & 1)) with ((a & b) & 1) allows the "&
@@ -1838,6 +1857,9 @@ optimizations.extend([
    (('bitfield_select', 0xff000000, ('ishl', 'b@32', 24), ('ushr', a, 8)), ('shfr', b, a, 8), 'options->has_shfr32'),
    (('bitfield_select', 0xffff0000, ('ishl', 'b@32', 16), ('extract_u16', a, 1)), ('shfr', b, a, 16), 'options->has_shfr32'),
    (('bitfield_select', 0xffffff00, ('ishl', 'b@32', 8), ('extract_u8', a, 3)), ('shfr', b, a, 24), 'options->has_shfr32'),
+   (('bitfield_select', 0x00ffffff, ('ushr', a, 8), ('ishl', 'b@32', 24)), ('shfr', b, a, 8), 'options->has_shfr32'),
+   (('bitfield_select', 0x0000ffff, ('extract_u16', a, 1), ('ishl', 'b@32', 16)), ('shfr', b, a, 16), 'options->has_shfr32'),
+   (('bitfield_select', 0x000000ff, ('extract_u8', a, 3), ('ishl', 'b@32', 8)), ('shfr', b, a, 24), 'options->has_shfr32'),
    (('ior', ('ishl', 'b@32', 24), ('ushr', a, 8)), ('shfr', b, a, 8), 'options->has_shfr32'),
    (('ior', ('ishl', 'b@32', 16), ('extract_u16', a, 1)), ('shfr', b, a, 16), 'options->has_shfr32'),
    (('ior', ('ishl', 'b@32', 8), ('extract_u8', a, 3)), ('shfr', b, a, 24), 'options->has_shfr32'),
@@ -2633,7 +2655,6 @@ optimizations.extend([
    (('bitfield_select', 0, a, b), b),
    (('bitfield_select', a, b, -1), ('ior', ('inot', a), b)),
    (('bitfield_select', a, -1, b), ('ior', a, b)),
-   (('bitfield_select', -1, a, b), a),
    (('bitfield_select', a, b, b), b),
    (('bitfield_select', a, ('inot', b), b), ('ixor', a, b)),
    (('bitfield_select', a, b, ('inot', b)), ('inot', ('ixor', a, b))),
@@ -2642,13 +2663,15 @@ optimizations.extend([
    (('bitfield_select', ('inot', a), b, c), ('bitfield_select', a, c, b)),
    (('bitfield_select', ('ineg', ('b2i', 'a@1')), b, c), ('bcsel', a, b, c)),
 
-   (('ior', ('iand', a, b), ('iand', ('inot', a), c)), ('bitfield_select', a, b, c), 'options->has_bitfield_select'),
-   (('iadd', ('iand', a, b), ('iand', ('inot', a), c)), ('bitfield_select', a, b, c), 'options->has_bitfield_select'),
-   (('ixor', ('iand', a, b), ('iand', ('inot', a), c)), ('bitfield_select', a, b, c), 'options->has_bitfield_select'),
    (('ixor', ('iand', a, ('ixor', b, c)), c), ('bitfield_select', a, b, c), 'options->has_bitfield_select'),
 
-   # The patterns above could create 1bit bitfield_select, but that's really just bcsel.
+   # Other patterns could create 1bit bitfield_select, but that's really just bcsel.
    (('bitfield_select@1', a, b, c), ('bcsel', a, b, c)),
+
+   # Canonicalize bitfield_select with constant mask for better CSE
+   # The chosen canonicalizion prefers positive constants because AMD
+   # has more inline constants for those.
+   (('bitfield_select', '#a(int)', b, c), ('bitfield_select', ('inot', a), c, b), when('a < 0')),
 
    # Note that these opcodes are defined to only use the five least significant bits of 'offset' and 'bits'
    (('ubfe', 'value', 'offset', ('iand', 31, 'bits')), ('ubfe', 'value', 'offset', 'bits')),
@@ -3396,6 +3419,27 @@ def bitfield_reverse_cp2077(u):
 optimizations += [(bitfield_reverse_xcom2('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
 optimizations += [(bitfield_reverse_ue4('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
 optimizations += [(bitfield_reverse_cp2077('x@32'), ('bitfield_reverse', 'x'), '!options->lower_bitfield_reverse')]
+
+# Create bitfield_select or bfi from (a & b) | (~a & c).
+# Instead of an or, xor and add can also be used to combine disjoint masks
+# These patterns must be after the bitfield_reverse patterns above
+for or_op in ['ior', 'ixor', 'iadd']:
+    optimizations.extend([
+       # Only bitfield_select can be used for the non constant case, because it doesn't shift.
+       ((or_op, ('iand', a, b), ('iand', ('inot', a), c)), ('bitfield_select', a, b, c), 'options->has_bitfield_select'),
+
+       # extracts are special iands
+       ((or_op, ('extract_u8', a, 0), ('iand', b, ~0xff)), ('bitfield_select', 0xff, a, b), 'options->has_bitfield_select'),
+       ((or_op, ('extract_u16', a, 0), ('iand', b, ~0xffff)), ('bitfield_select', 0xffff, a, b), 'options->has_bitfield_select'),
+       ((f'{or_op}@32', ('extract_u8', a, 0), ('iand', b, ~0xff)), ('bfi', 0xff, a, b), 'options->has_bfi'),
+       ((f'{or_op}@32', ('extract_u16', a, 0), ('iand', b, ~0xffff)), ('bfi', 0xffff, a, b), 'options->has_bfi'),
+
+       ((or_op, ('iand', '#a(uint)', b), ('iand', '#c(uint)', d)), ('bitfield_select', a, b, d), 'options->has_bitfield_select',
+        when('(a ^ c) == u_uintN_max(b->bit_size)')),
+       ((f'{or_op}@32', ('iand', '#a(uint)', b), ('iand', '#c(uint)', d)), ('bfi', a, b, d), 'options->has_bfi',
+        when('(a ^ c) == u_uintN_max(b->bit_size) && (a & 0x1)')),
+    ])
+
 
 # VKD3D-Proton DXBC f32 to f16 conversion implements a float conversion using PackHalf2x16.
 # Because the spec does not specify a rounding mode or behaviour regarding infinity,

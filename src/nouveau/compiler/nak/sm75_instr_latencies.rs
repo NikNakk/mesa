@@ -38,11 +38,7 @@ enum RegLatencySM75 {
 }
 
 pub const fn pred(has_pred: bool, a: u32, b: u32) -> u32 {
-    if has_pred {
-        a + b
-    } else {
-        b
-    }
+    if has_pred { a + b } else { b }
 }
 
 impl RegLatencySM75 {
@@ -199,6 +195,10 @@ impl RegLatencySM75 {
             Op::Shfl(_) => Decoupled,
             Op::Ldsm(_) => Decoupled,
             Op::Nanosleep(_) => Decoupled,
+            Op::TtuOpen(_) | Op::TtuGo(_) | Op::TtuLd(_) | Op::TtuSt(_) => {
+                Decoupled
+            }
+            Op::TtuMacroFuse(_) => CoupledAlu,
             x => {
                 panic!("Illegal instuction in reg category {}", x);
             }

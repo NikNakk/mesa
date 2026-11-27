@@ -33,7 +33,7 @@ class nir_opt_varyings_test_dedup : public nir_opt_varyings_test {
 
       create_shaders(producer, consumer);
       for (unsigned s = 0; s < 2; s++) {
-         nir_def *input = load_input(b1, (gl_varying_slot)0, 0, ty, 0, 0);
+         nir_def *input = load_input(b1, (gl_varying_slot)0, 0, ty, -1, 0);
          for (unsigned v = 0; v < (is_per_vertex(b1, (gl_varying_slot)pslot[s], false) ? 3 : 1); v++) {
             store[s][v] =
                store_output(b1, (gl_varying_slot)pslot[s], s, ty, input, v, false);
@@ -68,18 +68,16 @@ class nir_opt_varyings_test_dedup : public nir_opt_varyings_test {
             }
          }
          for (unsigned v = 0; v < (is_per_vertex(b2, (gl_varying_slot)cslot[1], true) ? 3 : 1); v++) {
-            ASSERT_TRUE(shader_contains_def(b2, load[0][v]));
-            ASSERT_TRUE(!shader_contains_def(b2, load[1][v]));
+            ASSERT_EQ(count_num_loads(b2, v), 1); \
          }
       } else {
-         ASSERT_EQ(opt_varyings() & nir_progress_consumer, 0);
+         ASSERT_EQ(opt_varyings() & (b1->shader->info.stage == MESA_SHADER_GEOMETRY ? 0 : nir_progress_consumer), 0); \
          for (unsigned v = 0; v < (is_per_vertex(b1, (gl_varying_slot)pslot[1], false) ? 3 : 1); v++) {
             ASSERT_TRUE(shader_contains_instr(b1, &store[0][v]->instr));
             ASSERT_TRUE(shader_contains_instr(b1, &store[1][v]->instr));
          }
          for (unsigned v = 0; v < (is_per_vertex(b2, (gl_varying_slot)cslot[1], true) ? 3 : 1); v++) {
-            ASSERT_TRUE(shader_contains_def(b2, load[0][v]));
-            ASSERT_TRUE(shader_contains_def(b2, load[1][v]));
+            ASSERT_EQ(count_num_loads(b2, v), 2); \
          }
       }
    }

@@ -23,8 +23,7 @@ idep_radv_tracepoints = declare_dependency(
 
 radv_entrypoints_gen_command = [
   prog_python, '@INPUT0@', '--xml', '@INPUT1@', '--proto', '--weak',
-  '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@',
-  '--beta', with_vulkan_beta.to_string()
+  '--out-h', '@OUTPUT0@', '--out-c', '@OUTPUT1@', vulkan_gen_beta_arg,
 ]
 
 radv_entrypoints_gen_command += [
@@ -170,6 +169,8 @@ libradv_files = files(
   'radv_event.h',
   'radv_formats.c',
   'radv_formats.h',
+  'radv_graphics_state.c',
+  'radv_graphics_state.h',
   'radv_host_image_copy.c',
   'radv_image.c',
   'radv_image.h',
@@ -203,6 +204,10 @@ libradv_files = files(
   'radv_shader.h',
   'radv_shader_args.c',
   'radv_shader_args.h',
+  'radv_shader_compute.c',
+  'radv_shader_compute.h',
+  'radv_shader_graphics.c',
+  'radv_shader_graphics.h',
   'radv_shader_info.c',
   'radv_shader_info.h',
   'radv_shader_object.c',
@@ -251,6 +256,10 @@ if with_amdgpu_virtio
   radv_flags += '-DHAVE_AMDGPU_VIRTIO'
 endif
 
+if with_amd_rdp
+  radv_flags += '-DRADV_SUPPORT_RDP'
+endif
+
 if with_platform_x11
   radv_deps += dep_xcb_dri3
 endif
@@ -286,7 +295,7 @@ libvulkan_radeon = shared_library(
     inc_util, inc_virtio_gpu
   ],
   link_with : [
-    libamd_common, libamd_common_llvm, libamdgpu_addrlib,
+    libamd_common, libamd_common_llvm, libamd_common_rdp, libamdgpu_addrlib,
   ],
   dependencies : [
     dep_llvm, dep_libdrm_amdgpu, dep_thread, dep_elf, dep_dl, dep_m,
@@ -370,7 +379,9 @@ if with_radv_tests
       'radv_tests',
       files(
         'nir/radv_nir_lower_hit_attrib_derefs.c',
+        'nir/radv_nir_lower_opt_fs_frag_pos.c',
         'tests/radv_nir_lower_hit_attrib_derefs_tests.cpp',
+        'tests/radv_nir_lower_opt_fs_frag_pos_tests.cpp',
         'tests/helpers.cpp',
         'tests/helpers.h',
         'tests/drirc.cpp',

@@ -1252,7 +1252,8 @@ ir3_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes,
    else if (bit_size >= 32)
       bit_size = 32;
 
-   if (intrin == nir_intrinsic_load_ubo)
+   if (intrin == nir_intrinsic_load_ubo ||
+       intrin == nir_intrinsic_load_push_constant)
       bit_size = 32;
 
    return (nir_mem_access_size_align){
@@ -1500,10 +1501,19 @@ ir3_nir_set_threadsize(struct ir3_shader_variant *v, const nir_shader *s)
        * worry about the workgroup fitting.
        */
       if (compiler->gen < 6 &&
-          (info->workgroup_size_variable ||
-           threads_per_wg > compiler->info->threadsize_base * compiler->info->max_waves)) {
+          threads_per_wg > compiler->info->threadsize_base * compiler->info->max_waves) {
          v->shader_options.real_wavesize = IR3_DOUBLE_ONLY;
-      };
+      } else if (compiler->gen < 6 && info->workgroup_size_variable) {
+         /* A variable workgroup size cannot force the doubled threadsize: a
+          * register-hungry kernel does not fit in the file once it is doubled,
+          * and the hardware faults.  Let the register heuristic choose, and
+          * let the workgroup size follow -- get_compute_state_info() already
+          * reports a max_threads clamped by the register footprint, so a
+          * workgroup that needs the doubled threadsize cannot be launched
+          * against a variant that did not get it.
+          */
+         v->shader_options.real_wavesize = IR3_SINGLE_OR_DOUBLE;
+      }
    }
 }
 
@@ -1730,7 +1740,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    /* UBO offset lowering has to come after we've decided what will
     * be left as load_ubo
     */
-   if (so->compiler->gen >= 6)
+   if (so->compiler->has_ldc_ubos)
       progress |= OPT(s, nir_lower_ubo_vec4);
 
    progress |= OPT(s, ir3_nir_lower_io_offsets, so->compiler);
@@ -1912,8 +1922,7 @@ ir3_get_driver_param_info(const nir_shader *shader,
 
 uint32_t
 ir3_nir_scan_driver_consts(struct ir3_compiler *compiler, nir_shader *shader,
-                           const struct ir3_shader_key *key,
-                           struct ir3_const_image_dims *image_dims)
+                           const struct ir3_shader_key *key)
 {
    uint32_t num_driver_params = 0;
    nir_foreach_function (function, shader) {
@@ -1926,36 +1935,6 @@ ir3_nir_scan_driver_consts(struct ir3_compiler *compiler, nir_shader *shader,
                continue;
 
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            unsigned idx;
-
-            if (image_dims) {
-               switch (intr->intrinsic) {
-               case nir_intrinsic_image_atomic:
-               case nir_intrinsic_image_atomic_swap:
-               case nir_intrinsic_image_load:
-               case nir_intrinsic_image_store:
-                  /* a4xx gets these supplied by the hw directly (maybe CP?).
-                   *
-                   * Every image intrinsic still present here is emitted with
-                   * ldib/stib, which needs the dimensions to compute its byte
-                   * offset: an image_load that could have used the texture
-                   * path was turned into a tex instruction by
-                   * nir_lower_readonly_images_to_tex long before this runs.
-                   * (image_size is a resinfo, which needs no dimensions.)
-                   */
-                  if (compiler->gen == 5) {
-                     idx = nir_src_as_uint(intr->src[0]);
-                     if (image_dims->mask & (1 << idx))
-                        break;
-                     image_dims->mask |= (1 << idx);
-                     image_dims->off[idx] = image_dims->count;
-                     image_dims->count += 3; /* three const per */
-                  }
-                  break;
-               default:
-                  break;
-               }
-            }
 
             struct driver_param_info param_info;
             if (ir3_get_driver_param_info(shader, key, intr, &param_info)) {
@@ -2086,8 +2065,7 @@ ir3_setup_const_state(nir_shader *nir, struct ir3_shader_variant *v,
    unsigned ptrsz = ir3_pointer_size(compiler);
 
    const_state->num_driver_params =
-      ir3_nir_scan_driver_consts(compiler, nir, &v->key,
-                                 &const_state->image_dims);
+      ir3_nir_scan_driver_consts(compiler, nir, &v->key);
 
    if ((compiler->gen < 5) && (v->stream_output.num_outputs > 0)) {
       const_state->num_driver_params =
@@ -2103,11 +2081,6 @@ ir3_setup_const_state(nir_shader *nir, struct ir3_shader_variant *v,
       ir3_alloc_driver_params(&const_state->allocs,
                               &const_state->num_driver_params, compiler,
                               v->type);
-   }
-
-   if (const_state->image_dims.count > 0) {
-      ir3_const_reserve_space(&const_state->allocs, IR3_CONST_ALLOC_IMAGE_DIMS,
-                              align(const_state->image_dims.count, 4) / 4, 1);
    }
 
    if ((v->type == MESA_SHADER_VERTEX) && (compiler->gen < 5) &&

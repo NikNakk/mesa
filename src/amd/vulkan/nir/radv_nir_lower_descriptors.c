@@ -26,6 +26,7 @@ typedef struct {
    bool has_desc_resource_level;
    bool enable_custom_border_on_compute_queue;
    bool gfx10_descriptor_alias_robust;
+   bool use_llvm;
 
    const struct radv_shader_args *args;
    const struct radv_shader_info *info;
@@ -389,6 +390,15 @@ get_sampler_desc(nir_builder *b, lower_descriptors_state *state, nir_deref_instr
    return desc;
 }
 
+/* descriptor_amd needs the descriptor itself rather than its address, which may be non-uniform. */
+static nir_def *
+load_non_uniform_desc(nir_builder *b, lower_descriptors_state *state, nir_def *ptr, unsigned num_components)
+{
+   assert(state->use_llvm);
+   return nir_load_global(b, num_components, 32, convert_pointer_to_64_bit(b, state, ptr),
+                          .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER, .align_mul = num_components * 4u);
+}
+
 static void
 update_image_intrinsic(nir_builder *b, lower_descriptors_state *state, nir_intrinsic_instr *intrin)
 {
@@ -401,6 +411,8 @@ update_image_intrinsic(nir_builder *b, lower_descriptors_state *state, nir_intri
                                     nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM, NULL, !is_load);
 
    if (intrin->intrinsic == nir_intrinsic_image_deref_descriptor_amd) {
+      if (nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM)
+         desc = load_non_uniform_desc(b, state, desc, intrin->def.num_components);
       nir_def_replace(&intrin->def, desc);
    } else {
       nir_rewrite_image_intrinsic(intrin, desc, nir_image_intrinsic_type_bindless);
@@ -451,6 +463,8 @@ lower_image_heap_intrinsic(nir_builder *b, lower_descriptors_state *state, nir_i
                        nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM, NULL, !is_load);
 
    if (intrin->intrinsic == nir_intrinsic_image_heap_descriptor_amd) {
+      if (nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM)
+         desc = load_non_uniform_desc(b, state, desc, intrin->def.num_components);
       nir_def_replace(&intrin->def, desc);
    } else {
       nir_rewrite_image_intrinsic(intrin, desc, nir_image_intrinsic_type_bindless);
@@ -730,6 +744,8 @@ lower_descriptors_tex(nir_builder *b, lower_descriptors_state *state, nir_tex_in
    }
 
    if (tex->op == nir_texop_descriptor_amd) {
+      if (tex->texture_non_uniform)
+         image = load_non_uniform_desc(b, state, image, tex->def.num_components);
       nir_def_replace(&tex->def, image);
       return true;
    }
@@ -776,6 +792,81 @@ lower_descriptors_instr(nir_builder *b, nir_instr *instr, void *_state)
    return false;
 }
 
+/* Uniform multisampled input attachment read, which may target an MSRTSS attachment. */
+bool
+radv_nir_tex_is_msaa_fbfetch(const nir_tex_instr *tex)
+{
+   return (tex->input_attachment_index || tex->input_attachment_depth || tex->input_attachment_stencil) &&
+          tex->sampler_dim == GLSL_SAMPLER_DIM_SUBPASS_MS && !tex->texture_non_uniform;
+}
+
+/* Replace the single-sampled image descriptor with the descriptor of the MSRTSS transient image if needed. */
+static bool
+lower_msrtss_input_attachment(nir_builder *b, nir_tex_instr *tex, void *_state)
+{
+   lower_descriptors_state *state = _state;
+
+   if (!radv_nir_tex_is_msaa_fbfetch(tex))
+      return false;
+
+   const int handle_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+   nir_def *desc = tex->src[handle_idx].src.ssa;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *index, *in_range;
+   if (tex->input_attachment_index) {
+      index = nir_imm_int(b, tex->texture_index);
+      const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+      if (offset_idx >= 0)
+         index = nir_iadd(b, index, tex->src[offset_idx].src.ssa);
+      in_range = nir_ult_imm(b, index, RADV_MSRTSS_MAX_INPUTS);
+   } else {
+      index = nir_imm_int(b, tex->input_attachment_depth ? RADV_MSRTSS_DEPTH_INPUT : RADV_MSRTSS_STENCIL_INPUT);
+      in_range = nir_imm_true(b);
+   }
+
+   nir_def *table = get_scalar_arg(b, 1, state->args->ps_msrtss_inputs);
+   nir_def *msrtss_desc;
+
+   nir_push_if(b, nir_ine_imm(b, table, 0));
+   {
+      table = convert_pointer_to_64_bit(b, state, table);
+
+      nir_def *header = ac_nir_load_smem(b, 2, table, nir_imm_int(b, 0), 4, 0);
+      nir_def *mask = nir_channel(b, header, 0);
+      nir_def *ds_shared_mask = nir_channel(b, header, 1);
+      nir_def *bit = nir_ishl(b, nir_imm_int(b, 1), index);
+      nir_def *enabled = nir_iand(b, in_range, nir_ine_imm(b, nir_iand(b, mask, bit), 0));
+
+      /* Descriptors are packed in index order, depth before stencil on a shared index.
+       * Keep in sync with radv_emit_msrtss_input_attachments().
+       */
+      nir_def *below = nir_iadd_imm(b, bit, -1);
+      nir_def *slot =
+         nir_iadd(b, nir_bit_count(b, nir_iand(b, mask, below)), nir_bit_count(b, nir_iand(b, ds_shared_mask, below)));
+
+      /* Stencil is the only non-float input attachment that can share an index with depth. */
+      if (tex->op != nir_texop_fragment_mask_fetch_amd && nir_alu_type_get_base_type(tex->dest_type) != nir_type_float)
+         slot = nir_iadd(b, slot, nir_bit_count(b, nir_iand(b, ds_shared_mask, bit)));
+
+      /* The descriptor is loaded unconditionally, so clamp the slot to stay within the table. */
+      nir_def *count = nir_iadd(b, nir_bit_count(b, mask), nir_bit_count(b, ds_shared_mask));
+      slot = nir_umin(b, slot, nir_iadd_imm(b, count, -1));
+
+      const unsigned fmask_offset = tex->op == nir_texop_fragment_mask_fetch_amd ? 32 : 0;
+      nir_def *offset = nir_imul_imm(b, slot, state->sampled_image_desc_size);
+      offset = nir_iadd_imm(b, offset, RADV_MSRTSS_INPUTS_DESC_OFFSET + fmask_offset);
+
+      msrtss_desc = nir_bcsel(b, enabled, ac_nir_load_smem(b, 8, table, offset, 4, 0), desc);
+   }
+   nir_pop_if(b, NULL);
+
+   /* Fall back to the application's descriptor if there is no table or the attachment isn't MSRTSS. */
+   nir_src_rewrite(&tex->src[handle_idx].src, nir_if_phi(b, msrtss_desc, desc));
+   return true;
+}
+
 bool
 radv_nir_lower_descriptors(nir_shader *shader, const struct radv_compiler_info *compiler_info,
                            const struct radv_shader_stage *stage)
@@ -795,6 +886,7 @@ radv_nir_lower_descriptors(nir_shader *shader, const struct radv_compiler_info *
       .has_desc_resource_level = compiler_info->ac->has_desc_resource_level,
       .enable_custom_border_on_compute_queue = compiler_info->key.enable_custom_border_on_compute_queue,
       .gfx10_descriptor_alias_robust = compiler_info->key.gfx10_descriptor_alias_robust,
+      .use_llvm = compiler_info->key.use_llvm,
       .args = &stage->args,
       .info = &stage->info,
       .layout = &stage->layout,
@@ -806,6 +898,9 @@ radv_nir_lower_descriptors(nir_shader *shader, const struct radv_compiler_info *
     */
    progress |= nir_shader_intrinsics_pass(shader, lower_descriptors_early_intrin, nir_metadata_control_flow, &state);
    progress |= nir_shader_instructions_pass(shader, lower_descriptors_instr, nir_metadata_control_flow, &state);
+
+   if (stage->info.ps.reads_msrtss_inputs)
+      progress |= nir_shader_tex_pass(shader, lower_msrtss_input_attachment, nir_metadata_none, &state);
 
    return progress;
 }

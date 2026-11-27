@@ -858,9 +858,6 @@ emit_copy_query_pool_results(struct tu_cmd_buffer *cmdbuf,
                              VkDeviceSize stride,
                              VkQueryResultFlags flags)
 {
-   /* Flush cache for the buffer to copy to. */
-   tu_emit_cache_flush<CHIP>(cmdbuf);
-
    /* From the Vulkan 1.1.130 spec:
     *
     *    vkCmdCopyQueryPoolResults is guaranteed to see the effect of previous
@@ -870,7 +867,12 @@ emit_copy_query_pool_results(struct tu_cmd_buffer *cmdbuf,
     * To ensure that previous writes to the available bit are coherent, first
     * wait for all writes to complete.
     */
-   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   cmdbuf->state.cache.flush_bits |= TU_CMD_FLAG_WAIT_MEM_WRITES |
+                                     /* For CP_COND_EXEC */
+                                     TU_CMD_FLAG_WAIT_FOR_ME;
+
+   /* Flush cache for the buffer to copy to. */
+   tu_emit_cache_flush<CHIP>(cmdbuf);
 
    for (uint32_t i = 0; i < queryCount; i++) {
       uint32_t query = firstQuery + i;
@@ -1033,6 +1035,14 @@ static void
 emit_reset_query_pool(struct tu_cmd_buffer *cmdbuf, struct tu_query_pool *pool, uint32_t firstQuery, uint32_t queryCount)
 {
    struct tu_cs *cs = &cmdbuf->cs;
+
+   /* The result and availability of a previous occlusion query are written
+    * asynchronously by ZPASS_DONE and RB_DONE_TS, make sure they have landed.
+    */
+   if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION &&
+       cmdbuf->device->physical_device->info->props.has_event_write_sample_count) {
+      tu7_wait_for_rb_done(cs, CP_SET_THREAD_BR, true);
+   }
 
    reset_query_pool<CHIP>(pool, firstQuery, queryCount, [cs](uint64_t result_iova) {
       tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
@@ -1588,9 +1598,23 @@ emit_end_occlusion_query(struct tu_cmd_buffer *cmdbuf,
        */
       cs = &cmdbuf->draw_epilogue_cs;
 
-   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
-   tu_cs_emit_qw(cs, available_iova);
-   tu_cs_emit_qw(cs, 0x1);
+   if (cmdbuf->device->physical_device->info->props.has_event_write_sample_count) {
+      /* ZPASS_DONE with write_accum_sample_count_diff accumulates the result asynchronously,
+       * and WFI/WFM/WAIT_FOR_MEM_WRITES don't waits for that write to land.
+       * Thus write availability through RB_DONE_TS which is guaranteed to be correctly ordered.
+       */
+      tu_cs_emit_pkt7(cs, CP_EVENT_WRITE7, 4);
+      tu_cs_emit(cs, CP_EVENT_WRITE7_0(.event = RB_DONE_TS,
+                                       .write_src = EV_WRITE_USER_32B,
+                                       .write_dst = EV_DST_RAM,
+                                       .write_enabled = true).value);
+      tu_cs_emit_qw(cs, available_iova);
+      tu_cs_emit(cs, 0x1);
+   } else {
+      tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
+      tu_cs_emit_qw(cs, available_iova);
+      tu_cs_emit_qw(cs, 0x1);
+   }
 
    cmdbuf->state.occlusion_query_may_be_running = false;
    cmdbuf->state.dirty |= TU_CMD_DIRTY_DISABLE_FS | TU_CMD_DIRTY_LRZ;

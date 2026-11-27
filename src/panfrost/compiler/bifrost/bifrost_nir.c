@@ -10,6 +10,7 @@
 #include "panfrost/compiler/pan_compiler.h"
 #include "panfrost/compiler/pan_nir.h"
 #include "util/perf/cpu_trace.h"
+#include <sys/stat.h>
 
 #include "panfrost/model/pan_model.h"
 #include "valhall/valhall.h"
@@ -391,20 +392,6 @@ bi_optimize_late(nir_shader *nir, unsigned arch,
     * to reduce register pressure. */
    NIR_PASS(_, nir, nir_opt_sink, nir_move_all);
    NIR_PASS(_, nir, nir_opt_move, nir_move_all);
-
-   /* We might lower attribute, varying, and image indirects. Use the
-    * gathered info to skip the extra analysis in the happy path. */
-   bool any_indirects =
-      nir->info.inputs_read_indirectly || nir->info.outputs_read_indirectly ||
-      nir->info.outputs_written_indirectly ||
-      nir->info.patch_inputs_read_indirectly ||
-      nir->info.patch_outputs_read_indirectly ||
-      nir->info.patch_outputs_written_indirectly || nir->info.images_used[0];
-
-   if (any_indirects) {
-      nir_divergence_analysis(nir);
-      NIR_PASS(_, nir, bi_lower_divergent_indirects, pan_subgroup_size(arch));
-   }
 }
 
 void
@@ -852,7 +839,8 @@ bifrost_postprocess_nir(nir_shader *nir,
       NIR_PASS(_, nir, bifrost_nir_lower_load_output);
 
       /* Collect format varyings */
-      pan_varying_collect_formats(&info->varyings.formats, nir, gpu_arch);
+      pan_varying_collect_formats(&info->varyings.formats, nir, gpu_arch,
+                                  false);
 
       NIR_PASS(_, nir, pan_nir_resize_varying_io, &info->varyings.formats,
                inputs->varying_layout ?: &info->varyings.formats);
@@ -873,8 +861,8 @@ bifrost_postprocess_nir(nir_shader *nir,
          nir->info.outputs_written & (BITFIELD_BIT(FRAG_RESULT_DEPTH) |
                                       BITFIELD_BIT(FRAG_RESULT_STENCIL));
       const bool skip_atest = inputs->is_blit && !emit_zs;
-      NIR_PASS(_, nir, pan_nir_lower_fs_outputs, skip_atest,
-               inputs->fragcolor_nr_cbufs);
+      NIR_PASS(_, nir, pan_nir_lower_fs_outputs, skip_atest, gpu_arch,
+               inputs->model, inputs->fragcolor_nr_cbufs);
    } else if (nir->info.stage == MESA_SHADER_VERTEX) {
       NIR_PASS(_, nir, nir_lower_viewport_transform);
       NIR_PASS(_, nir, nir_lower_point_size, 1.0, 0.0);
@@ -899,6 +887,11 @@ bifrost_postprocess_nir(nir_shader *nir,
       NIR_PASS(_, nir, pan_nir_lower_vs_outputs, gpu_arch,
                inputs->varying_layout, info->vs.idvs,
                &info->vs.needs_extended_fifo);
+   } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      /* This may be a SW VS, which still has a varying layout */
+      if (inputs->varying_layout)
+         memcpy(&info->varyings.formats, inputs->varying_layout,
+                sizeof(*inputs->varying_layout));
    }
 
    NIR_PASS(_, nir, pan_nir_lower_tex, gpu_arch);
@@ -910,6 +903,12 @@ bifrost_postprocess_nir(nir_shader *nir,
 
    if (bi_use_kraid(nir, gpu_arch) && nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, pan_nir_opt_var_tex, gpu_arch);
+
+   /* CSE helps expose loads from the same resource. load_store_vectorize
+    * does not vectorize loads if they are not from the same resource
+    * (determined by the SSA value of the source).
+    */
+   NIR_PASS(_, nir, nir_opt_cse);
 
    /* Why aren't we vectorizing nir_var_shader_temp?
     * Basically, the current RA doesn't know rematerialization and is still
@@ -1103,6 +1102,30 @@ lower_buf_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    nir_def *res_handle = intr->src[0].ssa;
    nir_def *buf_index = nir_channel(b, intr->src[1].ssa, 0);
+
+   /* On pre-Valhall, LEA_ATTR encodes the register format in the conversion
+    * descriptor; the LOAD_CVT and ST_CVT format fields are not encoded.
+    *
+    * Use F16 for 16-bit float operations, while 32-bit operations use
+    * auto32 to avoid clamping.  Due to SPIR-V limitations, the source type
+    * is not fully reliable: it reports uint32 even for write_imagei,
+    * causing a u32 -> s32 -> u32 roundtrip.
+    */
+   nir_alu_type cvt_type = 32; /* auto32 */
+   if (intr->intrinsic == nir_intrinsic_image_store &&
+       intr->src[3].ssa->bit_size == 16) {
+      ASSERTED nir_alu_type T = nir_intrinsic_src_type(intr);
+
+      assert(nir_alu_type_get_base_type(T) == nir_type_float);
+      cvt_type = nir_type_float16;
+   } else if (intr->intrinsic == nir_intrinsic_image_load &&
+              intr->def.bit_size == 16) {
+      ASSERTED nir_alu_type T = nir_intrinsic_dest_type(intr);
+
+      assert(nir_alu_type_get_base_type(T) == nir_type_float);
+      cvt_type = nir_type_float16;
+   }
+
    nir_def *texel_addr, *icd;
    if (*arch >= 9) {
       texel_addr = nir_lea_buf_pan(b, res_handle, buf_index);
@@ -1110,7 +1133,7 @@ lower_buf_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    } else {
       nir_def *attr = nir_lea_attr_pan(b, res_handle, buf_index,
                                        nir_imm_int(b, 0),
-                                       .src_type = 32,
+                                       .src_type = cvt_type,
                                        .desc_set = BI_TABLE_ATTRIBUTE_1);
       texel_addr = nir_channels(b, attr, BITFIELD_MASK(2));
       icd = nir_channel(b, attr, 2);
@@ -1129,17 +1152,9 @@ lower_buf_image_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       break;
    }
    case nir_intrinsic_image_store: {
-      /* Due to SPIR-V limitations, the source type is not fully reliable: it
-       * reports uint32 even for write_imagei. This causes an incorrect
-       * u32->s32->u32 roundtrip which incurs an unwanted clamping. Use auto32
-       * instead, which will match per the OpenCL spec. Of course this does
-       * not work for 16-bit stores, but those are not available in OpenCL.
-       */
-      ASSERTED nir_alu_type T = nir_intrinsic_src_type(intr);
-      assert(nir_alu_type_get_type_size(T) == 32);
-
       nir_def *value = intr->src[3].ssa;
-      nir_store_global_cvt_pan(b, value, texel_addr, icd, .src_type = 32);
+      nir_store_global_cvt_pan(b, value, texel_addr, icd,
+                               .src_type = cvt_type);
       nir_instr_remove(&intr->instr);
       break;
    }
@@ -1368,12 +1383,33 @@ idvs_variant_suffix(enum bi_idvs_mode idvs)
 }
 
 static void
-bifrost_dump_shader(nir_shader *nir, struct util_dynarray *binary,
-                    enum bi_idvs_mode idvs, uint32_t offset, uint32_t size)
+bifrost_dump_shader(nir_shader *nir, unsigned arch,
+                    struct util_dynarray *binary, enum bi_idvs_mode idvs,
+                    uint32_t offset, uint32_t size)
 {
    const char *dump_dir = os_get_option_secure("BIFROST_MESA_DUMP_DIR");
    if (dump_dir == NULL)
       return;
+
+   struct stat statbuf;
+   if (stat(dump_dir, &statbuf) != 0) {
+      int err = errno;
+      if (err == ENOENT) {
+         fprintf(stderr, "PAN: Directory %s does not exist, creating\n",
+                 dump_dir);
+         if (mkdir(dump_dir, 0755) != 0) {
+            fprintf(stderr, "PAN: Failed to create directory %s\n", dump_dir);
+            return;
+         }
+      } else {
+         fprintf(stderr, "PAN: Error opening %s: %s\n", dump_dir,
+                 strerror(err));
+         return;
+      }
+   } else if (!S_ISDIR(statbuf.st_mode)) {
+      fprintf(stderr, "PAN: %s exists, but is not a directory\n", dump_dir);
+      return;
+   }
 
    bool has_src_blake3 = false;
    for (uint32_t i = 0; i < BLAKE3_OUT_LEN && !has_src_blake3; ++i)
@@ -1412,6 +1448,22 @@ bifrost_dump_shader(nir_shader *nir, struct util_dynarray *binary,
               nir->info.name ?: "<unnamed>", path);
    } else {
       fprintf(stderr, "PAN: Failed to dump %s to %s\n",
+              nir->info.name ?: "<unnamed>", path);
+   }
+
+   if (dump_stream)
+      fclose(dump_stream);
+
+   /* Dump the disassembly */
+   snprintf(path, sizeof(path), "%s/%s.%s%s.s", dump_dir, id,
+            _mesa_shader_stage_to_file_ext(nir->info.stage),
+            idvs_variant_suffix(idvs));
+   dump_stream = fopen(path, "w");
+
+   if (dump_stream) {
+      pan_disassemble_bi(dump_stream, binary->data + offset, size, arch, true);
+   } else {
+      fprintf(stderr, "PAN: Failed to dump %s disassembly to %s\n",
               nir->info.name ?: "<unnamed>", path);
    }
 
@@ -1547,14 +1599,15 @@ bifrost_compile_shader_nir(nir_shader *nir,
       enum bi_idvs_mode mode =
          arch >= 12 ? BI_IDVS_ALL : BI_IDVS_POSITION;
       uint32_t size_prim = info->vs.secondary_offset ?: binary->size;
-      bifrost_dump_shader(nir, binary, mode, 0, size_prim);
+      bifrost_dump_shader(nir, arch, binary, mode, 0, size_prim);
       if (info->vs.secondary_enable && mode != BI_IDVS_ALL) {
          uint32_t offs = info->vs.secondary_offset;
          uint32_t size_sec = binary->size - offs;
-         bifrost_dump_shader(nir, binary, BI_IDVS_VARYING, offs, size_sec);
+         bifrost_dump_shader(nir, arch, binary, BI_IDVS_VARYING, offs,
+                             size_sec);
       }
    } else {
-      bifrost_dump_shader(nir, binary, BI_IDVS_NONE, 0, binary->size);
+      bifrost_dump_shader(nir, arch, binary, BI_IDVS_NONE, 0, binary->size);
    }
 
    info->ubo_mask &= (1 << nir->info.num_ubos) - 1;

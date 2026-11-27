@@ -44,6 +44,7 @@ replace_with_formatted_load_buffer_amd(nir_builder *b, nir_def *old_def, nir_der
                                  .can_speculate = access & ACCESS_CAN_SPECULATE,
                                  .backend_flags = backend_flags);
    desc->num_components = gfx_level >= GFX13 ? 8 : 4; /* size of buffer descriptors */
+   nir_instr_as_tex(nir_def_instr(desc))->texture_non_uniform = access & ACCESS_NON_UNIFORM;
 
    if (gfx_level >= GFX13) {
       /* The 5th dword is the format dword. */
@@ -247,6 +248,12 @@ lower_image(nir_builder *b, nir_intrinsic_instr *intr, const ac_nir_lower_image_
                        intr->intrinsic == nir_intrinsic_image_heap_sparse_load;
       unsigned access = nir_intrinsic_access(intr) | (is_sparse ? ACCESS_SPARSE : 0);
       nir_def *vindex = nir_channel(b, intr->src[1].ssa, 0);
+
+      if (deref) {
+         nir_variable *var = nir_deref_instr_get_variable(deref);
+         assert(var);
+         access |= var->data.access;
+      }
 
       replace_with_formatted_load_buffer_amd(b, &intr->def, deref, handle, heap_offset, vindex, access,
                                              nir_var_image, AC_NIR_TEX_BACKEND_FLAG_IS_IMAGE,

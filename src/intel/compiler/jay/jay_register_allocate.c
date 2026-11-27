@@ -159,7 +159,7 @@ r_file(jay_reg r)
 static jay_def
 def_from_reg(jay_reg r)
 {
-   return jay_bare_reg(r_file(r), r_reg(r));
+   return jay_bare_reg(r_file(r), 32, r_reg(r));
 }
 
 struct jay_roundrobin {
@@ -292,7 +292,7 @@ mov(jay_builder *b, jay_def dst, jay_def src, struct jay_temp_regs temps)
       jay_MOV(b, def_from_reg(temps.gpr), src);
       jay_MOV(b, dst, def_from_reg(temps.gpr));
    } else if (split_copy) {
-      jay_def t = jay_bare_reg(GPR, 0);
+      jay_def t = jay_bare_reg(GPR, 32, 0);
 
       /* This is terrible, but it's really uncommon. Use 4<-->8 swaps which
        * don't require further splitting to reduce the pain slightly.
@@ -309,9 +309,7 @@ mov(jay_builder *b, jay_def dst, jay_def src, struct jay_temp_regs temps)
       }
    } else {
       jay_MOV(b, dst, src)->type =
-         dst.file == FLAG  ? jay_flag_type(b->func) :
-         dst.file == ACCUM ? JAY_TYPE_F32 :
-                             JAY_TYPE_U32;
+         dst.file == FLAG ? jay_flag_type(b->func) : JAY_TYPE_U32;
    }
 }
 
@@ -326,7 +324,7 @@ swap(jay_builder *b, jay_def dst, jay_def src, struct jay_temp_regs temps)
       jay_MOV(b, src, def_from_reg(temps.gpr));
       jay_MOV(b, dst, def_from_reg(temps.gpr2));
    } else if (dst.file == GPR && must_split_copy(b->shader, dst, src)) {
-      jay_def t = jay_bare_reg(GPR, 0);
+      jay_def t = jay_bare_reg(GPR, 32, 0);
       jay_SWAP(b, dst, t);
       jay_SWAP(b, src, t);
       jay_SWAP(b, dst, t);
@@ -337,7 +335,7 @@ swap(jay_builder *b, jay_def dst, jay_def src, struct jay_temp_regs temps)
       jay_MOV(b, src, t)->type = jay_flag_type(b->func);
    } else if (dst.file == FLAG) {
       /* We can swap flag<-->UGPR but not directly flag<-->flag, split */
-      jay_def u = jay_bare_reg(UGPR, 0);
+      jay_def u = jay_bare_reg(UGPR, 32, 0);
       jay_SWAP(b, dst, u)->type = jay_flag_type(b->func);
       jay_SWAP(b, src, u)->type = jay_flag_type(b->func);
       jay_SWAP(b, dst, u)->type = jay_flag_type(b->func);
@@ -911,16 +909,21 @@ assign_regs_for_inst(jay_ra_state *ra, jay_inst *I)
     * values rely on this invariant for correctness.
     */
    jay_foreach_ra_src(I, s) {
-      /* Filter out duplicate scalar sources - they should only be assigned
-       * once. Duplicated vector sources are lowered away as a precondition.
-       */
+      /* Filter out duplicate sources - they should only be assigned once. */
       bool duplicate = false;
-      if (jay_num_values(I->src[s]) == 1) {
-         uint32_t index = jay_index(I->src[s]);
 
-         for (unsigned i = 0; i < nr_vars; ++i) {
-            jay_def var = *(vars[i]);
-            duplicate |= (jay_num_values(var) == 1 && jay_index(var) == index);
+      for (unsigned i = 0; i < nr_vars; ++i) {
+         duplicate |= jay_defs_equivalent(*vars[i], I->src[s]);
+      }
+
+      /* Likewise filter out scalars that are fully containted in another
+       * vector, which can happen when accessing both the bottom 16-bits and the
+       * full 32-bit value in the same instruction.
+       */
+      if (jay_num_values(I->src[s]) == 1) {
+         jay_foreach_src_index(I, s2, _, idx) {
+            duplicate |=
+               jay_index(I->src[s]) == idx && jay_num_values(I->src[s2]) > 1;
          }
       }
 
@@ -1078,7 +1081,7 @@ assign_regs_for_inst(jay_ra_state *ra, jay_inst *I)
       }
    }
 
-   /* Set .reg late so duplicated scalar sources are handled properly */
+   /* Set .reg late so duplicated sources are handled properly */
    jay_foreach_ra_src(I, s) {
       if (I->src[s]._payload != JAY_SENTINEL) {
          jay_set_reg(&I->src[s],
@@ -1178,9 +1181,8 @@ local_ra(jay_ra_state *ra, jay_block *block)
       }
 
       if (jay_debug & JAY_DBG_PRINTDEMAND) {
-         fprintf(stderr, "(RA) [G:%u\tU:%u\tF:%u\tA:%u] ",
-                 register_demand(ra, GPR), register_demand(ra, UGPR),
-                 register_demand(ra, FLAG), register_demand(ra, ACCUM));
+         fprintf(stderr, "(RA) [G:%u\tU:%u\tF:%u] ", register_demand(ra, GPR),
+                 register_demand(ra, UGPR), register_demand(ra, FLAG));
          jay_print_inst(stderr, ra->b.func, I);
       }
    }
@@ -1388,11 +1390,13 @@ jay_register_allocate_function(jay_function *f)
 
    /* We track the order of instructions in the program to inform coalescing */
    uint32_t *order = linear_alloc_array(lin_ctx, uint32_t, f->ssa_alloc);
+   jay_inst **def = linear_alloc_array(lin_ctx, jay_inst *, f->ssa_alloc);
    uint32_t order_counter = 0;
 
    jay_foreach_inst_in_func(f, block, I) {
       jay_foreach_dst_index(I, _, index) {
          order[index] = order_counter++;
+         def[index] = I;
          ra.affinities[index].stride = JAY_NUM_STRIDES;
       }
 
@@ -1403,9 +1407,16 @@ jay_register_allocate_function(jay_function *f)
          if (jay_num_values(I->src[s]) > 1 && !ra.affinities[index].repr) {
             uint32_t repr = UINT_MAX, repr_c = 0, best_order = UINT_MAX;
 
-            /* Pick the earliest representative to maximize freedom */
+            /* Pick the earliest representative to maximize freedom. However,
+             * exclude preloads that are too early in the register file and
+             * cannot possibly fit the vector.
+             */
             jay_foreach_index(I->src[s], j, index) {
-               if (order[index] < best_order) {
+               bool better = (order[index] < best_order &&
+                              !(def[index]->op == JAY_OPCODE_PRELOAD &&
+                                jay_preload_reg(def[index]) < j));
+
+               if (repr == UINT_MAX || better) {
                   repr = index;
                   repr_c = j;
                   best_order = order[index];
@@ -1467,7 +1478,7 @@ jay_register_allocate_function(jay_function *f)
    }
 
    jay_foreach_inst_in_func(f, block, I) {
-      if (I->dst.file == GPR || I->dst.file == UGPR || I->dst.file == ACCUM) {
+      if (I->dst.file == GPR || I->dst.file == UGPR) {
          I->dst.reg *= 2;
       } else if (I->dst.file == FLAG) {
          I->dst.reg *= jay_phys_flag_per_virt(shader);
@@ -1476,9 +1487,7 @@ jay_register_allocate_function(jay_function *f)
       I->cond_flag.reg *= jay_phys_flag_per_virt(shader);
 
       jay_foreach_src(I, s) {
-         if (I->src[s].file == GPR ||
-             I->src[s].file == UGPR ||
-             I->src[s].file == ACCUM) {
+         if (I->src[s].file == GPR || I->src[s].file == UGPR) {
             I->src[s].reg *= 2;
          } else if (I->src[s].file == FLAG) {
             I->src[s].reg *= jay_phys_flag_per_virt(shader);

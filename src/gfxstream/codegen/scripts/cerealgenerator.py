@@ -246,7 +246,7 @@ class IOStream;
 }}  // namespace gfxstream
 """
         encoderImplInclude = f"""
-#include "Resources.h"
+#include "gfxstream_vk_private.h"
 #include "ResourceTracker.h"
 #include "Validation.h"
 #include "%s.h"
@@ -331,7 +331,7 @@ class IOStream;
 """
 
         reservedmarshalImplIncludeGuest = """
-#include "Resources.h"
+#include "gfxstream_vk_private.h"
 """
 
         vulkanStreamIncludeHost = f"""
@@ -491,7 +491,6 @@ class BumpPool;
 #include <cstring>
 #include <functional>
 #include <optional>
-#include <thread>
 #include <unordered_map>
 
 #include "common/goldfish_vk_marshaling.h"

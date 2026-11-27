@@ -412,7 +412,7 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_link *link = &cmdbuf->state.gfx.link;
    struct pan_ptr bufs = panvk_cmd_alloc_desc_array(
       cmdbuf, PANVK_VARY_BUF_MAX + 1, ATTRIBUTE_BUFFER);
@@ -602,7 +602,7 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
 {
    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
    const struct panvk_shader_variant *vs_variant =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    const struct vk_dynamic_graphics_state *dyns =
       &cmdbuf->vk.dynamic_graphics_state;
    const struct vk_vertex_input_state *vi = dyns->vi;
@@ -786,7 +786,7 @@ panvk_emit_vertex_dcd(struct panvk_cmd_buffer *cmdbuf,
                       struct mali_draw_packed *dcd)
 {
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_desc_state *vs_desc_state =
       &cmdbuf->state.gfx.vs.desc;
 
@@ -806,7 +806,7 @@ panvk_emit_vertex_dcd(struct panvk_cmd_buffer *cmdbuf,
       }
 
       cfg.uniform_buffers = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_UBO];
-      cfg.push_uniforms = cmdbuf->state.gfx.vs.push_uniforms;
+      cfg.push_uniforms = cmdbuf->state.gfx.hw_vs.push_uniforms;
       cfg.textures = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
       cfg.samplers = vs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_SAMPLER];
    }
@@ -873,7 +873,7 @@ panvk_emit_tiler_primitive(struct panvk_cmd_buffer *cmdbuf,
                            struct mali_primitive_packed *prim)
 {
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_variant *fs =
       panvk_shader_only_variant(get_fs(cmdbuf));
    const struct vk_dynamic_graphics_state *dyns =
@@ -933,7 +933,7 @@ panvk_emit_tiler_primitive_size(struct panvk_cmd_buffer *cmdbuf,
                                 struct mali_primitive_size_packed *primsz)
 {
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    const bool writes_point_size =
       vs->info.vs.writes_point_size && draw->info.prim == MESA_PRIM_POINTS;
 
@@ -1166,7 +1166,7 @@ panvk_cmd_prepare_draw_link_shaders(struct panvk_cmd_buffer *cmd)
       return VK_SUCCESS;
 
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmd->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmd->state.gfx.vs.shader);
    const struct panvk_shader_variant *fs =
       panvk_shader_only_variant(get_fs(cmd));
 
@@ -1185,7 +1185,7 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
    struct panvk_batch *batch = cmdbuf->cur_batch;
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
    struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
    struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
@@ -1346,7 +1346,7 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
                    struct panvk_draw_data *draw, uint32_t layer)
 {
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_variant *fs =
       panvk_shader_only_variant(get_fs(cmdbuf));
    VkResult result;
@@ -1366,7 +1366,7 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
       cmdbuf, vs, &vs_push_uniforms, 1);
    if (result != VK_SUCCESS)
       return result;
-   cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   cmdbuf->state.gfx.hw_vs.push_uniforms = vs_push_uniforms.gpu;
 
    if (fs) {
       struct pan_ptr fs_push_uniforms;
@@ -1408,7 +1408,8 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
 static void
 panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
 {
-   const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *vs =
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
    /* If there's no vertex shader, we can skip the draw. */
@@ -1480,7 +1481,8 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
                         struct panvk_draw_data *draw)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   const struct panvk_shader_variant *vs =
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    VkResult result;
 
    /* If there's no vertex shader, we can skip the draw. */
@@ -1597,21 +1599,21 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       uint64_t first_instance_sysval = 0x8ull << 60;
       uint64_t raw_vertex_offset_sysval = 0x8ull << 60;
       if (shader_uses_sysval(vs, graphics, vs.first_vertex)) {
-         first_vertex_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+         first_vertex_sysval = cmdbuf->state.gfx.hw_vs.push_uniforms +
                                shader_remapped_sysval_offset(
                                   vs, sysval_offset(graphics, vs.first_vertex));
       }
 
       if (shader_uses_sysval(vs, graphics, vs.base_instance)) {
          first_instance_sysval =
-            cmdbuf->state.gfx.vs.push_uniforms +
+            cmdbuf->state.gfx.hw_vs.push_uniforms +
             shader_remapped_sysval_offset(
                vs, sysval_offset(graphics, vs.base_instance));
       }
 
       if (shader_uses_sysval(vs, graphics, vs.raw_vertex_offset)) {
          raw_vertex_offset_sysval =
-            cmdbuf->state.gfx.vs.push_uniforms +
+            cmdbuf->state.gfx.hw_vs.push_uniforms +
             shader_remapped_sysval_offset(
                vs, sysval_offset(graphics, vs.raw_vertex_offset));
       }
@@ -1718,7 +1720,7 @@ padded_vertex_count(struct panvk_cmd_buffer *cmdbuf, uint32_t vertex_count,
       return vertex_count;
 
    const struct panvk_shader_variant *vs =
-      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+      panvk_hw_vs_variant(cmdbuf->state.gfx.vs.shader);
    bool idvs = vs->info.vs.idvs;
 
    /* Index-Driven Vertex Shading requires different instances to

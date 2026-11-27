@@ -102,7 +102,7 @@ tu_cmd_buffer_status_gpu_write(struct tu_cmd_buffer *cmd_buffer,
 }
 
 static void
-tu_wait_for_rb_done(struct tu_cs *cs, uint32_t onchip_addr, uint32_t seqno)
+tu_emit_rb_done_ts(struct tu_cs *cs, uint32_t onchip_addr, uint32_t value)
 {
    tu_cs_emit_pkt7(cs, CP_EVENT_WRITE7, 4);
    tu_cs_emit(cs, CP_EVENT_WRITE7_0(
@@ -111,7 +111,13 @@ tu_wait_for_rb_done(struct tu_cs *cs, uint32_t onchip_addr, uint32_t seqno)
       .write_dst = EV_DST_ONCHIP,
       .write_enabled = true).value);
    tu_cs_emit_qw(cs, onchip_addr);
-   tu_cs_emit(cs, seqno);
+   tu_cs_emit(cs, value);
+}
+
+static void
+tu_wait_for_rb_done(struct tu_cs *cs, uint32_t onchip_addr, uint32_t seqno, bool clear)
+{
+   tu_emit_rb_done_ts(cs, onchip_addr, seqno);
 
    tu_cs_emit_pkt7(cs, CP_WAIT_REG_MEM, 6);
    tu_cs_emit(cs, CP_WAIT_REG_MEM_0_FUNCTION(WRITE_EQ) | CP_WAIT_REG_MEM_0_POLL(POLL_ON_CHIP));
@@ -119,6 +125,38 @@ tu_wait_for_rb_done(struct tu_cs *cs, uint32_t onchip_addr, uint32_t seqno)
    tu_cs_emit(cs, CP_WAIT_REG_MEM_3_REF(seqno));
    tu_cs_emit(cs, CP_WAIT_REG_MEM_4_MASK(~0u));
    tu_cs_emit(cs, CP_WAIT_REG_MEM_5_DELAY_LOOP_CYCLES(2));
+
+   if (clear)
+      tu_emit_rb_done_ts(cs, onchip_addr, 0);
+}
+
+/* Wait until the writes of all previously issued events that write through
+ * RB_DONE_TS (e.g. RB_DONE_TS writes or ZPASS_DONE accumulation) have landed.
+ * The only way to wait for them is to wait on a value they wrote, however we
+ * don't know the value nor can rely on the previous value being zero. So we
+ * have to issue our own RB_DONE_TS with a known value and wait for it.
+ */
+void
+tu7_wait_for_rb_done(struct tu_cs *cs, enum cp_thread threads, bool clear)
+{
+   static uint32_t seqno = 0;
+   uint32_t value = p_atomic_add_return(&seqno, 1);
+   /* 0 is the cleared value. */
+   if (value == 0)
+      value = p_atomic_add_return(&seqno, 1);
+
+   if (threads & CP_SET_THREAD_BR) {
+      tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BR);
+      tu_wait_for_rb_done(cs, TU_ONCHIP_BR_RB_DONE_BARRIER, value, clear);
+      tu_cond_exec_end(cs);
+   }
+
+   if (threads & CP_SET_THREAD_BV) {
+      /* BV can race BR so we cannot wait on the same addr in both since it can be overwritten. */
+      tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BV);
+      tu_wait_for_rb_done(cs, TU_ONCHIP_BV_RB_DONE_BARRIER, value, clear);
+      tu_cond_exec_end(cs);
+   }
 }
 
 template <chip CHIP>
@@ -130,25 +168,9 @@ tu_clone_trace_range(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    if (u_trace_iterator_equal(begin, end))
       return;
 
-   /* The only way to wait for tracepoint's RB_DONE_TS completion on A7XX+ is to wait
-    * on a value it written, however neither we know the value tracepoint writes,
-    * nor we can rely on previous value being zero. So we have to issue our own
-    * RB_DONE_TS with known value and wait for it.
-    */
-    /* TODO: Maybe we can do this only when we copy from memory written by RB_DONE_TS? */
-    if constexpr (CHIP >= A7XX) {
-      static uint32_t seqno = 0;
-      uint32_t value = p_atomic_add_return(&seqno, 1);
-
-      /* BV can race BR so we cannot wait on the same addr in both since it can be overwritten. */
-      tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BR);
-      tu_wait_for_rb_done(cs, TU_ONCHIP_BR_U_TRACE_BARRIER, value);
-      tu_cond_exec_end(cs);
-
-      tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BV);
-      tu_wait_for_rb_done(cs, TU_ONCHIP_BV_U_TRACE_BARRIER, value);
-      tu_cond_exec_end(cs);
-   }
+   /* TODO: Maybe we can do this only when we copy from memory written by RB_DONE_TS? */
+   if constexpr (CHIP >= A7XX)
+      tu7_wait_for_rb_done(cs, CP_SET_THREAD_BOTH, false);
 
    tu_cs_emit_wfi(cs);
    tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
@@ -4895,7 +4917,8 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
          (set->va | BINDLESS_DESCRIPTOR_64B) : 0;
 
       /* Compute consts are emitted on every dispatch. */
-      if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && cmd->state.program.uses_bindless_base_addrs)
+      if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && cmd->state.program &&
+          cmd->state.program->uses_bindless_base_addrs)
          cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
 
       if (!set)
@@ -5072,7 +5095,8 @@ tu_set_descriptor_buffer_offsets(
          BINDLESS_DESCRIPTOR_64B;
 
       /* Compute consts are emitted on every dispatch. */
-      if ((bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && cmd->state.program.uses_bindless_base_addrs) ||
+      if ((bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && cmd->state.program &&
+           cmd->state.program->uses_bindless_base_addrs) ||
           set_layout->has_inline_uniforms)
          cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
    }
@@ -5660,7 +5684,7 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
 
    vk_cmd_set_dynamic_graphics_state(&cmd->vk,
                                      &gfx_pipeline->dynamic_state);
-   cmd->state.program = pipeline->program;
+   cmd->state.program = &pipeline->program;
 
    cmd->state.load_state = pipeline->load_state;
    cmd->state.prim_order_gmem = pipeline->prim_order.state_gmem;
@@ -8071,7 +8095,7 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
    uint32_t dwords = 0;
    const struct tu_push_constant_range *shared_consts =
       compute ? &cmd->state.shaders[MESA_SHADER_COMPUTE]->const_state.push_consts :
-      &cmd->state.program.shared_consts;
+      &cmd->state.program->shared_consts;
 
    dwords = tu6_const_size(cmd, shared_consts, compute);
 
@@ -8108,7 +8132,7 @@ tu_emit_consts(struct tu_cmd_buffer *cmd, bool compute)
          tu_get_descriptors_state(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
       for (uint32_t type = MESA_SHADER_VERTEX; type <= MESA_SHADER_FRAGMENT; type++) {
          const struct tu_program_descriptor_linkage *link =
-            &cmd->state.program.link[type];
+            &cmd->state.program->link[type];
          tu6_emit_per_stage_push_consts(&cs, &link->tu_const_state,
                                         &link->const_state,
                                         static_cast<mesa_shader_stage>(type),
@@ -8258,8 +8282,7 @@ tu_fs_reads_dynamic_ds_input_attachment(struct tu_cmd_buffer *cmd,
    uint8_t depth_att = cmd->vk.dynamic_graphics_state.ial.depth_att;
    if (depth_att == MESA_VK_ATTACHMENT_UNUSED)
       return false;
-   unsigned depth_idx =
-      (depth_att == MESA_VK_ATTACHMENT_NO_INDEX) ? 0 : depth_att + 1;
+   unsigned depth_idx = (depth_att == MESA_VK_ATTACHMENT_NO_INDEX) ? 0 : depth_att + TU_DYN_INPUT_ATT_OFFSET;
    return fs->fs.dynamic_input_attachments_used & (1u << depth_idx);
 }
 
@@ -8358,7 +8381,7 @@ static uint32_t
 fs_params_offset(struct tu_cmd_buffer *cmd)
 {
    const struct tu_program_descriptor_linkage *link =
-      &cmd->state.program.link[MESA_SHADER_FRAGMENT];
+      &cmd->state.program->link[MESA_SHADER_FRAGMENT];
    const struct ir3_const_state *const_state = &link->const_state;
 
    if (const_state->num_driver_params <= IR3_DP_FS_DYNAMIC)
@@ -8377,7 +8400,7 @@ static uint32_t
 fs_params_size(struct tu_cmd_buffer *cmd)
 {
    const struct tu_program_descriptor_linkage *link =
-      &cmd->state.program.link[MESA_SHADER_FRAGMENT];
+      &cmd->state.program->link[MESA_SHADER_FRAGMENT];
    const struct ir3_const_state *const_state = &link->const_state;
 
    return DIV_ROUND_UP(const_state->num_driver_params - IR3_DP_FS_DYNAMIC, 4);
@@ -8635,16 +8658,16 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                 /* note: draw_count is 0 for indirect */
                 uint32_t draw_count)
 {
-   const struct tu_program_state *program = &cmd->state.program;
+   const struct tu_program_state *program = cmd->state.program;
    struct tu_render_pass_state *rp = &cmd->state.rp;
 
    trace_start_draw(
       &cmd->rp_trace, &cmd->draw_cs, cmd, draw_count,
-      cmd->state.program.stage_blake3[MESA_SHADER_VERTEX],
-      cmd->state.program.stage_blake3[MESA_SHADER_TESS_CTRL],
-      cmd->state.program.stage_blake3[MESA_SHADER_TESS_EVAL],
-      cmd->state.program.stage_blake3[MESA_SHADER_GEOMETRY],
-      cmd->state.program.stage_blake3[MESA_SHADER_FRAGMENT]);
+      const_cast<char *>(program->stage_blake3[MESA_SHADER_VERTEX]),
+      const_cast<char *>(program->stage_blake3[MESA_SHADER_TESS_CTRL]),
+      const_cast<char *>(program->stage_blake3[MESA_SHADER_TESS_EVAL]),
+      const_cast<char *>(program->stage_blake3[MESA_SHADER_GEOMETRY]),
+      const_cast<char *>(program->stage_blake3[MESA_SHADER_FRAGMENT]));
 
    /* Emit state first, because it's needed for bandwidth calculations */
    uint32_t dynamic_draw_state_dirty = 0;
@@ -8717,7 +8740,7 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
    }
 
    if (FD_QUIRK(cmd->device->physical_device->info, QCTDD10497382_rt_workaround) &&
-       cmd->state.program.uses_ray_intersection) {
+       cmd->state.program->uses_ray_intersection) {
       tu_set_render_mode<CHIP>(cs, { .shader_uses_rt = true });
    }
 
@@ -8975,7 +8998,7 @@ static uint32_t
 vs_params_offset(struct tu_cmd_buffer *cmd)
 {
    const struct tu_program_descriptor_linkage *link =
-      &cmd->state.program.link[MESA_SHADER_VERTEX];
+      &cmd->state.program->link[MESA_SHADER_VERTEX];
    const struct ir3_const_state *const_state = &link->const_state;
 
    uint32_t param_offset =

@@ -181,6 +181,7 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_shader_subgroup_rotate = true,
       .KHR_shader_subgroup_uniform_control_flow = true,
       .KHR_shader_terminate_invocation = true,
+      .KHR_shader_untyped_pointers = true,
       .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_swapchain = PVR_USE_WSI_PLATFORM,
@@ -191,6 +192,7 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_unified_image_layouts = true,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_vertex_attribute_divisor = true,
+      .KHR_vulkan_memory_model = true,
       .KHR_workgroup_memory_explicit_layout = true,
       .KHR_zero_initialize_workgroup_memory = true,
       .EXT_border_color_swizzle = true,
@@ -204,6 +206,7 @@ static void pvr_physical_device_get_supported_extensions(
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
+      .EXT_external_memory_acquire_unmodified = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
@@ -347,8 +350,8 @@ static void pvr_physical_device_get_supported_features(
       .descriptorBindingVariableDescriptorCount = false,
       .runtimeDescriptorArray = false,
       .samplerFilterMinmax = false,
-      .vulkanMemoryModel = false,
-      .vulkanMemoryModelDeviceScope = false,
+      .vulkanMemoryModel = true,
+      .vulkanMemoryModelDeviceScope = true,
       .vulkanMemoryModelAvailabilityVisibilityChains = false,
       .shaderOutputViewportIndex = false,
       .shaderOutputLayer = false,
@@ -522,6 +525,9 @@ static void pvr_physical_device_get_supported_features(
 
       /* VK_KHR_shader_terminate_invocation */
       .shaderTerminateInvocation = true,
+
+      /* VK_KHR_shader_untyped_pointers */
+      .shaderUntypedPointers = true,
 
       /* Vulkan 1.3 / VK_EXT_subgroup_size_control */
       .subgroupSizeControl = true,
@@ -884,7 +890,7 @@ static bool pvr_physical_device_get_properties(
       .conformanceVersion = {
          .major = 1,
          .minor = 4,
-         .subminor = 3,
+         .subminor = 5,
          .patch = 3,
       },
 

@@ -74,6 +74,8 @@ pub struct PlatformDebug {
     pub program: bool,
     pub reuse_context: bool,
     pub sync_every_event: bool,
+    pub untyped_pointers: bool,
+    pub use_llvm_spirv_target: bool,
     pub validate_spirv: bool,
 }
 
@@ -97,6 +99,8 @@ static mut PLATFORM_DBG: PlatformDebug = PlatformDebug {
     program: false,
     reuse_context: true,
     sync_every_event: false,
+    untyped_pointers: false,
+    use_llvm_spirv_target: false,
     validate_spirv: false,
 };
 static mut PLATFORM_FEATURES: PlatformFeatures = PlatformFeatures {
@@ -120,6 +124,8 @@ fn load_env() {
                 "perfspam" => debug.perf = PerfDebugLevel::Spam,
                 "program" => debug.program = true,
                 "sync" => debug.sync_every_event = true,
+                "untyped_pointers" => debug.untyped_pointers = true,
+                "use_llvm_spirv_target" => debug.use_llvm_spirv_target = true,
                 "validate" => debug.validate_spirv = true,
                 "" => (),
                 _ => eprintln!("Unknown RUSTICL_DEBUG flag found: {}", flag),

@@ -291,13 +291,15 @@ emit_indirect_generate_draw(struct iris_batch *batch,
 
    iris_emit_cmd(batch, GENX(3DSTATE_PS), ps) {
 #if GFX_VER >= 9
-      struct brw_fs_prog_data *fs_prog_data = brw_fs_prog_data(shader->brw_prog_data);
+      intel_set_ps_dispatch_state(&ps, devinfo, &shader->info,
+                                  1 /* rasterization_samples */,
+                                  0 /* fs_config */);
 #else
       struct elk_fs_prog_data *fs_prog_data = elk_fs_prog_data(shader->elk_prog_data);
-#endif
       intel_set_ps_dispatch_state(&ps, devinfo, fs_prog_data,
                                   1 /* rasterization_samples */,
                                   0 /* fs_config */);
+#endif
 
       ps.VectorMaskEnable       = fs_data->uses_vmask;
 
@@ -308,26 +310,26 @@ emit_indirect_generate_draw(struct iris_batch *batch,
 
 #if GFX_VER >= 9
       ps.DispatchGRFStartRegisterForConstantSetupData0 =
-         brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 0);
+         intel_shader_info_fs_dispatch_grf_start_reg(&shader->info, ps, 0);
       ps.DispatchGRFStartRegisterForConstantSetupData1 =
-         brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 1);
+         intel_shader_info_fs_dispatch_grf_start_reg(&shader->info, ps, 1);
 #if GFX_VER < 20
       ps.DispatchGRFStartRegisterForConstantSetupData2 =
-         brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 2);
+         intel_shader_info_fs_dispatch_grf_start_reg(&shader->info, ps, 2);
 #endif
 
       ps.KernelStartPointer0 = KSP(ice->draw.generation.shader) +
-         brw_fs_prog_data_prog_offset(fs_prog_data, ps, 0);
+         intel_shader_info_fs_prog_offset(&shader->info, ps, 0);
       ps.KernelStartPointer1 = KSP(ice->draw.generation.shader) +
-         brw_fs_prog_data_prog_offset(fs_prog_data, ps, 1);
+         intel_shader_info_fs_prog_offset(&shader->info, ps, 1);
 #if GFX_VER < 20
       ps.KernelStartPointer2 = KSP(ice->draw.generation.shader) +
-         brw_fs_prog_data_prog_offset(fs_prog_data, ps, 2);
+         intel_shader_info_fs_prog_offset(&shader->info, ps, 2);
 #endif
 
 #if GFX_VER >= 30
       ps.RegistersPerThread =
-         intel_register_blocks(devinfo, fs_prog_data->base.grf_used);
+         intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
 
 #else

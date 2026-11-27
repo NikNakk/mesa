@@ -182,7 +182,7 @@ op('zip', 4, 'u32')
 op('extract_byte_per_8lanes', 2, 'u32')
 op('shr_odd_subspans_by_4', 1, 'u16')
 op('and_u32_u16', 2, 'u32')
-op('and_sN_s32', 2, 's32', 0, ['unsigned n'])
+op('and_sN', 2, 's16 s32', 0, ['unsigned n'])
 
 # Pixel coord calculations. expand_quad replicates out the per-2x2 values from
 # its source g0.[10...13] and - in the case of SIMD32 - g1.[10...13] into a
@@ -225,9 +225,9 @@ op('phi_dst', 0, 'u1 u16 u32')
 op('unit_test', 1, 'u32', Props.NO_DEST)
 
 # Produces a unstable indeterminate value. Undef in LLVM parlance.
-op('undef', 0, 'u1 u32')
+op('undef', 0, 'u1 u16 u32')
 
-op('not', 1, 'u1 u32', Props.CMOD)
+op('not', 1, 'u1 u16 u32 s16 s32', Props.CMOD)
 
 op('mov_imm64', 0, 'u64', 0, ['uint64_t imm'])
 
@@ -237,6 +237,11 @@ op('shuffle', 2, 'u1 u8 u16 u32')
 # Indirect move directly from the register file. src0=data vector. src1=offset
 # in bytes inside the register file (as an address register).
 op('mov_indirect', 2, 'u8 u16 u32')
+
+# Move indexed. src0=data (one GPR within one GRF), src1=a0 window (a0.0 or
+# a0.8) holding per-channel subregister byte offsets. The register base is
+# supplied as the src1 immediate at codegen.
+op('movi', 2, 'u32')
 
 # Shuffle with a constant lane index.
 op('broadcast_imm', 1, 'u1 u32', 0, ['unsigned lane'])

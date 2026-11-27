@@ -15,9 +15,6 @@ glx@glx-visuals-stencil -pixmap,Crash
 glx@glx_arb_create_context@invalid flag,Fail
 
 spec@!opengl 1.0@gl-1.0-swapbuffers-behavior,Fail
-spec@!opengl 1.0@rasterpos,Fail
-spec@!opengl 1.0@rasterpos@glsl_vs_gs_linked,Fail
-spec@!opengl 1.0@rasterpos@glsl_vs_tes_linked,Fail
 spec@!opengl 3.0@clearbuffer-depth-cs-probe,Fail
 spec@arb_post_depth_coverage@arb_post_depth_coverage-multisampling,Fail
 
@@ -87,3 +84,12 @@ spec@arb_timer_query@query gl_timestamp,Fail
 spec@ext_framebuffer_blit@fbo-blit-check-limits,Crash
 spec@ext_framebuffer_blit@fbo-sys-blit,Crash
 spec@ext_framebuffer_blit@fbo-sys-sub-blit,Crash
+
+# uprev Piglit in Mesa
+glx@glx-front-flush-after-swap,Fail
+glx@glx-read-back-after-swap -rgba,Fail
+glx@glx-read-back-after-swap,Fail
+spec@!opengl 1.0@gl-1.0-front-back-interleave,Crash
+spec@!opengl 1.0@gl-1.0-read-front-after-swap,Crash
+spec@!opengl 1.5@gl-1.5-gen-buffers-unique,Crash
+

@@ -55,6 +55,8 @@ fi
 if [ -n "$VKD3D_PROTON_TAG" ]; then
   # Are we using the right vkd3d-proton version?
   ci_tag_test_time_check "VKD3D_PROTON_TAG"
+else
+  rm -rf /vkd3d-proton-tests
 fi
 
 if [ -n "${OPENCL_CTS_TAG:-}" ]; then
@@ -224,10 +226,10 @@ deqp-runner junit \
 # Report the flakes to the IRC channel for monitoring (if configured):
 if [ -n "$FLAKES_CHANNEL" ]; then
   python3 $INSTALL/report-flakes.py \
+         ${CI_TRON_JOB_HTTP_SERVER:+--proxy-connect ${CI_TRON_JOB_HTTP_SERVER#http://}} \
          --host irc.oftc.net \
          --port 6667 \
          --results $RESULTS_DIR/results.csv \
-         --known-flakes $INSTALL/$GPU_VERSION-flakes.txt \
          --channel "$FLAKES_CHANNEL" \
          --runner "$CI_RUNNER_DESCRIPTION" \
          --job "$CI_JOB_ID" \

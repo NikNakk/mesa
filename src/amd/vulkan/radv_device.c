@@ -27,6 +27,9 @@
 #include "util/u_debug.h"
 #include "radv_cs.h"
 #include "radv_device.h"
+#ifdef RADV_SUPPORT_RDP
+#include "ac_devdriver.h"
+#endif
 #include "radv_entrypoints.h"
 #include "radv_formats.h"
 #include "radv_physical_device.h"
@@ -94,6 +97,8 @@ radv_device_init_border_color(struct radv_device *device)
 
    radv_rmv_log_border_color_palette_create(device, device->border_color_data.bo);
 
+   mtx_init(&device->border_color_data.mutex, mtx_plain);
+
    result = device->ws->buffer_make_resident(device->ws, device->border_color_data.bo, true);
    if (result != VK_SUCCESS)
       return vk_error(device, result);
@@ -101,7 +106,6 @@ radv_device_init_border_color(struct radv_device *device)
    device->border_color_data.colors_gpu_ptr = radv_buffer_map(device->ws, device->border_color_data.bo);
    if (!device->border_color_data.colors_gpu_ptr)
       return vk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   mtx_init(&device->border_color_data.mutex, mtx_plain);
 
    return VK_SUCCESS;
 }
@@ -605,6 +609,39 @@ radv_device_init_rmv(struct radv_device *device)
    radv_memory_trace_init(device);
 }
 
+/* Get devdriver from instance and complete late device rdp initialization. Only the first
+ * vkCreateDevice call runs this init. Concurrent vkCreateDevice calls wait until the first one
+ * finishes. It may block if RDP requests driver halt.
+ */
+static void
+radv_device_init_rdp(struct radv_device *device)
+{
+#ifdef RADV_SUPPORT_RDP
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radv_instance *instance = radv_physical_device_instance(pdev);
+
+   device->devdriver = instance->devdriver;
+   if (device->devdriver) {
+      simple_mtx_lock(&instance->devdriver_mtx);
+      if (!ac_devdriver_is_driver_initialized(device->devdriver)) {
+         /* Handle RDP device halt requests in late_device_init, this will block
+          * waiting for StepDriver request, then advance to LateDeviceInit state.
+          * finalize() completes protocol server initialization.
+          */
+         ac_devdriver_set_num_gpus(device->devdriver, list_length(&instance->vk.physical_devices.list));
+         ac_devdriver_start_late_device_init(device->devdriver);
+         ac_devdriver_finalize(device->devdriver);
+
+         /* Advance the DriverControl protocol to the Running state. The driver is now fully
+          * initialized and ready for RDP communication.
+          */
+         ac_devdriver_finish_device_init(device->devdriver);
+      }
+      simple_mtx_unlock(&instance->devdriver_mtx);
+   }
+#endif
+}
+
 static VkResult
 radv_device_init_trap_handler(struct radv_device *device)
 {
@@ -865,7 +902,8 @@ capture_trace(VkQueue _queue)
       simple_mtx_unlock(&device->vk.memory_trace_data.token_mtx);
    }
 
-   if (instance->vk.trace_mode & RADV_TRACE_MODE_RGP)
+   /* Note: Additional RDP check to disable F1 hotkey in this mode. */
+   if ((instance->vk.trace_mode & RADV_TRACE_MODE_RGP) && !(instance->vk.trace_mode & RADV_TRACE_MODE_RDP))
       device->sqtt_triggered = true;
 
    if (instance->vk.trace_mode & RADV_TRACE_MODE_CTX_ROLLS) {
@@ -1233,6 +1271,7 @@ radv_device_init_compiler_info(struct radv_device *device)
             .mesh_shader_queries = mesh_shader_queries && pdev->emulate_mesh_shader_queries,
             .image_2d_view_of_3d = image_2d_view_of_3d && pdev->info.gfx_level == GFX9,
             .use_fmask = pdev->use_fmask,
+            .msrtss = radv_msrtss_enabled(pdev),
             .force_64_byte_sampled_image = pdev->force_64_byte_sampled_image,
             .robust_buffer_access = pdev->use_llvm && (device->vk.enabled_features.robustBufferAccess2 ||
                                                        device->vk.enabled_features.robustBufferAccess),
@@ -1435,8 +1474,7 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
 
    radv_device_finish_notifier(device);
    radv_device_finish_vs_prologs(device);
-   if (device->ps_epilogs.ops)
-      radv_shader_part_cache_finish(device, &device->ps_epilogs);
+   radv_shader_part_cache_finish(device, &device->ps_epilogs);
    radv_device_finish_border_color(device);
    radv_device_finish_vrs_image(device);
 
@@ -1641,7 +1679,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    if (video_dec_queue && video_enc_queue && pdev->info.ip[AMD_IP_VCN_ENC].num_instances > 1) {
       result = device->ws->ctx_create(device->ws, RADEON_CTX_PRIORITY_MEDIUM, &device->hw_vcn_enc_ctx);
       if (result != VK_SUCCESS)
-         return result;
+         goto fail;
    }
 
    uint32_t total_queue_count = 0;
@@ -1749,14 +1787,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
          goto fail;
    }
 
-   if (device->vk.enabled_features.graphicsPipelineLibrary || device->vk.enabled_features.shaderObject ||
-       device->vk.enabled_features.extendedDynamicState ||
-       device->vk.enabled_features.extendedDynamicState3ColorBlendEnable ||
-       device->vk.enabled_features.extendedDynamicState3ColorWriteMask ||
-       device->vk.enabled_features.extendedDynamicState3AlphaToCoverageEnable ||
-       device->vk.enabled_features.extendedDynamicState3ColorBlendEquation ||
-       device->vk.enabled_features.extendedDynamicState3RasterizationSamples)
-      radv_shader_part_cache_init(&device->ps_epilogs, &ps_epilog_ops);
+   radv_shader_part_cache_init(&device->ps_epilogs, &ps_epilog_ops);
 
    if (pdev->info.has_zero_index_buffer_bug || device->compiler_info.key.mitigate_smem_oob) {
       result = radv_bo_create(
@@ -1792,7 +1823,10 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
       device->capture_replay_arena_vas = _mesa_hash_table_u64_create(NULL);
    }
 
+   radv_device_init_rdp(device);
+
    *pDevice = radv_device_to_handle(device);
+
    return VK_SUCCESS;
 
 fail:
@@ -1876,8 +1910,13 @@ radv_GetDeviceImageMemoryRequirements(VkDevice device, const VkDeviceImageMemory
       radv_image_create(device, &(struct radv_image_create_info){.vk_info = pInfo->pCreateInfo}, NULL, &image, true);
    assert(result == VK_SUCCESS);
 
+   VkImagePlaneMemoryRequirementsInfo plane_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO,
+      .planeAspect = pInfo->planeAspect,
+   };
    VkImageMemoryRequirementsInfo2 info2 = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .pNext = radv_image_from_handle(image)->disjoint ? &plane_info : NULL,
       .image = image,
    };
 

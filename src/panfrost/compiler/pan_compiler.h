@@ -356,7 +356,7 @@ void pan_build_varying_layout_compact(struct pan_varying_layout *layout,
                                       nir_shader *nir, unsigned arch);
 
 void pan_varying_collect_formats(struct pan_varying_layout *registry,
-                                 nir_shader *nir, unsigned arch);
+                                 nir_shader *nir, unsigned arch, bool is_sw_vs);
 
 struct pan_shader_varying {
    gl_varying_slot location;
@@ -641,6 +641,9 @@ pan_res_handle(unsigned table, unsigned index)
 
 void pan_disassemble(FILE *fp, const void *code, size_t size, uint64_t gpu_id,
                      bool verbose);
+
+void pan_disassemble_bi(FILE *fp, const void *code, size_t size, unsigned arch,
+                        bool verbose);
 
 void pan_stats_verbose_prologue(FILE *f, const char *prefix, unsigned arch,
                                 const struct pan_model *model);

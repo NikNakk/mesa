@@ -1722,11 +1722,13 @@ gather_outputs(struct nir_builder *builder, nir_intrinsic_instr *intr, void *cb_
       /* If the store instruction is executed in a divergent block, the value
        * that's stored in the output becomes divergent.
        *
-       * For all shaders except mesh shaders, "divergent" is vertex divergence.
-       * For mesh shaders, it's workgroup divergence.
+       * For all shaders except mesh and geometry shaders, "divergent" is
+       * vertex divergence. For geometry shaders, it's always uniform. For
+       * mesh shaders, it's workgroup divergence.
        */
-      const bool divergent = intr->instr.block->divergent ||
-                             nir_src_is_divergent(&intr->src[0]);
+      const bool divergent = linkage->producer_stage != MESA_SHADER_GEOMETRY &&
+                             (intr->instr.block->divergent ||
+                              nir_src_is_divergent(&intr->src[0]));
 
       if (!out->producer.value.def) {
          /* This is the first store to this output. */
@@ -1760,6 +1762,24 @@ gather_outputs(struct nir_builder *builder, nir_intrinsic_instr *intr, void *cb_
                BITSET_CLEAR(linkage->convergent16_mask, slot);
             else
                UNREACHABLE("invalid store_output type");
+         }
+      }
+
+      /* If the store value is inside a loop, there might be multiple
+       * different store values to the output. This matters for geometry
+       * shaders because they can each be for a different vertex.
+       *
+       * TODO: This can disable uniform expression propagation and promotion
+       * of convergent varyings to flat. We should use some kind of proper
+       * loop invariance analysis to determine equility of output values.
+       */
+      if (linkage->producer_stage == MESA_SHADER_GEOMETRY && !nir_scalar_is_const(value)) {
+         for (nir_cf_node *node = &nir_def_instr(value.def)->block->cf_node;
+            node->type != nir_cf_node_function; node = node->parent) {
+            if (node->type == nir_cf_node_loop) {
+               BITSET_CLEAR(linkage->output_equal_mask, slot);
+               break;
+            }
          }
       }
 
@@ -4968,6 +4988,13 @@ relocate_slot(struct linkage_info *linkage, struct scalar_slot *slot,
                  fs_vec4_type_strings[fs_vec4_type]);
 #endif /* PRINT_RELOCATE_SLOT */
 
+         if (instruction_lists[i] == &slot->producer.stores &&
+             sem.location < VARYING_SLOT_VAR0 &&
+             (sem.location != new_semantic ||
+              sem.high_16bits != new_high_16bits ||
+              nir_intrinsic_component(intr) != new_component))
+            *progress |= nir_progress_producer_builtin_outputs_moved;
+
          sem.location = new_semantic;
          sem.high_16bits = new_high_16bits;
 
@@ -6054,11 +6081,17 @@ nir_opt_varyings(nir_shader *producer, nir_shader *consumer, bool spirv,
     * divergence information.
     */
    if (consumer->info.stage == MESA_SHADER_FRAGMENT) {
-      nir_divergence_options divergence_options =
-         producer->info.stage == MESA_SHADER_MESH ?
-               nir_divergence_across_subgroups : nir_divergence_vertex;
-
-      nir_custom_divergence_analysis(producer, divergence_options);
+      switch (producer->info.stage) {
+      case MESA_SHADER_MESH:
+         nir_custom_divergence_analysis(producer, nir_divergence_across_subgroups);
+         break;
+      case MESA_SHADER_VERTEX:
+      case MESA_SHADER_TESS_EVAL:
+         nir_custom_divergence_analysis(producer, nir_divergence_vertex);
+         break;
+      default:
+         break;
+      }
    }
 
    /* This also removes dead varyings. */
@@ -6198,13 +6231,23 @@ optimize_varyings(nir_shader *producer, nir_shader *consumer, bool spirv,
  * of stage and a driver-specific optimization callback for a single stage. It
  * then calls nir_opt_varyings and associated passes across all the shaders in
  * the pipeline to optimize. This is a convenience helper for drivers.
+ *
+ * If pair_progress is not NULL, it must have num_shaders - 1 elements.
+ * Element i receives the combined progress of all nir_opt_varyings calls
+ * with shaders[i] as the producer and shaders[i + 1] as the consumer.
  */
 void
 nir_opt_varyings_bulk(nir_shader **shaders, uint32_t num_shaders, bool spirv,
                       unsigned max_uniform_comps, unsigned max_ubos,
                       void (*optimize)(nir_shader *, void *),
-                      void *optimize_data)
+                      void *optimize_data,
+                      nir_opt_varyings_progress *pair_progress)
 {
+   if (pair_progress && num_shaders > 1) {
+      memset(pair_progress, 0,
+             (num_shaders - 1) * sizeof(pair_progress[0]));
+   }
+
    /* There is nothing to link for only 1 shader. */
    if (num_shaders == 1) {
       nir_shader *nir = shaders[0];
@@ -6265,10 +6308,14 @@ nir_opt_varyings_bulk(nir_shader **shaders, uint32_t num_shaders, bool spirv,
     */
    unsigned highest_changed_producer = 0;
    for (unsigned i = 0; i < num_shaders - 1; i++) {
-      if (optimize_varyings(shaders[i], shaders[i + 1], spirv,
-                            max_uniform_comps, max_ubos, optimize,
-                            optimize_data) &
-          nir_progress_producer)
+      nir_opt_varyings_progress progress =
+         optimize_varyings(shaders[i], shaders[i + 1], spirv,
+                           max_uniform_comps, max_ubos, optimize,
+                           optimize_data);
+
+      if (pair_progress)
+         pair_progress[i] |= progress;
+      if (progress & nir_progress_producer)
          highest_changed_producer = i;
    }
 
@@ -6276,8 +6323,13 @@ nir_opt_varyings_bulk(nir_shader **shaders, uint32_t num_shaders, bool spirv,
     * shader.
     */
    for (unsigned i = highest_changed_producer; i > 0; i--) {
-      optimize_varyings(shaders[i - 1], shaders[i], spirv, max_uniform_comps,
-                        max_ubos, optimize, optimize_data);
+      nir_opt_varyings_progress progress =
+         optimize_varyings(shaders[i - 1], shaders[i], spirv,
+                           max_uniform_comps, max_ubos, optimize,
+                           optimize_data);
+
+      if (pair_progress)
+         pair_progress[i - 1] |= progress;
    }
 
    /* Final cleanups. */

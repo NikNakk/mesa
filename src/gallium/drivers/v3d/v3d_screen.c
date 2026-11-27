@@ -268,6 +268,7 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->texture_barrier = true;
         caps->polygon_offset_clamp = true;
         caps->texture_query_lod = true;
+        caps->texture_shadow_lod = true;
 
         caps->query_timestamp =
         caps->query_time_elapsed = screen->has_cpu_queue && screen->has_multisync;
@@ -585,6 +586,8 @@ v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
                 .lower_fmod = true,
                 .lower_pack_unorm_2x16 = true,
                 .lower_pack_snorm_2x16 = true,
+                .lower_unpack_unorm_2x16 = true,
+                .lower_unpack_snorm_2x16 = true,
                 .lower_pack_unorm_4x8 = true,
                 .lower_pack_snorm_4x8 = true,
                 .lower_unpack_unorm_4x8 = true,

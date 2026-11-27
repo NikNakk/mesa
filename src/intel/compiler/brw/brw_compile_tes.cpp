@@ -53,13 +53,14 @@ brw_fill_tess_info_from_shader_info(struct brw_tess_info *brw_info,
    STATIC_ASSERT(INTEL_TESS_PARTITIONING_EVEN_FRACTIONAL ==
                  TESS_SPACING_FRACTIONAL_EVEN - 1);
 
+   *brw_info = {};
    brw_info->primitive_mode = shader_info->tess._primitive_mode;
    brw_info->spacing = shader_info->tess.spacing;
    brw_info->ccw = shader_info->tess.ccw;
    brw_info->point_mode = shader_info->tess.point_mode;
 }
 
-const unsigned *
+intel_shader_bin *
 brw_compile_tes(const struct brw_compiler *compiler,
                 brw_compile_params *params)
 {
@@ -68,12 +69,10 @@ brw_compile_tes(const struct brw_compiler *compiler,
    const struct brw_tes_prog_key *key =
       (const struct brw_tes_prog_key *)params->key;
    struct intel_vue_map input_vue_map;
-   struct brw_tes_prog_data *prog_data =
-      (struct brw_tes_prog_data *)params->prog_data;
    const unsigned dispatch_width = brw_geometry_stage_dispatch_width(compiler->devinfo);
 
    const bool debug_enabled = brw_should_print_shader(
-      nir, DEBUG_TES, prog_data->base.base.source_hash);
+      nir, DEBUG_TES, params->source_hash);
 
    brw_pass_tracker pt_ = {
       .nir = nir,
@@ -85,7 +84,7 @@ brw_compile_tes(const struct brw_compiler *compiler,
 
    BRW_NIR_SNAPSHOT("first");
 
-   brw_prog_data_init(&prog_data->base.base, params);
+   const unsigned ray_queries = nir->info.ray_queries;
 
    if (params->tes.input_vue_map != NULL) {
       assert(!key->separate_tess_vue_layout);
@@ -104,13 +103,15 @@ brw_compile_tes(const struct brw_compiler *compiler,
       (nir->info.per_view_outputs & VARYING_BIT_POS) ?
       MAX2(1, util_bitcount(key->base.view_mask)) : 1;
 
-   brw_compute_vue_map(devinfo, &prog_data->base.vue_map,
+   struct intel_vue_map vue_map;
+   brw_compute_vue_map(devinfo, &vue_map,
                        nir->info.outputs_written,
                        key->base.vue_layout, pos_slots);
 
    brw_nir_apply_key(pt, &key->base, dispatch_width);
+   unsigned urb_read_length = 0;
    brw_nir_lower_tes_inputs(nir, devinfo, &input_vue_map,
-                            &prog_data->base.urb_read_length);
+                            &urb_read_length);
    brw_nir_lower_vue_outputs(nir);
    BRW_NIR_SNAPSHOT("after_lower_io");
 
@@ -120,9 +121,9 @@ brw_compile_tes(const struct brw_compiler *compiler,
    brw_postprocess_nir(pt, debug_enabled);
 
    BRW_NIR_PASS(brw_nir_lower_deferred_urb_writes, devinfo,
-                &prog_data->base.vue_map, 0, 0);
+                &vue_map, 0, 0);
 
-   unsigned output_size_bytes = prog_data->base.vue_map.num_slots * 4 * 4;
+   unsigned output_size_bytes = vue_map.num_slots * 4 * 4;
 
    assert(output_size_bytes >= 1);
    if (output_size_bytes > GFX7_MAX_DS_URB_ENTRY_SIZE_BYTES) {
@@ -131,20 +132,20 @@ brw_compile_tes(const struct brw_compiler *compiler,
       return NULL;
    }
 
-   prog_data->include_primitive_id =
+   const bool include_primitive_id =
       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID);
 
    /* URB entry sizes are stored as a multiple of 64 bytes. */
-   prog_data->base.urb_entry_size = align(output_size_bytes, 64) / 64;
+   const unsigned urb_entry_size = align(output_size_bytes, 64) / 64;
 
-   brw_fill_tess_info_from_shader_info(&prog_data->tess_info,
-                                       &nir->info);
+   struct brw_tess_info tess_info;
+   brw_fill_tess_info_from_shader_info(&tess_info, &nir->info);
 
    if (unlikely(debug_enabled)) {
       fprintf(stderr, "TES Input ");
       brw_print_vue_map(stderr, &input_vue_map, MESA_SHADER_TESS_EVAL);
       fprintf(stderr, "TES Output ");
-      brw_print_vue_map(stderr, &prog_data->base.vue_map,
+      brw_print_vue_map(stderr, &vue_map,
                         MESA_SHADER_TESS_EVAL);
    }
 
@@ -152,8 +153,22 @@ brw_compile_tes(const struct brw_compiler *compiler,
       .compiler                = compiler,
       .compile_params          = params,
       .nir                     = nir,
+      .info = {
+         .source_hash = params->source_hash,
+         .ray_queries = ray_queries,
+         .vue = {
+            .vue_map = vue_map,
+            .urb_read_length = urb_read_length,
+            .urb_entry_size = urb_entry_size,
+            .dispatch_mode = INTEL_DISPATCH_MODE_SIMD8,
+         },
+         .tes = {
+            .tess_info = tess_info,
+            .include_primitive_id = include_primitive_id,
+         },
+      },
       .dispatch_width          = dispatch_width,
-      .needs_register_pressure = params->stats != NULL,
+      .needs_register_pressure = params->collect_register_pressure,
       .debug_enabled           = debug_enabled,
    };
    brw_shader v(&shader_params);
@@ -163,15 +178,9 @@ brw_compile_tes(const struct brw_compiler *compiler,
       return NULL;
    }
 
-   assert(v.payload().num_regs % reg_unit(devinfo) == 0);
-   prog_data->base.base.dispatch_grf_start_reg = v.payload().num_regs / reg_unit(devinfo);
-   prog_data->base.base.grf_used = v.grf_used;
-   prog_data->base.dispatch_mode = INTEL_DISPATCH_MODE_SIMD8;
-
    const brw_to_binary_params to_binary_params = {
       .compiler = compiler,
       .params = params,
-      .prog_data = &prog_data->base.base,
       .shaders = { &v },
    };
    return brw_to_binary(&to_binary_params);

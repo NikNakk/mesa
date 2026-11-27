@@ -90,15 +90,32 @@ to_gen_operand(jay_function *f,
    }
 
    if (jay_is_imm(d)) {
-      /* Immediates have size restrictions but can zero extend */
+      uint32_t imm = jay_as_uint(d);
+
+      /* Immediates have size restrictions but can sign/zero extend */
       if (jay_type_size_bits(type) == 64) {
          type = jay_type_resize(type, 32);
       } else if (jay_num_isa_srcs(I) == 3) {
-         assert(jay_as_uint(d) <= UINT16_MAX);
-         type = JAY_TYPE_U16;
+         /* First apply sign-extend so we get the logical 32-bit immediate */
+         if (jay_base_type(type) == JAY_TYPE_S) {
+            imm = util_sign_extend(imm, jay_type_size_bits(type));
+         }
+
+         if (jay_type_is_any_float(type)) {
+            /* Float types need to match */
+            assert(imm <= UINT16_MAX && type == JAY_TYPE_F16);
+         } else if (jay_base_type(type) == JAY_TYPE_S &&
+                    (int16_t) imm == (int32_t) imm) {
+            /* Sign-extend 16-bit */
+            type = JAY_TYPE_S16;
+         } else {
+            /* Zero-extend 16-bit */
+            assert(imm <= UINT16_MAX);
+            type = JAY_TYPE_U16;
+         }
       }
 
-      R = gen_imm_ud(jay_as_uint(d));
+      R = gen_imm_ud(imm);
    } else if (jay_is_null(d)) {
       R = gen_null();
    } else if (d.file == UGPR || (d.file == ACCUM && I->uniform)) {
@@ -141,7 +158,7 @@ to_gen_operand(jay_function *f,
          if ((I->type == JAY_TYPE_F16 && !jay_type_is_any_float(src0_type)) ||
              (src0_type == JAY_TYPE_F16 && !jay_type_is_any_float(I->type))) {
             assert(jay_num_values(d) == 1 && "must not vectorize HF<->Int");
-            R = gen_restride(R, 8, 2, 4);
+            R = gen_restride(R, 4, 2, 2);
          }
 
          /* Packed floats have restrictions on mixed sizes.  Use <2>. */
@@ -275,7 +292,7 @@ static const struct {
    OP(ADD_RTNE, ADD, 2),
    OP(AND, AND, 2),
    OP(AND_U32_U16, AND, 2),
-   OP(AND_SN_S32, AND, 2),
+   OP(AND_SN, AND, 2),
    OP(ASR, ASR, 2),
    OP(AVG, AVG, 2),
    OP(BFE, BFE, 3),
@@ -338,6 +355,7 @@ static const struct {
    OP(SHR_ODD_SUBSPANS_BY_4, SHR, 1),
    OP(SHR, SHR, 2),
    OP(MOV_INDIRECT, MOV, 2),
+   OP(MOVI, MOVI, 2),
    OP(SYNC, SYNC, 1),
    OP(WHILE, WHILE, 0),
    OP(XOR, XOR, 2),
@@ -578,13 +596,16 @@ emit(struct jay_codegen *jc,
    case JAY_OPCODE_MOV_INDIRECT:
       /* UGPR broadcasts are both useless (degrading to a plain move) and would
        * generate incorrect code (since we do not zero out the offset). Just
-       * assert that we don't see them, we handled them during isel.
+       * assert that we don't see them, we handled them during isel.  Sub-dword
+       * reads can select a byte or word within a scalar UGPR.
        */
       assert(I->src[0].file == GPR ||
-             (I->src[0].file == UGPR && jay_num_values(I->src[0]) > 1));
+             (I->src[0].file == UGPR &&
+              (jay_num_values(I->src[0]) > 1 ||
+               jay_type_size_bits(I->type) < 32)));
 
       gen->src[0] = gen_grf(0, I->src[1].reg);
-      gen->src[0].type = GEN_TYPE_UD;
+      gen->src[0].type = to_gen_reg_type(I->type);
       gen->src[0].indirect = true;
       gen->src[0].addr_imm = 0;
 
@@ -597,6 +618,26 @@ emit(struct jay_codegen *jc,
          gen->src[0] = gen_restride(gen->src[0], 0, 1, 0);
       }
       break;
+
+   case JAY_OPCODE_MOVI: {
+      unsigned base_B = jay_reg_offset_B(f->shader, I->src[0]);
+      unsigned grf_size = jc->devinfo->grf_size;
+
+      assert(jay_type_size_bits(I->type) == 32);
+      /* a0.n[5:0] + imm[5:0] wraps within the GRF, so the data must not
+       * cross a GRF boundary.
+       */
+      assert(base_B % grf_size + 4 * f->shader->dispatch_width <= grf_size);
+
+      gen->src[0] = gen_grf(0, I->src[1].reg);
+      gen->src[0].type = GEN_TYPE_UD;
+      gen->src[0].indirect = true;
+      gen->src[0].addr_imm = 0;
+      gen->src[0] = gen_restride(gen->src[0], 1, 1, 0);
+      assert(base_B <= UINT16_MAX);
+      gen->src[1] = gen_imm_uw(base_B);
+      break;
+   }
 
    case JAY_OPCODE_HALT:
       if (jay_halt_predicate_all(I)) {
@@ -670,13 +711,14 @@ emit(struct jay_codegen *jc,
    }
 }
 
-struct jay_shader_bin *
+intel_shader_bin *
 jay_to_binary(jay_shader *s,
               void *const_data,
               size_t const_data_size,
               bool debug)
 {
-   struct jay_shader_bin *bin = rzalloc(s, struct jay_shader_bin);
+   intel_shader_bin *bin = rzalloc(s, intel_shader_bin);
+   bin->info = s->info;
    void *mem_ctx = ralloc_context(NULL);
 
    int total_gen_insts = 0;
@@ -733,7 +775,6 @@ jay_to_binary(jay_shader *s,
    util_dynarray_init(&jc.loop_stack, mem_ctx);
    util_dynarray_init(&jc.relocs, bin);
 
-   struct brw_stage_prog_data *prog_data = &s->prog_data->base;
    int code_size;
 
    /* TODO: Multifunction properly */
@@ -850,21 +891,20 @@ jay_to_binary(jay_shader *s,
       }
    }
 
-   assert(prog_data->const_data_size == 0);
+   assert(bin->info.const_data_size == 0);
    if (const_data_size > 0) {
       unsigned offset = align(jc.output_size, 32);
       assert(offset + const_data_size <= output_capacity);
       memcpy(jc.output + offset, const_data, const_data_size);
       jc.output_size = offset + const_data_size;
-      prog_data->const_data_size = const_data_size;
-      prog_data->const_data_offset = offset;
+      bin->info.const_data_size = const_data_size;
+      bin->info.const_data_offset = offset;
    }
 
-   prog_data->relocs = jc.relocs.data;
-   prog_data->num_relocs = num_relocs;
-
-   bin->kernel = (const uint32_t *) jc.output;
-   bin->size = jc.output_size;
+   bin->code = jc.output;
+   bin->code_size = jc.output_size;
+   bin->relocs = jc.relocs.data;
+   bin->num_relocs = num_relocs;
 
    ralloc_free(mem_ctx);
    return bin;

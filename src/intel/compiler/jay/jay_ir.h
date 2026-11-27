@@ -155,29 +155,6 @@ typedef struct jay_def {
 static_assert(sizeof(jay_def) == 8, "packed");
 
 /*
- * Construct an jay_def representing contiguous bare registers with no
- * associated SSA index, for use post-RA only.
- */
-static inline jay_def
-jay_bare_regs(enum jay_file file, uint16_t reg, unsigned count)
-{
-   assert(count > 0);
-   return (jay_def) {
-      ._payload = JAY_SENTINEL,
-      .reg = reg,
-      .file = file,
-      .num_values_m1 = count - 1,
-      .size = JAY_SIZE_32,
-   };
-}
-
-static inline jay_def
-jay_bare_reg(enum jay_file file, uint16_t reg)
-{
-   return jay_bare_regs(file, reg, 1);
-}
-
-/*
  * Set the register for a def (called by RA only). This drops the collect
  * indices since we do not have space to encode both simultaneously.
  */
@@ -344,6 +321,29 @@ jay_contiguous_def(enum jay_file file,
       .num_values_m1 = count - 1,
       .size = jay_size_from_bits(size),
    };
+}
+
+/*
+ * Construct an jay_def representing contiguous bare registers with no
+ * associated SSA index, for use post-RA only.
+ */
+static inline jay_def
+jay_bare_regs(enum jay_file file, unsigned size, uint16_t reg, unsigned count)
+{
+   assert(count > 0);
+   return (jay_def) {
+      ._payload = JAY_SENTINEL,
+      .reg = reg,
+      .file = file,
+      .num_values_m1 = count - 1,
+      .size = jay_size_from_bits(size),
+   };
+}
+
+static inline jay_def
+jay_bare_reg(enum jay_file file, unsigned size, uint16_t reg)
+{
+   return jay_bare_regs(file, size, reg, 1);
 }
 
 /*
@@ -744,8 +744,8 @@ jay_src_type(const jay_inst *I, unsigned s)
    /* TODO: Do we want to allow zero-extension generally? */
    if (I->op == JAY_OPCODE_AND_U32_U16)
       return JAY_TYPE_U16;
-   else if (I->op == JAY_OPCODE_AND_SN_S32 && s == 0)
-      return jay_type(JAY_TYPE_S, jay_and_sN_s32_n(I));
+   else if (I->op == JAY_OPCODE_AND_SN && s == 0)
+      return jay_type(JAY_TYPE_S, jay_and_sN_n(I));
 
    /* Mixed-signedness integer dot product opcode */
    if (I->op == JAY_OPCODE_DP4A_SU && s == 2)
@@ -866,12 +866,12 @@ jay_lookup_block(const struct jay_partition *p,
  */
 typedef struct jay_shader {
    mesa_shader_stage stage;
+   struct intel_shader_info info;
    struct list_head functions;
    const struct intel_device_info *devinfo;
-   union brw_any_prog_data *prog_data;
+   const struct jay_compile_params *params;
    debug_archiver *archiver;
    unsigned spills, fills;
-   unsigned scratch_size;
    unsigned payload_gprs, payload_ugprs, push_grfs;
 
    /**
@@ -950,6 +950,21 @@ jay_ugpr_per_gpr(jay_shader *s)
    return jay_ugpr_per_grf(s) * jay_grf_per_gpr(s);
 }
 
+/*
+ * Byte offset of a GPR/UGPR def from the start of the register file, as
+ * used for indirect addressing. Registers are in 16-bit units.
+ */
+static inline unsigned
+jay_reg_offset_B(const jay_shader *s, jay_def x)
+{
+   struct jay_register_block block =
+      jay_lookup_block(&s->partition, x.reg, x.file);
+   unsigned reg_width = 2 * (x.file == UGPR ? 1 : s->dispatch_width);
+
+   return block.start_grf * s->devinfo->grf_size +
+          (x.reg - block.start_gpr) * reg_width;
+}
+
 static inline unsigned
 jay_phys_flag_per_virt(jay_shader *s)
 {
@@ -989,7 +1004,8 @@ jay_is_shuffle_like(const jay_inst *I)
    return I->op == JAY_OPCODE_SHUFFLE ||
           I->op == JAY_OPCODE_QUAD_SWIZZLE ||
           I->op == JAY_OPCODE_BROADCAST_IMM ||
-          I->op == JAY_OPCODE_MOV_INDIRECT;
+          I->op == JAY_OPCODE_MOV_INDIRECT ||
+          I->op == JAY_OPCODE_MOVI;
 }
 
 static inline bool
@@ -1227,14 +1243,20 @@ jay_def_stride(const jay_shader *shader, jay_def x)
    return jay_lookup_block(&shader->partition, x.reg, GPR).stride;
 }
 
-static inline enum jay_type
-jay_flag_type(jay_function *func)
+static inline unsigned
+jay_flag_bits(jay_function *func)
 {
    /* Flags can only be addressed as UW or UD as ARF sources, so we use 16-bit
     * values for flags even in SIMD8 - going smaller is pointless and opens us
     * up to GEN's many wonderful byte regioning restrictions.
     */
-   return jay_type(JAY_TYPE_U, MAX2(func->shader->dispatch_width, 16));
+   return MAX2(func->shader->dispatch_width, 16);
+}
+
+static inline enum jay_type
+jay_flag_type(jay_function *func)
+{
+   return jay_type(JAY_TYPE_U, jay_flag_bits(func));
 }
 
 /* Represents an allocated register number with file in the top 3 bits. */

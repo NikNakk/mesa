@@ -1276,10 +1276,13 @@ void ac_fill_hw_info(struct radeon_info *info, const struct drm_amdgpu_info_devi
 
    /* Get the number of good compute units. */
    info->num_cu = 0;
+   info->max_good_cu_per_se = 0;
    info->min_good_cu_per_sa = UINT32_MAX;
    info->max_good_cu_per_sa = 0;
 
    for (int i = 0; i < info->max_se; i++) {
+      unsigned num_cu_per_se = 0;
+
       for (int j = 0; j < info->max_sa_per_se; j++) {
          if (info->gfx_level >= GFX11) {
             assert(info->max_sa_per_se <= 2);
@@ -1309,8 +1312,11 @@ void ac_fill_hw_info(struct radeon_info *info, const struct drm_amdgpu_info_devi
             info->min_good_cu_per_sa = MIN2(info->min_good_cu_per_sa, num_cu_in_sa);
             info->max_good_cu_per_sa = MAX2(info->max_good_cu_per_sa, num_cu_in_sa);
             info->num_cu += num_cu_in_sa;
+            num_cu_per_se += num_cu_in_sa;
          }
       }
+
+      info->max_good_cu_per_se = MAX2(info->max_good_cu_per_se, num_cu_per_se);
    }
 
    assert(info->min_good_cu_per_sa <= info->max_good_cu_per_sa);
@@ -2172,6 +2178,7 @@ void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd)
       }
    }
    fprintf(f, "    spi_cu_en_has_effect = %i\n", info->spi_cu_en_has_effect);
+   fprintf(f, "    max_good_cu_per_se = %i\n", info->max_good_cu_per_se);
    fprintf(f, "    max_good_cu_per_sa = %i\n", info->max_good_cu_per_sa);
    fprintf(f, "    min_good_cu_per_sa = %i\n", info->min_good_cu_per_sa);
    fprintf(f, "    max_se = %i\n", info->max_se);
@@ -2522,14 +2529,12 @@ void ac_get_harvested_configs(const struct radeon_info *info, unsigned raster_co
 }
 
 unsigned
-ac_get_compute_resource_limits(const struct radeon_info *info, unsigned waves_per_threadgroup,
-                               unsigned max_waves_per_sh, unsigned threadgroups_per_cu)
+ac_get_compute_resource_limits(const struct radeon_info *info, unsigned waves_per_workgroup,
+                               unsigned max_waves_per_sh, unsigned workgroups_per_cu)
 {
-   unsigned compute_resource_limits = S_00B854_SIMD_DEST_CNTL(waves_per_threadgroup % 4 == 0);
+   unsigned compute_resource_limits = S_00B854_SIMD_DEST_CNTL(waves_per_workgroup % 4 == 0);
 
    if (info->gfx_level >= GFX7) {
-      unsigned num_cu_per_se = info->num_cu / info->num_se;
-
       /* Gfx9 should set the limit to max instead of 0 to fix high priority compute. */
       if (info->gfx_level == GFX9 && !max_waves_per_sh) {
          max_waves_per_sh = info->max_good_cu_per_sa *
@@ -2545,12 +2550,12 @@ ac_get_compute_resource_limits(const struct radeon_info *info, unsigned waves_pe
        * size is 64. This has shown some good improvements if # of CUs
        * per SE is not a multiple of 4.
        */
-      if (num_cu_per_se % 4 && waves_per_threadgroup == 1)
+      if (info->max_good_cu_per_se % 4 && waves_per_workgroup == 1)
          compute_resource_limits |= S_00B854_FORCE_SIMD_DIST(1);
 
-      assert(threadgroups_per_cu >= 1 && threadgroups_per_cu <= 8);
+      assert(workgroups_per_cu >= 1 && workgroups_per_cu <= 8);
       compute_resource_limits |=
-         S_00B854_WAVES_PER_SH(max_waves_per_sh) | S_00B854_CU_GROUP_COUNT(threadgroups_per_cu - 1);
+         S_00B854_WAVES_PER_SH(max_waves_per_sh) | S_00B854_CU_GROUP_COUNT(workgroups_per_cu - 1);
    } else {
       /* GFX6 */
       if (max_waves_per_sh) {

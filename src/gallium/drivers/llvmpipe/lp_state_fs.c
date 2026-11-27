@@ -1489,7 +1489,7 @@ generate_fs_loop(struct gallivm_state *gallivm,
  * However in memory pixels are stored in rows
  *  e.g. (0, 0), (1, 0), (2, 0), (3, 0) ; (0, 1) ...
  *
- * @param type            fragment shader type (4x or 8x float)
+ * @param type            fragment shader type (4x or 8x or 16x float)
  * @param num_fs          number of fs_src
  * @param dst_channels    number of output channels
  * @param fs_src          output from fragment shader
@@ -1511,7 +1511,7 @@ generate_fs_twiddle(struct gallivm_state *gallivm,
    unsigned src_channels = dst_channels < 3 ? dst_channels : 4;
    unsigned src_count = num_fs * src_channels;
 
-   assert(pixels == 2 || pixels == 1);
+   assert(pixels == 4 || pixels == 2 || pixels == 1);
    assert(num_fs * src_channels <= ARRAY_SIZE(src));
 
    /*
@@ -1528,16 +1528,20 @@ generate_fs_twiddle(struct gallivm_state *gallivm,
    bool swizzle_pad = false;
    bool twiddle = false;
    bool split = false;
+   bool split_twiddled_rows = false;
    unsigned reorder_group = 0;
 
    if (dst_channels == 1) {
       twiddle = true;
-      if (pixels == 2) {
+      if (pixels > 1) {
          split = true;
       }
    } else if (dst_channels == 2) {
       if (pixels == 1) {
          reorder_group = 1;
+      } else if (pixels == 4) {
+         twiddle = true;
+         split_twiddled_rows = true;
       }
    } else if (dst_channels > 2) {
       if (pixels == 1) {
@@ -1551,16 +1555,15 @@ generate_fs_twiddle(struct gallivm_state *gallivm,
       }
    }
 
-   /*
-    * Split the src in half
-    */
    if (split) {
       for (unsigned i = num_fs; i > 0; --i) {
-         src[(i - 1)*2 + 1] = lp_build_extract_range(gallivm, src[i - 1], 4, 4);
-         src[(i - 1)*2 + 0] = lp_build_extract_range(gallivm, src[i - 1], 0, 4);
+         for (unsigned j = pixels; j > 0; --j) {
+            src[(i - 1) * pixels + j - 1] =
+               lp_build_extract_range(gallivm, src[i - 1], (j - 1) * 4, 4);
+         }
       }
 
-      src_count *= 2;
+      src_count *= pixels;
       type.length = 4;
    }
 
@@ -1588,6 +1591,15 @@ generate_fs_twiddle(struct gallivm_state *gallivm,
        * lp_build_conv to reorder (or deal with it ourselves).
        */
       lp_bld_quad_twiddle(gallivm, type, src, src_count, dst);
+
+      if (split_twiddled_rows) {
+         dst[3] = lp_build_extract_range(gallivm, dst[1], 8, 8);
+         dst[2] = lp_build_extract_range(gallivm, dst[1], 0, 8);
+         dst[1] = lp_build_extract_range(gallivm, dst[0], 8, 8);
+         dst[0] = lp_build_extract_range(gallivm, dst[0], 0, 8);
+         src_count *= 2;
+         type.length /= 2;
+      }
    } else {
       /* Do nothing */
       memcpy(dst, src, sizeof(LLVMValueRef) * src_count);
@@ -2081,7 +2093,7 @@ convert_to_blend_type(struct gallivm_state *gallivm,
          /* expand 4x16bit values to 4x32bit */
          struct lp_type type32x4 = src_type;
          LLVMTypeRef ltype32x4;
-         unsigned num_fetch = dst_type.length == 8 ? num_srcs / 2 : num_srcs / 4;
+         unsigned num_fetch = num_srcs * dst_type.length / 16;
          type32x4.width = 32;
          ltype32x4 = lp_build_vec_type(gallivm, type32x4);
          for (i = 0; i < num_fetch; i++) {
@@ -2095,7 +2107,15 @@ convert_to_blend_type(struct gallivm_state *gallivm,
       for (i = 0; i < num_srcs / 4; i++) {
          LLVMValueRef tmpsoa[4];
          LLVMValueRef tmps = tmpsrc[i];
-         if (dst_type.length == 8) {
+         if (dst_type.length == 16) {
+            LLVMValueRef shuffles[16];
+            tmps = lp_build_concat(gallivm, &tmpsrc[i * 4], src_type, 4);
+            for (unsigned j = 0; j < 16; j++) {
+               shuffles[j] = lp_build_const_int32(gallivm, (j % 4) * 4 + j / 4);
+            }
+            tmps = LLVMBuildShuffleVector(builder, tmps, tmps,
+                                          LLVMConstVector(shuffles, 16), "");
+         } else if (dst_type.length == 8) {
             LLVMValueRef shuffles[8];
             unsigned j;
             /* fetch was 4 values but need 8-wide output values */
@@ -2255,7 +2275,18 @@ convert_from_blend_type(struct gallivm_state *gallivm,
                                                    src_type, tmpsoa);
          }
 
-         if (src_type.length == 8) {
+         if (src_type.length == 16) {
+            LLVMValueRef shuffles[16];
+            for (unsigned j = 0; j < 16; j++) {
+               shuffles[j] = lp_build_const_int32(gallivm, (j % 4) * 4 + j / 4);
+            }
+            tmpdst = LLVMBuildShuffleVector(builder, tmpdst, tmpdst,
+                                            LLVMConstVector(shuffles, 16), "");
+            for (unsigned j = 0; j < 4; j++) {
+               src[i * 4 + j] = lp_build_extract_range(gallivm, tmpdst,
+                                                        j * 4, 4);
+            }
+         } else if (src_type.length == 8) {
             LLVMValueRef tmpaos, shuffles[8];
             unsigned j;
             /*
@@ -2279,7 +2310,7 @@ convert_from_blend_type(struct gallivm_state *gallivm,
          struct lp_type type16x8 = dst_type;
          struct lp_type type32x4 = dst_type;
          LLVMTypeRef ltype16x4, ltypei64, ltypei128;
-         unsigned num_fetch = src_type.length == 8 ? num_srcs / 2 : num_srcs / 4;
+         unsigned num_fetch = num_srcs * src_type.length / 16;
          type16x8.length = 8;
          type32x4.width = 32;
          ltypei128 = LLVMIntTypeInContext(gallivm->context, 128);
@@ -2315,12 +2346,14 @@ convert_from_blend_type(struct gallivm_state *gallivm,
       is_arith = false;
    }
 
-   /* Remove any padding */
-   if (!is_arith && (src_type.length % mem_type.length)) {
-      src_type.length -= (src_type.length % mem_type.length);
-
+   /* Each blend vector holds 'pixels' pixels, possibly spanning multiple
+    * memory rows. Remove channel padding without truncating those rows;
+    * the caller splits combined vectors into individual rows afterwards.
+    */
+   unsigned mem_length = mem_type.length * pixels;
+   if (!is_arith && src_type.length > mem_length) {
       for (i = 0; i < num_srcs; ++i) {
-         dst[i] = lp_build_extract_range(gallivm, dst[i], 0, src_type.length);
+         dst[i] = lp_build_extract_range(gallivm, dst[i], 0, mem_length);
       }
    }
 
@@ -2536,7 +2569,6 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
    struct lp_build_mask_context mask_ctx;
 
    unsigned char swizzle[TGSI_NUM_CHANNELS];
-   unsigned src_channels = TGSI_NUM_CHANNELS;
 
    const struct util_format_description *out_format_desc =
       util_format_description(out_format);
@@ -2547,7 +2579,8 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
       util_blend_state_is_dual(&variant->key.blend, 0);
 
    const bool is_1d = variant->key.resource_1d;
-   const unsigned num_fullblock_fs = is_1d ? 2 * num_fs : num_fs;
+   const unsigned num_fullblock_fs = block_size / fs_type.length;
+   const unsigned num_quads = fs_type.length / 4;
 
    LLVMTypeRef fs_vec_type = lp_build_vec_type(gallivm, fs_type);
 
@@ -2684,22 +2717,12 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
          fs_src[i][3] = alpha;
       }
 
-      /* We split the row_mask and row_alpha as we want 128bit interleave */
-      if (fs_type.length == 8) {
-         src_mask[i*2 + 0]  = lp_build_extract_range(gallivm, fs_mask[i],
-                                                     0, src_channels);
-         src_mask[i*2 + 1]  = lp_build_extract_range(gallivm, fs_mask[i],
-                                                     src_channels,
-                                                     src_channels);
-
-         src_alpha[i*2 + 0] = lp_build_extract_range(gallivm, alpha,
-                                                     0, src_channels);
-         src_alpha[i*2 + 1] = lp_build_extract_range(gallivm, alpha,
-                                                     src_channels,
-                                                     src_channels);
-      } else {
-         src_mask[i] = fs_mask[i];
-         src_alpha[i] = alpha;
+      /* Mask and alpha twiddling uses one 128-bit vector per quad. */
+      for (unsigned q = 0; q < num_quads; q++) {
+         src_mask[i * num_quads + q] =
+            lp_build_extract_range(gallivm, fs_mask[i], q * 4, 4);
+         src_alpha[i * num_quads + q] =
+            lp_build_extract_range(gallivm, alpha, q * 4, 4);
       }
    }
    if (dual_source_blend) {
@@ -2725,12 +2748,10 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
          if (dst_channels == 3 && !has_alpha) {
             fs_src1[i][3] = alpha;
          }
-         if (fs_type.length == 8) {
-            src1_alpha[i*2 + 0] = lp_build_extract_range(gallivm, alpha, 0, src_channels);
-            src1_alpha[i*2 + 1] = lp_build_extract_range(gallivm, alpha,
-                                                         src_channels, src_channels);
-         } else {
-            src1_alpha[i] = alpha;
+
+         for (unsigned q = 0; q < num_quads; q++) {
+            src1_alpha[i * num_quads + q] =
+               lp_build_extract_range(gallivm, alpha, q * 4, 4);
          }
       }
    }
@@ -2798,7 +2819,7 @@ generate_unswizzled_blend(struct gallivm_state *gallivm,
       }
    }
 
-   src_channels = dst_channels < 3 ? dst_channels : 4;
+   unsigned src_channels = dst_channels < 3 ? dst_channels : 4;
    if (src_count != num_fullblock_fs * src_channels) {
       unsigned ds = src_count / (num_fullblock_fs * src_channels);
       row_type.length /= ds;
@@ -3393,7 +3414,7 @@ generate_fragment(struct llvmpipe_context *lp,
    unsigned num_fs = 16 / fs_type.length; /* number of loops per 4x4 stamp */
    /* for 1d resources only run "upper half" of stamp */
    if (key->resource_1d)
-      num_fs /= 2;
+      num_fs = MAX2(num_fs/2, 1);
 
    {
       LLVMValueRef num_loop = lp_build_const_int32(gallivm, num_fs);
@@ -4010,6 +4031,7 @@ generate_variant(struct llvmpipe_context *lp,
          !key->depth.enabled &&
          !key->depth.depth_bounds_test &&
          !nir->info.fs.uses_discard &&
+         !nir->info.fs.uses_fbfetch_output &&
          !key->blend.logicop_enable &&
          (key->cbuf_format[0] == PIPE_FORMAT_B8G8R8A8_UNORM ||
           key->cbuf_format[0] == PIPE_FORMAT_B8G8R8X8_UNORM ||

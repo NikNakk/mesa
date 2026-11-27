@@ -275,6 +275,9 @@ spec@khr_texture_compression_astc@basic-gles,Fail
 spec@khr_texture_compression_astc@miptree-gl srgb-fp@sRGB decode full precision,Fail
 
 # uprev Piglit in Mesa
+spec@!opengl 1.0@gl-1.0-front-back-interleave,Fail
+spec@!opengl 1.0@gl-1.0-read-front-after-swap,Fail
+spec@!opengl 1.5@gl-1.5-gen-buffers-unique,Crash
 spec@ext_framebuffer_multisample@accuracy all_samples color depthstencil linear,Fail
 spec@ext_framebuffer_multisample@accuracy all_samples color depthstencil,Fail
 spec@ext_framebuffer_multisample@accuracy all_samples color small depthstencil linear,Fail

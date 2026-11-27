@@ -270,7 +270,7 @@ run_task_mesh(brw_shader &s, bool allow_spilling)
    return !s.failed;
 }
 
-const unsigned *
+intel_shader_bin *
 brw_compile_task(const struct brw_compiler *compiler,
                  struct brw_compile_params *params)
 {
@@ -278,10 +278,8 @@ brw_compile_task(const struct brw_compiler *compiler,
    struct nir_shader *nir = params->nir;
    const struct brw_task_prog_key *key =
       (const struct brw_task_prog_key *)params->key;
-   struct brw_task_prog_data *prog_data =
-      (struct brw_task_prog_data *)params->prog_data;
    const bool debug_enabled = brw_should_print_shader(nir, DEBUG_TASK,
-                                                      prog_data->base.base.source_hash);
+                                                      params->source_hash);
 
    brw_pass_tracker pt_ = {
       .nir = nir,
@@ -293,7 +291,8 @@ brw_compile_task(const struct brw_compiler *compiler,
 
    BRW_NIR_SNAPSHOT("first");
 
-   brw_nir_lower_tue_outputs(pt, &prog_data->map);
+   struct brw_tue_map map;
+   brw_nir_lower_tue_outputs(pt, &map);
 
    BRW_NIR_PASS(brw_nir_align_launch_mesh_workgroups);
 
@@ -312,20 +311,17 @@ brw_compile_task(const struct brw_compiler *compiler,
    NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics, compiler->devinfo,
             NULL);
 
-   brw_prog_data_init(&prog_data->base.base, params);
-
-   prog_data->base.local_size[0] = nir->info.workgroup_size[0];
-   prog_data->base.local_size[1] = nir->info.workgroup_size[1];
-   prog_data->base.local_size[2] = nir->info.workgroup_size[2];
-
-   prog_data->uses_drawid =
-      BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
+   const unsigned ray_queries = nir->info.ray_queries;
 
    brw_postprocess_nir_opts(pt);
 
+   const uint32_t local_size[3] = { nir->info.workgroup_size[0],
+                                    nir->info.workgroup_size[1],
+                                    nir->info.workgroup_size[2] };
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
-      .prog_data = &prog_data->base,
+      .stage = nir->info.stage,
+      .cs_local_size = local_size,
       .required_width = brw_required_dispatch_width(&nir->info),
    };
 
@@ -372,8 +368,15 @@ brw_compile_task(const struct brw_compiler *compiler,
          .compiler                = compiler,
          .compile_params          = params,
          .nir                     = shader,
+         .info = {
+            .source_hash = params->source_hash,
+            .ray_queries = ray_queries,
+            .wg = {
+               .local_size = { local_size[0], local_size[1], local_size[2] },
+            },
+         },
          .dispatch_width          = dispatch_width,
-         .needs_register_pressure = params->stats != NULL,
+         .needs_register_pressure = params->collect_register_pressure,
          .debug_enabled           = debug_enabled,
       };
       v[simd] = std::make_unique<brw_shader>(&shader_params);
@@ -404,19 +407,22 @@ brw_compile_task(const struct brw_compiler *compiler,
    }
 
    brw_shader &selected = *v[selected_simd];
-   prog_data->base.prog_mask = 1 << selected_simd;
-   prog_data->base.base.grf_used = MAX2(prog_data->base.base.grf_used,
-                                        selected.grf_used);
+   const uint8_t prog_mask = 1 << selected_simd;
+   selected.info.wg.prog_mask = prog_mask;
+   selected.info.wg.prog_spilled =
+      simd_state.spilled[selected_simd] ? prog_mask : 0;
+   selected.info.task.map = map;
+   selected.info.task.uses_drawid =
+      BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
 
    if (unlikely(debug_enabled)) {
       fprintf(stderr, "Task Output ");
-      brw_print_tue_map(stderr, &prog_data->map);
+      brw_print_tue_map(stderr, &map);
    }
 
    const brw_to_binary_params to_binary_params = {
       .compiler = compiler,
       .params = params,
-      .prog_data = &prog_data->base.base,
       .shaders = { &selected },
    };
    return brw_to_binary(&to_binary_params);
@@ -947,7 +953,7 @@ brw_mesh_autostrip_enable(const struct brw_compiler *compiler, struct nir_shader
    return true;
 }
 
-const unsigned *
+intel_shader_bin *
 brw_compile_mesh(const struct brw_compiler *compiler,
                  struct brw_compile_params *params)
 {
@@ -955,10 +961,8 @@ brw_compile_mesh(const struct brw_compiler *compiler,
    struct nir_shader *nir = params->nir;
    const struct brw_mesh_prog_key *key =
       (const struct brw_mesh_prog_key *)params->key;
-   struct brw_mesh_prog_data *prog_data =
-      (struct brw_mesh_prog_data *)params->prog_data;
    const bool debug_enabled = brw_should_print_shader(nir, DEBUG_MESH,
-                                                      prog_data->base.base.source_hash);
+                                                      params->source_hash);
 
    brw_pass_tracker pt_ = {
       .nir = nir,
@@ -970,13 +974,9 @@ brw_compile_mesh(const struct brw_compiler *compiler,
 
    BRW_NIR_SNAPSHOT("first");
 
-   brw_prog_data_init(&prog_data->base.base, params);
+   const unsigned ray_queries = nir->info.ray_queries;
 
-   prog_data->base.local_size[0] = nir->info.workgroup_size[0];
-   prog_data->base.local_size[1] = nir->info.workgroup_size[1];
-   prog_data->base.local_size[2] = nir->info.workgroup_size[2];
-
-   prog_data->primitive_type = nir->info.mesh.primitive_type;
+   const uint16_t primitive_type = nir->info.mesh.primitive_type;
 
    /* Apply this workaround before trying to pack indices because this can
     * increase the number of vertices and therefore change the decision about
@@ -992,16 +992,14 @@ brw_compile_mesh(const struct brw_compiler *compiler,
    }
 
    struct index_packing_state index_packing_state = {};
+   enum brw_mesh_index_format index_format;
    if (brw_can_pack_primitive_indices(nir, &index_packing_state)) {
       if (index_packing_state.original_prim_indices)
          NIR_PASS(_, nir, brw_pack_primitive_indices, &index_packing_state);
-      prog_data->index_format = BRW_INDEX_FORMAT_U888X;
+      index_format = BRW_INDEX_FORMAT_U888X;
    } else {
-      prog_data->index_format = BRW_INDEX_FORMAT_U32;
+      index_format = BRW_INDEX_FORMAT_U32;
    }
-
-   prog_data->uses_drawid =
-      BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
 
    brw_nir_lower_tue_inputs(pt, params->mesh.tue_map);
 
@@ -1009,35 +1007,36 @@ brw_compile_mesh(const struct brw_compiler *compiler,
    BRW_NIR_PASS(nir_opt_dce);
    BRW_NIR_PASS(nir_remove_dead_variables, nir_var_shader_out, NULL);
 
-   brw_compute_mue_map(compiler, nir, &prog_data->map,
-                       prog_data->index_format,
+   struct brw_mue_map map;
+   brw_compute_mue_map(compiler, nir, &map,
+                       index_format,
                        key->base.vue_layout,
                        apply_wa_18019110168 ? wa_18019110168_mapping : NULL);
-   brw_nir_lower_mesh_outputs(nir, &prog_data->map);
+   brw_nir_lower_mesh_outputs(nir, &map);
 
    /* When Primitive Header is enabled, we may not generates writes to all
     * fields, so let's initialize everything.
     */
-   if (prog_data->map.has_per_primitive_header)
-      BRW_NIR_PASS(brw_nir_initialize_mue, &prog_data->map);
+   if (map.has_per_primitive_header)
+      BRW_NIR_PASS(brw_nir_initialize_mue, &map);
 
    NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics, compiler->devinfo,
             NULL);
 
-   prog_data->autostrip_enable = brw_mesh_autostrip_enable(compiler, nir, &prog_data->map);
+   const bool autostrip_enable = brw_mesh_autostrip_enable(compiler, nir, &map);
 
    brw_postprocess_nir_opts(pt);
 
    const struct brw_lower_urb_cb_data cb_data = {
       .devinfo = devinfo,
-      .varying_to_slot = prog_data->map.vue_map.varying_to_slot,
-      .per_vertex_stride = prog_data->map.per_vertex_stride,
-      .per_vertex_offset = prog_data->map.per_vertex_offset,
-      .per_primitive_offset = prog_data->map.per_primitive_offset,
-      .per_primitive_stride = prog_data->map.per_primitive_stride,
+      .varying_to_slot = map.vue_map.varying_to_slot,
+      .per_vertex_stride = map.per_vertex_stride,
+      .per_vertex_offset = map.per_vertex_offset,
+      .per_primitive_offset = map.per_primitive_offset,
+      .per_primitive_stride = map.per_primitive_stride,
       .per_primitive_indices_stride =
-         prog_data->map.per_primitive_indices_stride,
-      .per_primitive_byte_offsets = prog_data->map.per_primitive_offsets,
+         map.per_primitive_indices_stride,
+      .per_primitive_byte_offsets = map.per_primitive_offsets,
    };
    BRW_NIR_PASS(brw_nir_lower_outputs_to_urb_intrinsics, &cb_data);
 
@@ -1052,9 +1051,13 @@ brw_compile_mesh(const struct brw_compiler *compiler,
                    pt->key->use_efficient_64bit);
    }
 
+   const uint32_t local_size[3] = { nir->info.workgroup_size[0],
+                                    nir->info.workgroup_size[1],
+                                    nir->info.workgroup_size[2] };
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
-      .prog_data = &prog_data->base,
+      .stage = nir->info.stage,
+      .cs_local_size = local_size,
       .required_width = brw_required_dispatch_width(&nir->info),
    };
 
@@ -1097,8 +1100,15 @@ brw_compile_mesh(const struct brw_compiler *compiler,
          .compiler                = compiler,
          .compile_params          = params,
          .nir                     = shader,
+         .info = {
+            .source_hash = params->source_hash,
+            .ray_queries = ray_queries,
+            .wg = {
+               .local_size = { local_size[0], local_size[1], local_size[2] },
+            },
+         },
          .dispatch_width          = dispatch_width,
-         .needs_register_pressure = params->stats != NULL,
+         .needs_register_pressure = params->collect_register_pressure,
          .debug_enabled           = debug_enabled,
       };
       v[simd] = std::make_unique<brw_shader>(&shader_params);
@@ -1129,9 +1139,25 @@ brw_compile_mesh(const struct brw_compiler *compiler,
    }
 
    brw_shader &selected = *v[selected_simd];
-   prog_data->base.prog_mask = 1 << selected_simd;
-   prog_data->base.base.grf_used = MAX2(prog_data->base.base.grf_used,
-                                        selected.grf_used);
+   const uint8_t prog_mask = 1 << selected_simd;
+   selected.info.wg.prog_mask = prog_mask;
+   selected.info.wg.prog_spilled =
+      simd_state.spilled[selected_simd] ? prog_mask : 0;
+   selected.info.mesh.map = map;
+   selected.info.mesh.uses_drawid =
+      BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
+   selected.info.mesh.primitive_type = primitive_type;
+   selected.info.mesh.index_format = index_format;
+   selected.info.mesh.autostrip_enable = autostrip_enable;
+   if (nir->info.outputs_written &
+       (VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
+        VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1)) {
+      selected.info.mesh.clip_distance_mask =
+         BITFIELD_MASK(nir->info.clip_distance_array_size);
+      selected.info.mesh.cull_distance_mask =
+         BITFIELD_RANGE(nir->info.clip_distance_array_size,
+                        nir->info.cull_distance_array_size);
+   }
 
    if (unlikely(debug_enabled)) {
       if (params->mesh.tue_map) {
@@ -1139,33 +1165,32 @@ brw_compile_mesh(const struct brw_compiler *compiler,
          brw_print_tue_map(stderr, params->mesh.tue_map);
       }
       fprintf(stderr, "Mesh Output ");
-      brw_print_mue_map(stderr, &prog_data->map, nir);
+      brw_print_mue_map(stderr, &map, nir);
    }
 
    int8_t remap_table[VARYING_SLOT_TESS_MAX] = {};
-   if (prog_data->map.wa_18019110168_active) {
+   if (map.wa_18019110168_active) {
       memset(remap_table, -1, sizeof(remap_table));
       for (uint32_t i = 0; i < ARRAY_SIZE(wa_18019110168_mapping); i++) {
          if (wa_18019110168_mapping[i] != -1)
-            remap_table[i] = prog_data->map.vue_map.varying_to_slot[wa_18019110168_mapping[i]];
+            remap_table[i] = map.vue_map.varying_to_slot[wa_18019110168_mapping[i]];
       }
    }
 
    const brw_to_binary_params to_binary_params = {
       .compiler = compiler,
       .params = params,
-      .prog_data = &prog_data->base.base,
       .shaders = { &selected },
-      .extra_const_data = prog_data->map.wa_18019110168_active ? remap_table : NULL,
-      .extra_const_data_size = prog_data->map.wa_18019110168_active ? (unsigned)sizeof(remap_table) : 0u,
+      .extra_const_data = map.wa_18019110168_active ? remap_table : NULL,
+      .extra_const_data_size = map.wa_18019110168_active ? (unsigned)sizeof(remap_table) : 0u,
    };
-   const unsigned *assembly = brw_to_binary(&to_binary_params);
+   intel_shader_bin *bin = brw_to_binary(&to_binary_params);
 
-   if (prog_data->map.wa_18019110168_active) {
-      prog_data->wa_18019110168_mapping_offset =
-         prog_data->base.base.const_data_offset +
+   if (map.wa_18019110168_active) {
+      bin->info.mesh.wa_18019110168_mapping_offset =
+         bin->info.const_data_offset +
          align(nir->constant_data_size, 32);
    }
 
-   return assembly;
+   return bin;
 }

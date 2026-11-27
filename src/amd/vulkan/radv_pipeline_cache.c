@@ -7,6 +7,7 @@
 #include "radv_pipeline_cache.h"
 #include "util/macros.h"
 #include "util/mesa-blake3.h"
+#include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "nir.h"
 #include "nir_serialize.h"
@@ -206,6 +207,21 @@ radv_shader_create(struct radv_device *device, struct vk_pipeline_cache *cache, 
    blob_finish(&blob);
 
    return shader_obj ? container_of(shader_obj, struct radv_shader, base) : NULL;
+}
+
+void
+radv_graphics_shaders_create(struct radv_device *device, struct vk_pipeline_cache *cache, bool skip_shaders_cache,
+                             struct radv_shader **shaders, struct radv_shader_binary **binaries,
+                             struct radv_shader_debug_info *debug, struct radv_shader **gs_copy_shader,
+                             struct radv_shader_binary *gs_copy_binary, struct radv_shader_debug_info *gs_copy_debug)
+{
+   for (int i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i) {
+      struct radv_shader_binary *binary = binaries[i];
+      if (binary)
+         shaders[i] = radv_shader_create(device, cache, binary, skip_shaders_cache, &debug[i]);
+   }
+   if (gs_copy_binary)
+      *gs_copy_shader = radv_shader_create(device, cache, gs_copy_binary, skip_shaders_cache, gs_copy_debug);
 }
 
 const struct vk_pipeline_cache_object_ops radv_shader_ops = {
@@ -652,6 +668,56 @@ radv_pipeline_cache_insert_nir(const struct radv_compiler_info *compiler_info, s
       cache = compiler_info->mem_cache;
 
    vk_pipeline_cache_add_nir(cache, key, sizeof(blake3_hash), nir);
+}
+
+VkShaderStageFlags
+radv_graphics_shaders_lookup_nir(const struct radv_compiler_info *compiler_info, struct vk_pipeline_cache *cache,
+                                 struct radv_shader_stage *stages)
+{
+   VkShaderStageFlags misses = 0;
+
+   if (!compiler_info->enable_nir_cache)
+      return 0;
+
+   for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; s++) {
+      /* NIR might already have been imported from a library. */
+      if (stages[s].stage == MESA_SHADER_NONE || stages[s].nir)
+         continue;
+
+      int64_t stage_start = os_time_get_nano();
+
+      const struct radv_spirv_to_nir_options options = radv_get_graphics_spirv_to_nir_options(&stages[s]);
+      blake3_hash key;
+
+      radv_hash_graphics_spirv_to_nir(key, &stages[s], &options);
+      stages[s].nir = radv_pipeline_cache_lookup_nir(compiler_info, cache, s, key);
+      if (!stages[s].nir)
+         misses |= mesa_to_vk_shader_stage(s);
+
+      stages[s].feedback.duration += os_time_get_nano() - stage_start;
+   }
+
+   return misses;
+}
+
+void
+radv_graphics_shaders_insert_nir(const struct radv_compiler_info *compiler_info, struct vk_pipeline_cache *cache,
+                                 struct radv_shader_stage *stages, VkShaderStageFlags nir_cache_misses)
+{
+   if (!compiler_info->enable_nir_cache)
+      return;
+
+   radv_foreach_stage (s, nir_cache_misses) {
+      int64_t stage_start = os_time_get_nano();
+
+      const struct radv_spirv_to_nir_options options = radv_get_graphics_spirv_to_nir_options(&stages[s]);
+      blake3_hash key;
+
+      radv_hash_graphics_spirv_to_nir(key, &stages[s], &options);
+      radv_pipeline_cache_insert_nir(compiler_info, cache, key, stages[s].nir);
+
+      stages[s].feedback.duration += os_time_get_nano() - stage_start;
+   }
 }
 
 struct nir_shader *

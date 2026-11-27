@@ -5,13 +5,7 @@ teflon/ssdlite_mobiledet.0086,Fail
 teflon/ssdlite_mobiledet.0087,Fail
 teflon/ssdlite_mobiledet.whole,Fail
 teflon/movenet_lightning.0085,Fail
-teflon/movenet_lightning.0112,Fail
-teflon/movenet_lightning.0141,Fail
-teflon/movenet_lightning.0152,Fail
 teflon/movenet_thunder.0085,Fail
-teflon/movenet_thunder.0112,Fail
-teflon/movenet_thunder.0141,Fail
-teflon/movenet_thunder.0152,Fail
 teflon/posenet_mobilenet_v1.0000,Fail
 teflon/posenet_mobilenet_v1.0001,Fail
 teflon/posenet_mobilenet_v1.0003,Fail
@@ -125,7 +119,6 @@ teflon/deeplabv3.0042,Crash
 teflon/deeplabv3.0046,Crash
 teflon/deeplabv3.0053,Crash
 teflon/deeplabv3.0057,Crash
-teflon/deeplabv3.0060,Crash
 teflon/deeplabv3.whole,Crash
 teflon/ssd_mobilenet_v3.0016,Crash
 teflon/ssd_mobilenet_v3.0039,Crash

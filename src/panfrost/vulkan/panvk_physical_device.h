@@ -13,6 +13,7 @@
 #include "panvk_instance.h"
 #include "panvk_macros.h"
 
+#include "vk_memory.h"
 #include "vk_physical_device.h"
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
@@ -25,14 +26,6 @@ struct pan_model;
 struct pan_blendable_format;
 struct pan_format;
 struct panvk_instance;
-
-struct panvk_heap_budget {
-   uint32_t ref_count;
-   struct list_head link;
-   dev_t rdev;
-
-   alignas(8) uint64_t heap_used;
-};
 
 struct panvk_physical_device {
    struct vk_physical_device vk;
@@ -75,7 +68,7 @@ struct panvk_physical_device {
 
       uint64_t max_supported_va;
 
-      struct panvk_heap_budget *budget;
+      struct vk_memory_budget *budget;
    } memory;
 
    struct vk_sync_type drm_syncobj_type;
@@ -120,8 +113,8 @@ panvk_get_max_buffer_size(const struct panvk_physical_device *device);
 
 #ifdef PAN_ARCH
 void panvk_per_arch(get_physical_device_extensions)(
-   const struct panvk_physical_device *device,
    const struct panvk_instance *instance,
+   const struct panvk_physical_device *device,
    struct vk_device_extension_table *ext);
 
 void panvk_per_arch(get_physical_device_features)(

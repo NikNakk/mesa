@@ -381,11 +381,18 @@ init_common_queue_state(struct anv_queue *queue, struct anv_batch *batch)
    }
 #endif
 
-   /* Always use Thread Group Preemption granularity level for Media/GPGPU */
+#if GFX_VER >= 11
+   /* Bspec 11348 (for BWD, SKL), programming notes states:
+    *
+    *    "This register must not be programmed and must not be used for any
+    *    purposes."
+    *
+    * Always use Thread Group Preemption granularity level for Media/GPGPU.*/
    anv_batch_write_reg(batch, GENX(CS_CHICKEN1), cc1) {
       cc1.MediaAndGPGPUPreemptionControl = ThreadGroupPreemption;
       cc1.MediaAndGPGPUPreemptionControlMask = 0x3;
    }
+#endif
 
    state_system_mem_fence_address_emit(device, batch);
 }
@@ -542,13 +549,16 @@ init_render_queue_state(struct anv_queue *queue, bool is_companion_rcs_batch)
     * corrupted during object-level preemption. For now, restrict
     * to command buffer level preemption to avoid rendering
     * corruption.
+    *
+    * On Gfx11, preemption on 3DPRIMITIVE also intermittently drops whole
+    * draws, so disable it as on Gfx12.0.
     */
    anv_batch_write_reg(batch, GENX(CS_CHICKEN1), cc1) {
 #if GFX_VERx10 < 200
       cc1.ReplayMode = MidcmdbufferPreemption;
       cc1.ReplayModeMask = true;
 #endif
-#if GFX_VERx10 == 120
+#if GFX_VERx10 == 110 || GFX_VERx10 == 120
       cc1.DisablePreemptionandHighPriorityPausingdueto3DPRIMITIVECommand = true;
       cc1.DisablePreemptionandHighPriorityPausingdueto3DPRIMITIVECommandMask = true;
 #endif
@@ -816,6 +826,19 @@ init_render_queue_state(struct anv_queue *queue, bool is_companion_rcs_batch)
       p.RCCRHWOOptimizationDisable =
          intel_needs_workaround(device->info, 14024015672);
       p.RCCRHWOOptimizationDisableMask = true;
+   }
+#endif
+
+#if GFX_VERx10 >= 350
+   const uint32_t memory_urb_size_per_slice = intel_device_info_memory_urb_size_per_slice(device->info);
+   struct anv_address urb_memory_addr = { .bo = device->urb_memory_bo };
+
+   anv_batch_emit(batch, GENX(3DSTATE_URB_MEMORY), urb_memory) {
+      urb_memory.body.VertexMemoryURBmodeEnable = true;
+      urb_memory.body.MemoryinStolenMemoryDisable = !intel_device_info_memory_urb_is_allocated_in_stolen(device->info);
+      urb_memory.body.VertexMemoryURBsizeperslice = (memory_urb_size_per_slice / (256 * 1024)) - 1;
+      urb_memory.body.MemoryURBStartingAddress = urb_memory_addr;
+      urb_memory.body.MOCS = anv_mocs(device, urb_memory_addr.bo, 0);
    }
 #endif
 
@@ -1396,6 +1419,14 @@ genX(emit_sampler_state)(const struct anv_device *device,
 
       if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
 #if GFX_VERx10 >= 350
+         /* Apply the format swizzle when needed */
+         const union isl_color_value border_color =
+            anv_sampler_border_color_value(
+               pdevice,
+               vk_border_color_is_custom(vk_state->border_color) ?
+               vk_state->format : VK_FORMAT_UNDEFINED,
+               vk_state->border_color_value);
+
          struct GENX(SAMPLER_STATE_EXTENDED) sampler_state = {
             .SamplerDisable = false,
 
@@ -1440,10 +1471,10 @@ genX(emit_sampler_state)(const struct anv_device *device,
             vk_state->reduction_mode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE,
             .YCRCBBorderMode = YCRCBBM_PASSTHROUGH,
 
-            .BorderColorRed = vk_state->border_color_value.float32[0],
-            .BorderColorGreen = vk_state->border_color_value.float32[1],
-            .BorderColorBlue = vk_state->border_color_value.float32[2],
-            .BorderColorAlpha = vk_state->border_color_value.float32[3],
+            .BorderColorRed = border_color.f32[0],
+            .BorderColorGreen = border_color.f32[1],
+            .BorderColorBlue = border_color.f32[2],
+            .BorderColorAlpha = border_color.f32[3],
             /* Bspec 57016 (r77793) HSD 22021085527. Also refer to the names of
              * values and description in the dri option.
              */

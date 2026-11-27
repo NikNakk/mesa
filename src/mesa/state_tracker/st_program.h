@@ -47,9 +47,9 @@ extern "C" {
 
 struct st_external_sampler_key
 {
-   GLuint lower_nv12;             /**< bitmask of 2 plane YUV samplers */
-   GLuint lower_nv21;
-   GLuint lower_iyuv;             /**< bitmask of 3 plane YUV samplers */
+   GLuint lower_semi_planar;      /**< bitmask of 2 plane YUV samplers */
+   GLuint lower_semi_planar_vu;
+   GLuint lower_planar;           /**< bitmask of 3 plane YUV samplers */
    GLuint lower_xy_uxvx;          /**< bitmask of 2 plane YUV samplers */
    GLuint lower_xy_vxux;          /**< bitmask of 2 plane YUV samplers */
    GLuint lower_yx_xuxv;          /**< bitmask of 2 plane YUV samplers */
@@ -62,6 +62,7 @@ struct st_external_sampler_key
    GLuint lower_y41x;
    GLuint lower_sx10;
    GLuint lower_sx12;
+   GLuint yuv_msb_aligned;
    GLuint bt709;
    GLuint bt2020;
    GLuint yuv_full_range;
@@ -115,11 +116,18 @@ st_add_external_sampler_key(struct st_external_sampler_key *key,
       }
       FALLTHROUGH;
    case PIPE_FORMAT_NV24:
-   case PIPE_FORMAT_P010:
-   case PIPE_FORMAT_P012:
    case PIPE_FORMAT_P016:
    case PIPE_FORMAT_P030:
-      key->lower_nv12 |= (1 << unit);
+      key->lower_semi_planar |= (1 << unit);
+      break;
+   case PIPE_FORMAT_P010:
+   case PIPE_FORMAT_P012:
+      key->lower_semi_planar |= (1 << unit);
+      key->yuv_msb_aligned |= (1 << unit);
+      if (format == PIPE_FORMAT_P010)
+         key->lower_sx10 |= (1 << unit);
+      else
+         key->lower_sx12 |= (1 << unit);
       break;
    case PIPE_FORMAT_NV21:
       if (stObj->pt->format == PIPE_FORMAT_R8_B8G8_420_UNORM) {
@@ -129,7 +137,7 @@ st_add_external_sampler_key(struct st_external_sampler_key *key,
       FALLTHROUGH;
    case PIPE_FORMAT_NV61:
    case PIPE_FORMAT_NV42:
-      key->lower_nv21 |= (1 << unit);
+      key->lower_semi_planar_vu |= (1 << unit);
       break;
    case PIPE_FORMAT_NV20:
       if (stObj->pt->format == PIPE_FORMAT_R10_G10B10_422_UNORM) {
@@ -143,24 +151,24 @@ st_add_external_sampler_key(struct st_external_sampler_key *key,
          key->lower_yuv |= (1 << unit);
          break;
       }
-      key->lower_iyuv |= (1 << unit);
+      key->lower_planar |= (1 << unit);
       break;
    case PIPE_FORMAT_Y10X6_U10X6_V10X6_420_UNORM:
    case PIPE_FORMAT_Y10X6_U10X6_V10X6_422_UNORM:
    case PIPE_FORMAT_Y10X6_U10X6_V10X6_444_UNORM:
-      key->lower_iyuv |= (1 << unit);
+      key->lower_planar |= (1 << unit);
       key->lower_sx10 |= (1 << unit);
       break;
    case PIPE_FORMAT_Y12X4_U12X4_V12X4_420_UNORM:
    case PIPE_FORMAT_Y12X4_U12X4_V12X4_422_UNORM:
    case PIPE_FORMAT_Y12X4_U12X4_V12X4_444_UNORM:
-      key->lower_iyuv |= (1 << unit);
+      key->lower_planar |= (1 << unit);
       key->lower_sx12 |= (1 << unit);
       break;
    case PIPE_FORMAT_Y16_U16_V16_420_UNORM:
    case PIPE_FORMAT_Y16_U16_V16_422_UNORM:
    case PIPE_FORMAT_Y16_U16_V16_444_UNORM:
-      key->lower_iyuv |= (1 << unit);
+      key->lower_planar |= (1 << unit);
       break;
    case PIPE_FORMAT_YUYV:
       if (stObj->pt->format == PIPE_FORMAT_R8G8_R8B8_UNORM)
@@ -461,6 +469,9 @@ extern void
 st_serialize_nir(struct gl_program *stp);
 void
 st_serialize_base_nir(struct gl_program *prog, struct nir_shader *nir);
+
+void
+st_serialize_raster_pos_nir(struct gl_program *prog, struct nir_shader *nir);
 
 extern char *
 st_finalize_program(struct st_context *st, struct gl_program *prog,

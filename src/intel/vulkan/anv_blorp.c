@@ -27,7 +27,8 @@
 static bool
 lookup_blorp_shader(struct blorp_batch *batch,
                     const void *key, uint32_t key_size,
-                    uint64_t *kernel_out, void *prog_data_out)
+                    uint64_t *kernel_out, void *prog_data_out,
+                    const struct intel_shader_info **info_out)
 {
    struct blorp_context *blorp = batch->blorp;
    struct anv_device *device = blorp->driver_ctx;
@@ -44,7 +45,9 @@ lookup_blorp_shader(struct blorp_batch *batch,
    anv_shader_internal_unref(device, bin);
 
    *kernel_out = anv_shader_get_pointer(device, &bin->kernel);
-   *(const struct brw_stage_prog_data **)prog_data_out = bin->prog_data;
+   *(const void **)prog_data_out = NULL;
+   if (info_out)
+      *info_out = &bin->bin->info;
 
    return true;
 }
@@ -52,10 +55,12 @@ lookup_blorp_shader(struct blorp_batch *batch,
 static bool
 upload_blorp_shader(struct blorp_batch *batch, uint32_t stage,
                     const void *key, uint32_t key_size,
-                    const void *kernel, uint32_t kernel_size,
-                    const void *prog_data,
-                    uint32_t prog_data_size,
-                    uint64_t *kernel_out, void *prog_data_out)
+                    UNUSED const void *kernel, UNUSED uint32_t kernel_size,
+                    UNUSED const void *prog_data,
+                    UNUSED uint32_t prog_data_size,
+                    const intel_shader_bin *src_bin,
+                    uint64_t *kernel_out, void *prog_data_out,
+                    const struct intel_shader_info **info_out)
 {
    struct blorp_context *blorp = batch->blorp;
    struct anv_device *device = blorp->driver_ctx;
@@ -66,10 +71,7 @@ upload_blorp_shader(struct blorp_batch *batch, uint32_t stage,
       .stage               = stage,
       .key_data            = key,
       .key_size            = key_size,
-      .kernel_data         = kernel,
-      .kernel_size         = kernel_size,
-      .prog_data           = prog_data,
-      .prog_data_size      = prog_data_size,
+      .bin                 = src_bin,
       .bind_map            = &empty_bind_map,
       .push_desc_info      = &empty_push_desc_info,
    };
@@ -86,7 +88,9 @@ upload_blorp_shader(struct blorp_batch *batch, uint32_t stage,
    anv_shader_internal_unref(device, bin);
 
    *kernel_out = anv_shader_get_pointer(device, &bin->kernel);
-   *(const struct brw_stage_prog_data **)prog_data_out = bin->prog_data;
+   *(const void **)prog_data_out = NULL;
+   if (info_out)
+      *info_out = &bin->bin->info;
 
    return true;
 }
@@ -1408,6 +1412,9 @@ void anv_CmdUpdateMemoryKHR(
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
 
+   if (pDstRange->size == 0)
+      return;
+
    anv_cmd_buffer_update_addr(cmd_buffer,
                               anv_address_from_range_flags(*pDstRange, dstFlags),
                               pDstRange->size, pData);
@@ -1483,6 +1490,9 @@ void anv_CmdFillMemoryKHR(
     uint32_t                                    data)
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   if (pDstRange->size == 0)
+      return;
 
    anv_cmd_buffer_fill_area(cmd_buffer,
                             anv_address_from_range_flags(*pDstRange, dstFlags),
@@ -2659,7 +2669,8 @@ resolve_image(struct anv_cmd_buffer *cmd_buffer,
    anv_foreach_image_aspect_bit(aspect_bit, src_image,
                                 region->srcSubresource.aspectMask) {
       const VkImageAspectFlags aspect = (1 << aspect_bit);
-      const uint32_t plane = anv_image_aspect_to_plane(src_image, aspect);
+      const uint32_t src_plane = anv_image_aspect_to_plane(src_image, aspect);
+      const uint32_t dst_plane = anv_image_aspect_to_plane(dst_image, aspect);
 
       enum isl_aux_usage src_aux_usage =
          anv_layout_to_aux_usage(cmd_buffer->device->info, src_image,
@@ -2680,8 +2691,8 @@ resolve_image(struct anv_cmd_buffer *cmd_buffer,
          vk_to_blorp_resolve_mode(res_info->resolveMode) :
          BLORP_FILTER_NONE;
 
-      enum isl_format src_format = src_image->planes[plane].primary_surface.isl.format;
-      enum isl_format dst_format = dst_image->planes[plane].primary_surface.isl.format;
+      enum isl_format src_format = src_image->planes[src_plane].primary_surface.isl.format;
+      enum isl_format dst_format = dst_image->planes[dst_plane].primary_surface.isl.format;
       if (skip_srgb_decode) {
          src_format = isl_format_srgb_to_linear(src_format);
          dst_format = isl_format_srgb_to_linear(dst_format);

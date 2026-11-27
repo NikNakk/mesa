@@ -11,6 +11,7 @@ use compiler::memstream::MemStream;
 use kraid_bindings::*;
 
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::sync::OnceLock;
 
 fn nir_opts(arch: u8, merge_wg: bool) -> nir_shader_compiler_options {
@@ -139,6 +140,32 @@ fn dynarray_append_vec<T: Copy>(buf: &mut util_dynarray, vec: Vec<T>) {
     }
 }
 
+pub fn stage_from_nir(
+    stage: mesa_shader_stage,
+    is_blend: bool,
+    idvs: u32,
+) -> ShaderStage {
+    match stage {
+        MESA_SHADER_COMPUTE => ShaderStage::Compute,
+        MESA_SHADER_KERNEL => ShaderStage::Compute,
+        MESA_SHADER_VERTEX => match idvs {
+            KRAID_IDVS_POSITION => ShaderStage::IdvsPosition,
+            KRAID_IDVS_VARYING => ShaderStage::IdvsVarying,
+            KRAID_IDVS_ALL | KRAID_IDVS_NONE => ShaderStage::Vertex,
+            _ => panic!("Unknown IDVS variant {idvs}"),
+        },
+        MESA_SHADER_FRAGMENT if is_blend => ShaderStage::Blend,
+        MESA_SHADER_FRAGMENT => ShaderStage::Fragment,
+        _ => {
+            let name = unsafe {
+                CStr::from_ptr(_mesa_shader_stage_to_string(stage as u32))
+            };
+            let name = name.to_str().unwrap_or("Invalid name");
+            panic!("Unknown shader stage {name}");
+        }
+    }
+}
+
 fn write_back_info(
     model: &dyn Model,
     src: &ShaderInfo,
@@ -217,6 +244,7 @@ fn encode_no_psiz_variant(
     info.__bindgen_anon_1.vs.no_psiz_offset = binary.size;
     // Find the store with is_psiz set
     let store = s
+        .entrypoint_mut()
         .blocks
         .iter_mut()
         .rev()
@@ -266,7 +294,8 @@ pub extern "C" fn kraid_compile_nir(
         eprint!("{}", nir.to_string().unwrap());
     }
 
-    let mut s = Shader::from_nir(model.as_ref(), nir, inputs);
+    let stage = stage_from_nir(nir.info.stage(), inputs.is_blend, idvs);
+    let mut s = Shader::from_nir(model.as_ref(), nir, stage);
     s.run_pass("after translation from NIR", |_| {});
 
     pass!(s.remat_constants());
@@ -303,7 +332,9 @@ pub extern "C" fn kraid_compile_nir(
     // These have to happen last since we can't remove any instructions after
     // they've completed.
     pass!(s.assign_message_slots());
-    pass!(s.insert_required_waits());
+    if stage == ShaderStage::Fragment {
+        pass!(s.insert_required_waits());
+    }
     pass!(s.mark_reconvergence());
     pass!(s.opt_flow());
 

@@ -24,7 +24,7 @@ set -x
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
 DEQP_MAIN_COMMIT=634a3fc62d82c34de68c3b1add25e6b7f5777524
-DEQP_VK_VERSION=1.4.7.0
+DEQP_VK_VERSION=1.4.7.1
 DEQP_GL_VERSION=4.6.8.1
 DEQP_GLES_VERSION=3.2.14.1
 
@@ -48,8 +48,12 @@ main_cts_patch_files=(
 
 # shellcheck disable=SC2034
 vk_cts_commits_to_backport=(
-  # Add default Platform constructor and restore createPlatform() for Android
-  c60ca01d5bd437e610c9bf20c732fe0e923d3d43
+  # Fix missing depth barrier in early_fragment sample count tests
+  4be0860ba5adbdb6aa06a3921a33d3b89a527f09
+  # Ignore padding bits when verifying packed format copies
+  4c48fad37aaae27bbe25d40ce987575991bc1223
+  # Improve run time of reconvergence tests
+  124a7d9e4417da60f7134c097c151377580ed53e
 )
 
 # shellcheck disable=SC2034
@@ -198,13 +202,16 @@ done
 # always goes through ssh or https.
 python3 external/fetch_sources.py --insecure
 
-case "${DEQP_API}" in
-  VK-main)
-    # Video tests rely on external files
-    python3 external/fetch_video_decode_samples.py
-    python3 external/fetch_video_encode_samples.py
-    ;;
-esac
+EXTRA_CMAKE_ARGS="${EXTRA_CMAKE_ARGS:-}"
+
+# Only build Vulkan Video tests for x86_64
+if [ "${DEBIAN_ARCH}" = "amd64" ]; then
+  # Video tests rely on external files
+  python3 external/fetch_video_decode_samples.py
+  python3 external/fetch_video_encode_samples.py
+else
+  EXTRA_CMAKE_ARGS+=" -DDEQP_DISABLE_VK_VIDEO_TESTS=ON"
+fi
 
 if [[ "$DEQP_API" = tools ]]; then
   # Save the testlog stylesheets:

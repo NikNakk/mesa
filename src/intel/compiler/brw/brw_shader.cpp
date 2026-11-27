@@ -24,11 +24,10 @@
 void
 brw_assign_urb_setup(brw_shader &s)
 {
-   struct brw_vue_prog_data *vue_prog_data = brw_vue_prog_data(s.prog_data);
    const unsigned verts =
       s.stage == MESA_SHADER_GEOMETRY ? s.nir->info.gs.vertices_in : 1;
 
-   s.first_non_payload_grf += 8 * vue_prog_data->urb_read_length * verts;
+   s.first_non_payload_grf += 8 * s.info.vue.urb_read_length * verts;
 
    /* Rewrite all ATTR file references to HW_REGs. */
    foreach_block_and_inst(block, brw_inst, inst, s.cfg) {
@@ -155,9 +154,9 @@ brw_shader::brw_shader(const brw_shader_params *params)
      mem_ctx(params->compile_params->mem_ctx),
      cfg(NULL),
      stage(params->nir->info.stage),
+     info(params->info),
      debug_enabled(params->debug_enabled),
      key(params->compile_params->key),
-     prog_data(params->compile_params->prog_data),
      live_analysis(this),
      regpressure_analysis(this),
      performance_analysis(this),
@@ -167,8 +166,31 @@ brw_shader::brw_shader(const brw_shader_params *params)
      needs_register_pressure(params->needs_register_pressure),
      dispatch_width(params->dispatch_width),
      max_polygons(params->num_polygons),
+     uses_btd_stack_ids(params->compile_params->cs.uses_btd_stack_ids),
      api_subgroup_size(brw_nir_api_subgroup_size(params->nir, dispatch_width))
 {
+   info.stage = stage;
+   info.push_layout = params->compile_params->push_layout;
+   info.total_shared = params->nir->info.shared_size;
+
+   switch (stage) {
+   case MESA_SHADER_VERTEX:
+   case MESA_SHADER_TESS_EVAL:
+   case MESA_SHADER_GEOMETRY:
+      if (nir->info.outputs_written &
+          (VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 |
+           VARYING_BIT_CULL_DIST0 | VARYING_BIT_CULL_DIST1)) {
+         info.vue.clip_distance_mask =
+            BITFIELD_MASK(nir->info.clip_distance_array_size);
+         info.vue.cull_distance_mask =
+            BITFIELD_RANGE(nir->info.clip_distance_array_size,
+                           nir->info.cull_distance_array_size);
+      }
+      break;
+   default:
+      break;
+   }
+
    assert(api_subgroup_size == 0 ||
          api_subgroup_size == 8 ||
          api_subgroup_size == 16 ||
@@ -186,7 +208,6 @@ brw_shader::brw_shader(const brw_shader_params *params)
    memset(&this->shader_stats, 0, sizeof(this->shader_stats));
 
    this->seen_rt_write = false;
-   this->grf_used = 0;
    this->spilled_any_registers = false;
    this->start_offset = 0;
 
@@ -315,12 +336,14 @@ brw_shader::mark_last_urb_write_with_eot()
 void
 brw_shader::assign_curb_setup()
 {
+   const intel_push_layout &push_layout = compile_params->push_layout;
+
    uint32_t ranges_start[4];
    this->push_data_size = 0;
    for (uint32_t i = 0; i < 4; i++) {
       ranges_start[i] = this->push_data_size / REG_SIZE;
-      assert(prog_data->push_sizes[i] == align(prog_data->push_sizes[i], REG_SIZE));
-      this->push_data_size += prog_data->push_sizes[i];
+      assert(push_layout.push_sizes[i] == align(push_layout.push_sizes[i], REG_SIZE));
+      this->push_data_size += push_layout.push_sizes[i];
    }
 
    /* Map the offsets in the UNIFORM file to fixed HW regs. */
@@ -357,7 +380,7 @@ brw_shader::assign_curb_setup()
       }
    }
 
-   if (prog_data->robust_ubo_ranges) {
+   if (push_layout.robust_ubo_ranges) {
       brw_builder ubld = brw_builder(this, 8).exec_all().at_start(cfg->first_block());
       /* At most we can write 2 GRFs (HW limit), the SIMD width matching the
        * HW generation depends on the size of the physical register.
@@ -366,7 +389,7 @@ brw_shader::assign_curb_setup()
       assert(max_grf_writes <= 4);
 
       /* push_reg_mask_param is in 32-bit units */
-      unsigned mask_param = prog_data->push_reg_mask_param;
+      unsigned mask_param = push_layout.push_reg_mask_param;
       brw_reg mask = retype(brw_vec1_grf(payload().num_regs + mask_param / 8,
                                          mask_param % 8), BRW_TYPE_UB);
 
@@ -377,9 +400,9 @@ brw_shader::assign_curb_setup()
       if (max_grf_writes > 2)
          ubld.group(16, 0).ADD(horiz_offset(offset_base, 16), offset_base, brw_imm_uw(16));
 
-      u_foreach_bit(i, prog_data->robust_ubo_ranges) {
+      u_foreach_bit(i, push_layout.robust_ubo_ranges) {
          const unsigned range_length =
-            DIV_ROUND_UP(prog_data->push_sizes[i], REG_SIZE);
+            DIV_ROUND_UP(push_layout.push_sizes[i], REG_SIZE);
 
          const unsigned range_start = ranges_start[i];
          uint64_t want_zero = (used >> range_start) & BITFIELD64_MASK(range_length);
@@ -481,7 +504,7 @@ brw_shader::assign_curb_setup()
  * on each upload.
  */
 void
-brw_compute_urb_setup_index(struct brw_fs_prog_data *fs_prog_data)
+brw_compute_urb_setup_index(struct intel_shader_info *info)
 {
    /* TODO(mesh): Review usage of this in the context of Mesh, we may want to
     * skip per-primitive attributes here.
@@ -491,11 +514,11 @@ brw_compute_urb_setup_index(struct brw_fs_prog_data *fs_prog_data)
    STATIC_ASSERT(VARYING_SLOT_MAX <= 0xff);
    uint8_t index = 0;
    for (uint8_t attr = 0; attr < VARYING_SLOT_MAX; attr++) {
-      if (fs_prog_data->urb_setup[attr] >= 0) {
-         fs_prog_data->urb_setup_attribs[index++] = attr;
+      if (info->fs.urb_setup[attr] >= 0) {
+         info->fs.urb_setup_attribs[index++] = attr;
       }
    }
-   fs_prog_data->urb_setup_attribs_count = index;
+   info->fs.urb_setup_attribs_count = index;
 }
 
 void
@@ -543,11 +566,11 @@ brw_shader::convert_attr_sources_to_hw_regs(brw_inst *inst)
 
 uint32_t
 brw_fb_write_msg_control(const brw_inst *inst,
-                         const struct brw_fs_prog_data *prog_data)
+                         const struct intel_shader_info *info)
 {
    uint32_t mctl;
 
-   if (prog_data->dual_src_blend) {
+   if (info->fs.dual_src_blend) {
       assert(inst->exec_size < 32);
 
       if (inst->group % 16 == 0)
@@ -847,7 +870,7 @@ brw_allocate_registers(brw_shader &s, bool allow_spilling)
 
       if (OPT(brw_opt_cmp_flag_destination,
                /* We want something like
-                * brw_wm_prog_data(s.prog_data)->uses_kill, but there are
+                * s.info.fs.uses_kill, but there are
                 * other things that can cause the sample_mask_flag_subreg to
                 * be used.
                 */
@@ -917,7 +940,7 @@ brw_allocate_registers(brw_shader &s, bool allow_spilling)
    OPT(brw_opt_cmod_propagation);
 
    if (OPT(brw_opt_cmp_flag_destination,
-           /* We want something like brw_wm_prog_data(s.prog_data)->uses_kill,
+           /* We want something like s.info.fs.uses_kill,
             * but there are other things that can cause the
             * sample_mask_flag_subreg to be used.
             */
@@ -945,12 +968,7 @@ brw_allocate_registers(brw_shader &s, bool allow_spilling)
        * Thread Group Tracking > Local Memory/Scratch Space.
        */
       if (s.last_scratch <= devinfo->max_scratch_size_per_thread) {
-         /* Take the max of any previously compiled variant of the shader. In the
-          * case of bindless shaders with return parts, this will also take the
-          * max of all parts.
-          */
-         s.prog_data->total_scratch = MAX2(brw_get_scratch_size(s.last_scratch),
-                                           s.prog_data->total_scratch);
+         s.info.total_scratch = brw_get_scratch_size(s.last_scratch);
       } else {
          s.fail("Scratch space required is larger than supported");
       }
@@ -982,50 +1000,49 @@ brw_pass_tracker_archive(brw_pass_tracker *pt, const char *pass_name)
 #endif
 
 unsigned
-brw_cs_push_const_total_size(const struct brw_cs_prog_data *cs_prog_data,
+brw_cs_push_const_total_size(const struct intel_shader_info *info,
                              unsigned threads)
 {
-   assert(cs_prog_data->push.per_thread.size % REG_SIZE == 0);
-   assert(cs_prog_data->push.cross_thread.size % REG_SIZE == 0);
-   return cs_prog_data->push.per_thread.size * threads +
-          cs_prog_data->push.cross_thread.size;
+   assert(info->cs.push.per_thread.size % REG_SIZE == 0);
+   assert(info->cs.push.cross_thread.size % REG_SIZE == 0);
+   return info->cs.push.per_thread.size * threads +
+          info->cs.push.cross_thread.size;
 }
 
 struct intel_cs_dispatch_info
 brw_cs_get_dispatch_info(const struct intel_device_info *devinfo,
-                         const struct brw_cs_prog_data *prog_data,
+                         const struct intel_shader_info *info,
                          const unsigned *override_local_size)
 {
-   struct intel_cs_dispatch_info info = {};
+   struct intel_cs_dispatch_info dispatch = {};
 
    const unsigned *sizes =
-      override_local_size ? override_local_size :
-                            prog_data->local_size;
+      override_local_size ? override_local_size : info->wg.local_size;
 
    int simd = -1;
-   if (prog_data->base.is_jay) {
+   if (info->is_jay) {
       /* Currently Jay compiles only a single binary, just select that. In the
        * future this needs to get smarter.
        */
-      assert(util_is_power_of_two_nonzero(prog_data->prog_mask));
-      simd = util_logbase2(prog_data->prog_mask);
+      assert(util_is_power_of_two_nonzero(info->wg.prog_mask));
+      simd = util_logbase2(info->wg.prog_mask);
    } else {
-      simd = brw_simd_select_for_workgroup_size(devinfo, prog_data, sizes);
+      simd = brw_simd_select_for_workgroup_size(devinfo, info, sizes);
    }
 
    assert(simd >= 0 && simd < 3);
 
-   info.group_size = sizes[0] * sizes[1] * sizes[2];
-   info.simd_size = 8u << simd;
-   info.threads = DIV_ROUND_UP(info.group_size, info.simd_size);
+   dispatch.group_size = sizes[0] * sizes[1] * sizes[2];
+   dispatch.simd_size = 8u << simd;
+   dispatch.threads = DIV_ROUND_UP(dispatch.group_size, dispatch.simd_size);
 
-   const uint32_t remainder = info.group_size & (info.simd_size - 1);
+   const uint32_t remainder = dispatch.group_size & (dispatch.simd_size - 1);
    if (remainder > 0)
-      info.right_mask = ~0u >> (32 - remainder);
+      dispatch.right_mask = ~0u >> (32 - remainder);
    else
-      info.right_mask = ~0u >> (32 - info.simd_size);
+      dispatch.right_mask = ~0u >> (32 - dispatch.simd_size);
 
-   return info;
+   return dispatch;
 }
 
 void
@@ -1077,14 +1094,13 @@ brw_allocate_vgrf_units(brw_shader &s, unsigned units_of_REGSIZE)
    return brw_vgrf(brw_allocate_vgrf_number(s, units_of_REGSIZE), BRW_TYPE_UD);
 }
 
-const unsigned *
+intel_shader_bin *
 brw_compile(const struct brw_compiler *compiler,
             struct brw_compile_params *params)
 {
    assert(params);
    assert(params->nir);
    assert(params->key);
-   assert(params->prog_data);
 
    switch (params->nir->info.stage) {
    case MESA_SHADER_VERTEX:
@@ -1115,18 +1131,6 @@ brw_compile(const struct brw_compiler *compiler,
       UNREACHABLE("Unsupported shader stage");
       return NULL;
    }
-}
-
-void brw_prog_data_init(struct brw_stage_prog_data *prog_data,
-                        const struct brw_compile_params *params)
-{
-   /* Do not memset the structure to 0, the driver might have put some bits of
-    * information in there.
-    */
-   prog_data->ray_queries = params->nir->info.ray_queries;
-   prog_data->stage = params->nir->info.stage;
-   prog_data->total_scratch = 0;
-   prog_data->total_shared = params->nir->info.shared_size;
 }
 
 brw_reg

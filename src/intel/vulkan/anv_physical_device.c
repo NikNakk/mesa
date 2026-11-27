@@ -33,9 +33,6 @@
 
 #include "vk_android.h"
 
-static simple_mtx_t physical_budgets_mutex = SIMPLE_MTX_INITIALIZER;
-static struct list_head physical_budgets = {&physical_budgets, &physical_budgets};
-
 static void
 anv_drirc_shader_cb(const void *hash_data,
                     uint32_t hash_size,
@@ -43,8 +40,8 @@ anv_drirc_shader_cb(const void *hash_data,
                     const driOptionValue *value,
                     void *shaderOptionCallbackData)
 {
-   /* Should always be 8 bytes or more. Our compiler prog_data only holds the
-    * first 64bits, so just use that for the hash table.
+   /* Should always be 8 bytes or more. The intel_shader_info source_hash only
+    * holds the first 64bits, so just use that for the hash table.
     */
    assert(hash_size >= 8);
    uint64_t shader_hash = ((uint64_t *)hash_data)[0];
@@ -210,49 +207,6 @@ anv_physical_device_finish_drirc(struct anv_physical_device *device)
          vk_free(&device->instance->vk.alloc, entry.data);
       _mesa_hash_table_u64_destroy(device->shader_workarounds);
    }
-}
-
-static struct anv_memory_budget *
-get_physical_device_budget(int64_t local_major, int64_t local_minor)
-{
-   struct anv_memory_budget *budget = NULL;
-
-   simple_mtx_lock(&physical_budgets_mutex);
-
-   list_for_each_entry(struct anv_memory_budget, b, &physical_budgets, link) {
-      if (b->local_major == local_major &&
-          b->local_minor == local_minor) {
-         budget = b;
-         break;
-      }
-   }
-
-   if (budget == NULL) {
-      budget = calloc(1, sizeof(struct anv_memory_budget));
-      budget->ref_count = 1;
-      budget->local_major = local_major;
-      budget->local_minor = local_minor;
-      list_addtail(&budget->link, &physical_budgets);
-   } else {
-      budget->ref_count++;
-   }
-
-   simple_mtx_unlock(&physical_budgets_mutex);
-
-   return budget;
-}
-
-static void
-release_physical_device_budget(struct anv_memory_budget *budget)
-{
-   simple_mtx_lock(&physical_budgets_mutex);
-
-   if (--budget->ref_count == 0) {
-      list_del(&budget->link);
-      free(budget);
-   }
-
-   simple_mtx_unlock(&physical_budgets_mutex);
 }
 
 /* This is probably far to big but it reflects the max size used for messages
@@ -426,6 +380,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_maintenance9                      = true,
       .KHR_maintenance10                     = true,
       .KHR_maintenance11                     = true,
+      .KHR_maintenance12                     = true,
       .KHR_map_memory2                       = true,
       .KHR_multiview                         = true,
       .KHR_performance_query =
@@ -501,6 +456,8 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_video_encode_h264                 = VIDEO_CODEC_H264ENC && video_encode_enabled,
       .KHR_video_encode_h265                 = device->info.ver >= 12 && VIDEO_CODEC_H265ENC && video_encode_enabled,
       .KHR_video_encode_av1                  = device->info.verx10 == 125 && VIDEO_CODEC_AV1ENC && video_encode_enabled,
+      .KHR_video_encode_intra_refresh        = device->info.ver >= 12 && video_encode_enabled &&
+                                               (VIDEO_CODEC_H264ENC || VIDEO_CODEC_H265ENC),
       .KHR_video_maintenance1                = (video_decode_enabled &&
                                                (VIDEO_CODEC_H264DEC || VIDEO_CODEC_H265DEC)) ||
                                                (video_encode_enabled &&
@@ -1194,6 +1151,9 @@ get_features(const struct anv_physical_device *pdevice,
       /* VK_KHR_video_encode_av1 */
       .videoEncodeAV1 = true,
 
+      /* VK_KHR_video_encode_intra_refresh */
+      .videoEncodeIntraRefresh = true,
+
       /* VK_EXT_image_compression_control */
       .imageCompressionControl = pdevice->expose_compression_control,
 
@@ -1300,6 +1260,9 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_maintenance11 */
       .maintenance11 = true,
+
+      /* VK_KHR_maintenance12 */
+      .maintenance12 = true,
 
       /* VK_KHR_device_address_commands */
       .deviceAddressCommands = true,
@@ -1881,6 +1844,11 @@ get_properties(const struct anv_physical_device *pdevice,
       props->rgba4OpaqueBlackSwizzled = true;
       props->resolveSrgbFormatAppliesTransferFunction = true;
       props->resolveSrgbFormatSupportsTransferFunctionControl = true;
+   }
+
+   /* VK_KHR_maintenance12 */
+   {
+      props->maxInputAttachmentIndex = MAX_DESCRIPTOR_SET_INPUT_ATTACHMENTS - 1;
    }
 
    /* VK_KHR_performance_query */
@@ -3332,8 +3300,12 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    get_features(device, &device->vk.supported_features);
    get_properties(device, &device->vk.properties);
 
-   device->memory.heaps_budget =
-      get_physical_device_budget(device->local_major, device->local_minor);
+   device->memory.heaps_budget = vk_memory_budget_acquire(
+      makedev(device->local_major, device->local_minor));
+   if (!device->memory.heaps_budget) {
+      result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_perf;
+   }
 
    result = anv_init_wsi(device);
    if (result != VK_SUCCESS)
@@ -3349,7 +3321,7 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    return VK_SUCCESS;
 
 fail_perf:
-   release_physical_device_budget(device->memory.heaps_budget);
+   vk_memory_budget_release(device->memory.heaps_budget);
    intel_perf_free(device->perf);
    free(device->engine_info);
    anv_physical_device_free_disk_cache(device);
@@ -3380,7 +3352,7 @@ anv_physical_device_destroy(struct vk_physical_device *vk_device)
    free(device->engine_info);
    anv_physical_device_free_disk_cache(device);
    ralloc_free(device->compiler);
-   release_physical_device_budget(device->memory.heaps_budget);
+   vk_memory_budget_release(device->memory.heaps_budget);
    intel_perf_free(device->perf);
    anv_physical_device_finish_drirc(device);
    intel_virtio_unref_fd(device->local_fd);
@@ -3561,7 +3533,7 @@ anv_get_memory_budget(VkPhysicalDevice physicalDevice,
    for (size_t i = 0; i < device->memory.heap_count; i++) {
       VkDeviceSize heap_size = device->memory.heaps[i].size;
       VkDeviceSize heap_used =
-         p_atomic_read(&device->memory.heaps_budget->used[i]);
+         vk_memory_budget_used(device->memory.heaps_budget, i);
       VkDeviceSize heap_budget, total_heaps_size;
       uint64_t mem_available = 0;
 

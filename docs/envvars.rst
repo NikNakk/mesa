@@ -445,6 +445,9 @@ Core Mesa environment variables
       * - ``ctxroll``
         - Context rolls
         - ``RADV``
+      * - ``rdp``
+        - Radeon Developer Panel connection. Implicitly enables ``rgp``.
+        - ``RADV``
 
    - Creating RMV captures requires the ``scripts/setup.sh`` script in the
      Radeon Developer Tools folder to be run beforehand
@@ -1327,6 +1330,8 @@ Rusticl environment variables
    - ``perfspam`` same as perf, but doesn't skip same warnings
    - ``program`` dumps compilation logs to stderr
    - ``sync`` waits on the GPU to complete after every event
+   - ``untyped_pointers`` enables support for SPV_KHR_untyped_pointers
+   - ``use_llvm_spirv_target`` uses the LLVM SPIR-V target instead of the SPIRV-LLVM-Translator
    - ``validate`` validates any internally generated SPIR-Vs, e.g. through compiling OpenCL C code
 
 .. envvar:: RUSTICL_MAX_WORK_GROUPS
@@ -2027,6 +2032,14 @@ RadeonSI driver environment variables
       Disable all optimizations.
    ``ibcachesflush``
       Flush all caches at the beginning of IBs.
+   ``bo_history``
+      Logs BO VA operations and CS flushes.
+   ``bo_all``
+      Always add all BOs to CS. Useful to debug VM FAULT issues.
+   ``nodma``
+      Disable SDMA-copy for DRI_PRIME.
+   ``nocompute``
+      Disable compute queues use.
 
 r600 driver environment variables
 ---------------------------------

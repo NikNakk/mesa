@@ -1545,8 +1545,11 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
    syncobj_dependencies_list[num_syncobj_dependencies - 1] = aws->vm_timeline_syncobj;
    syncobj_dependencies_points[num_syncobj_dependencies - 1] = vm_timeline_point;
 
-   /* Syncobj signals. Adding 1 for cs submission fence. */
-   unsigned num_syncobj_to_signal = csc->syncobj_to_signal.num + 1;
+   /* Syncobj signals. Adding 1 for cs submission fence (has to fit in a 16bit uint) */
+   if (csc->syncobj_to_signal.num > UINT16_MAX - 1)
+      return -EINVAL;
+
+   uint16_t num_syncobj_to_signal = csc->syncobj_to_signal.num + 1;
    uint32_t *syncobj_signal_list =
       (uint32_t*)alloca(num_syncobj_to_signal * sizeof(uint32_t));
    uint64_t *syncobj_signal_points =
@@ -1993,9 +1996,8 @@ static void amdgpu_cs_submit_ib(void *job, void *gdata, int thread_index)
    }
    simple_mtx_unlock(&aws->bo_fence_lock);
 
-#if MESA_DEBUG
    /* Prepare the buffer list. */
-   if (aws->debug_all_bos) {
+   if (unlikely(aws->debug_all_bos)) {
       /* The buffer list contains all buffers. This is a slow path that
        * ensures that no buffer is missing in the BO list.
        */
@@ -2022,7 +2024,6 @@ static void amdgpu_cs_submit_ib(void *job, void *gdata, int thread_index)
       }
       simple_mtx_unlock(&aws->global_bo_list_lock);
    }
-#endif
 
    if (acs->ip_type == AMD_IP_GFX && queue_type != USERQ)
       aws->gfx_bo_list_counter += num_submit_real_buffers;
@@ -2121,6 +2122,17 @@ static void amdgpu_cs_submit_ib(void *job, void *gdata, int thread_index)
    }
 
    amdgpu_cs_context_cleanup(aws, csc);
+
+   if (aws->bo_history_logfile && queue_type != USERQ) {
+      const uint64_t timestamp = os_time_get_nano();
+      fprintf(aws->bo_history_logfile, "ts=%llu, ctx=%u ip=%u, seqno=%" PRIu64 ", BOs=",
+              (long long) timestamp, acs->ctx->ctx_handle, acs->ip_type, seq_no);
+      for (unsigned i = 0; i < num_submit_real_buffers; i++) {
+         fprintf(aws->bo_history_logfile, "h=%u ", bo_list[i].bo_handle);
+      }
+      fprintf(aws->bo_history_logfile, "\n");
+      fflush(aws->bo_history_logfile);
+   }
 }
 
 /* Make sure the previous submission is completed. */

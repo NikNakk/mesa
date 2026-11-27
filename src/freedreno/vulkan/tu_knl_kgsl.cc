@@ -1075,7 +1075,8 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs, 
    struct u_vector poll_fds = { 0 };
    uint32_t lowest_timestamp = 0;
 
-   if (convert_ts_to_fd || num_fds > 0)
+   const bool use_poll = convert_ts_to_fd || num_fds > 0;
+   if (use_poll)
       u_vector_init(&poll_fds, 4, sizeof(struct pollfd));
 
    uint32_t owned_fds = 0;
@@ -1121,7 +1122,7 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs, 
       }
    }
 
-   if (u_vector_length(&poll_fds) == 0) {
+   if (!use_poll) {
       result = wait_timestamp_safe(device, queue->msm_queue_id, lowest_timestamp, MIN2(abs_timeout_ns, INT64_MAX));
    } else {
       int ret, i;
@@ -1650,7 +1651,7 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
    if (u_trace_submission_data) {
       mtx_lock(&queue->device->kgsl_profiling_mutex);
       result =
-         tu_suballoc_bo_alloc(&u_trace_submission_data->kgsl_timestamp_bo, &queue->device->kgsl_profiling_suballoc,
+         tu_suballoc_bo_alloc(&u_trace_submission_data->kgsl.timestamp_bo, &queue->device->kgsl_profiling_suballoc,
                               sizeof(struct kgsl_cmdbatch_profiling_buffer), 4);
       mtx_unlock(&queue->device->kgsl_profiling_mutex);
       if (result != VK_SUCCESS) {
@@ -1663,7 +1664,7 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
 
    struct kgsl_cmdbatch_profiling_buffer *profiling_buffer = NULL;
    if (u_trace_submission_data) {
-      struct tu_suballoc_bo *bo = &u_trace_submission_data->kgsl_timestamp_bo;
+      struct tu_suballoc_bo *bo = &u_trace_submission_data->kgsl.timestamp_bo;
 
       profile_obj = (struct kgsl_command_object) {
          .offset = bo->iova - bo->bo->iova,
@@ -1710,7 +1711,19 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
 
    int ret;
    uint32_t timestamp = 0;
-   uint64_t gpu_offset = 0;
+
+   if (u_trace_submission_data) {
+      struct timespec realtime = {};
+      clock_gettime(CLOCK_REALTIME, &realtime);
+
+      struct timespec boottime = {};
+      clock_gettime(CLOCK_BOOTTIME, &boottime);
+
+      u_trace_submission_data->kgsl.submit = {
+         .realtime_ns = timespec_to_nsec(&realtime),
+         .boottime_ns = timespec_to_nsec(&boottime),
+      };
+   }
 
    if (submit->bind_cmds.size == 0) {
       struct kgsl_gpu_command req = {
@@ -1789,32 +1802,8 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
 #if HAVE_PERFETTO
    if (profiling_buffer) {
       struct tu_perfetto_clocks clocks = { 0 };
-      /* We need to wait for KGSL to queue the GPU command before we can read
-       * the timestamp. Since this is just for profiling and doesn't take too
-       * long, we can just busy-wait for it.
-       */
-      while (p_atomic_read(&profiling_buffer->gpu_ticks_queued) == 0);
-
-      struct kgsl_perfcounter_read_group perf = {
-         .groupid = KGSL_PERFCOUNTER_GROUP_ALWAYSON,
-         .countable = 0,
-         .value = 0
-      };
-      struct kgsl_perfcounter_read req = {
-         .reads = &perf,
-         .count = 1,
-      };
-      if (safe_ioctl(queue->device->fd, IOCTL_KGSL_PERFCOUNTER_READ, &req) == 0) {
-         /* Older KGSL has some kind of garbage in upper 32 bits */
-         uint64_t offseted_gpu_ts = perf.value & 0xffffffff;
-         gpu_offset = tu_device_ticks_to_ns(queue->device, offseted_gpu_ts - profiling_buffer->gpu_ticks_queued);
-         clocks.cpu = profiling_buffer->wall_clock_ns;
-         clocks.gpu_ts = tu_device_ticks_to_ns(queue->device, profiling_buffer->gpu_ticks_queued);
-         clocks.gpu_ts_offset = gpu_offset;
-      }
-      clocks = tu_perfetto_end_submit(queue, queue->device->submit_count,
-                                      start_ts, &clocks);
-      gpu_offset = clocks.gpu_ts_offset;
+      tu_perfetto_end_submit(queue, queue->device->submit_count,
+                             start_ts, &clocks);
    }
 #endif
 
@@ -1833,18 +1822,12 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
       signal_sync->timestamp = timestamp;
    }
 
-   if (u_trace_submission_data) {
-      struct tu_u_trace_submission_data *submission_data =
-         u_trace_submission_data;
-      submission_data->gpu_ts_offset = gpu_offset;
-   }
-
 fail_submit:
    if (result != VK_SUCCESS && u_trace_submission_data && !profiling_submitted) {
       mtx_lock(&queue->device->kgsl_profiling_mutex);
       tu_suballoc_bo_free(&queue->device->kgsl_profiling_suballoc,
-                          &u_trace_submission_data->kgsl_timestamp_bo);
-      u_trace_submission_data->kgsl_timestamp_bo = {};
+                          &u_trace_submission_data->kgsl.timestamp_bo);
+      u_trace_submission_data->kgsl.timestamp_bo = {};
       mtx_unlock(&queue->device->kgsl_profiling_mutex);
    }
 
@@ -1998,6 +1981,86 @@ kgsl_device_check_status(struct tu_device *device)
    return VK_SUCCESS;
 }
 
+static void
+kgsl_device_trace_submission_complete(struct tu_device *device,
+                                      struct tu_u_trace_submission_data *u_trace_submission_data)
+{
+#if HAVE_PERFETTO
+   struct tu_suballoc_bo *bo = &u_trace_submission_data->kgsl.timestamp_bo;
+   struct kgsl_cmdbatch_profiling_buffer *profiling_buffer =
+      static_cast<struct kgsl_cmdbatch_profiling_buffer *>(tu_suballoc_bo_map(bo));
+
+   /* Initially use the current GPU timestamp offset, in case we bail early. */
+   u_trace_submission_data->gpu_ts_offset = device->perfetto.kgsl_clocks.gpu_ts_offset;
+
+   /* Bail if somehow no gpu tick data was set. */
+   if (!profiling_buffer->gpu_ticks_queued)
+      return;
+
+   /* We have submit-time samples of realtime and boottime clocks. We do another
+    * sampling here, calculate the drift, and bail if it's larger than 100us.
+    */
+   struct timespec realtime = {};
+   clock_gettime(CLOCK_REALTIME, &realtime);
+
+   struct timespec boottime = {};
+   clock_gettime(CLOCK_BOOTTIME, &boottime);
+
+   int64_t drift_ns = ((int64_t) timespec_to_nsec(&realtime) - (int64_t) timespec_to_nsec(&boottime)) -
+      ((int64_t) u_trace_submission_data->kgsl.submit.realtime_ns - (int64_t) u_trace_submission_data->kgsl.submit.boottime_ns);
+   if (std::abs(drift_ns) > 100000)
+      return;
+
+   /* The profiling buffer will contain wall-time of when the submit was queued onto
+    * the ring buffer. This value should slot between the wall-times taken just before
+    * the submission and after its completion above. Bail if it's outside of that range.
+    */
+   uint64_t queued_walltime_ns = profiling_buffer->wall_clock_s * NSEC_PER_SEC +
+      profiling_buffer->wall_clock_ns;
+   if (queued_walltime_ns < u_trace_submission_data->kgsl.submit.realtime_ns ||
+       queued_walltime_ns > timespec_to_nsec(&realtime))
+      return;
+
+   uint64_t cpu_ns = u_trace_submission_data->kgsl.submit.boottime_ns +
+      (queued_walltime_ns - u_trace_submission_data->kgsl.submit.realtime_ns);
+   if (cpu_ns > device->perfetto.kgsl_clocks.cpu) {
+      struct tu_perfetto_clocks clocks = {
+         .cpu = cpu_ns,
+         .gpu_ts = tu_device_ticks_to_ns(device, profiling_buffer->gpu_ticks_queued),
+         .gpu_ts_offset = device->perfetto.kgsl_clocks.gpu_ts_offset,
+      };
+
+      /* Throttle clock syncs by default. But also always emit if a GPU reset
+       * requires an updated timestamp offset.
+       */
+      bool emit_clock_sync = clocks.cpu >= device->perfetto.next_clock_sync_ns;
+
+      /* If the GPU timestamp went backwards, let's set up a timestamp offset that
+       * will project the current and all future GPU timestamps to where we would expect
+       * them to be given the boot-time delta.
+       */
+      if (clocks.gpu_ts < device->perfetto.kgsl_clocks.gpu_ts) {
+         clocks.gpu_ts_offset = device->perfetto.kgsl_clocks.gpu_ts_offset + device->perfetto.kgsl_clocks.gpu_ts +
+            (clocks.cpu - device->perfetto.kgsl_clocks.cpu) - clocks.gpu_ts;
+         emit_clock_sync = true;
+      }
+
+      device->perfetto.kgsl_clocks = clocks;
+      u_trace_submission_data->gpu_ts_offset = clocks.gpu_ts_offset;
+
+      if (emit_clock_sync) {
+         tu_perfetto_emit_clock_sync(&clocks);
+         device->perfetto.next_clock_sync_ns = clocks.cpu + 30000000;
+      }
+   }
+
+   /* TODO: The profiling buffer has useful timestamps that we can use to display
+    * timespans of when the submission was pending and then executing on the
+    * ring buffer.
+    */
+#endif
+}
+
 static const struct tu_knl kgsl_knl_funcs = {
       .name = "kgsl",
 
@@ -2007,6 +2070,7 @@ static const struct tu_knl kgsl_knl_funcs = {
       .device_get_calibrated_timestamps = kgsl_device_get_calibrated_timestamps,
       .device_get_suspend_count = kgsl_device_get_suspend_count,
       .device_check_status = kgsl_device_check_status,
+      .device_trace_submission_complete = kgsl_device_trace_submission_complete,
       .submitqueue_new = kgsl_submitqueue_new,
       .submitqueue_close = kgsl_submitqueue_close,
       .bo_init = kgsl_bo_init,
@@ -2112,6 +2176,7 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
       ((info.chip_id >> 16) & 0xff) * 10 +
       ((info.chip_id >>  8) & 0xff);
    device->dev_id.chip_id = info.chip_id;
+   fd_dev_check_gmem_size(&device->dev_id, info.gmem_sizebytes);
    device->gmem_size = debug_get_num_option("TU_GMEM", info.gmem_sizebytes);
    device->gmem_base = gmem_iova;
 
@@ -2129,7 +2194,6 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
    device->sync_types[2] = NULL;
 
    device->heap.size = tu_get_system_heap_size(device);
-   device->heap.used = 0u;
    device->heap.flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    device->has_set_iova = kgsl_is_memory_type_supported(
@@ -2145,8 +2209,15 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
    device->has_sparse = kgsl_is_virtual_bo_supported(fd);
    device->has_sparse_prr = device->has_sparse;
    device->has_lazy_bos = device->has_sparse;
-   get_kgsl_prop(fd, KGSL_PROP_GPU_VA64_SIZE, &device->va_size,
-                 sizeof(device->va_size));
+   if (get_kgsl_prop(fd, KGSL_PROP_GPU_VA64_SIZE, &device->va_size, sizeof(device->va_size)) != VK_SUCCESS &&
+       device->has_sparse) {
+      /* Kernels with virtual BOs but without KGSL_PROP_GPU_VA64_SIZE (e.g.
+       * 5.10 on A725) place virtual BOs in the same 256 GiB region
+       * (0x4000000000-0x8000000000) that newer kernels report. Leaving
+       * va_size at 0 would advertise sparseAddressSpaceSize = 0.
+       */
+      device->va_size = 0x4000000000ull;
+   }
    /* We don't actually use the VMA, but set a fake offset so that it doesn't
     * think we're trying to allocate 0 and assert.
     */

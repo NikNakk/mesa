@@ -641,11 +641,12 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
       P(ctx, " ? 1.0 : 0.0");
       break;
    case nir_op_bcsel:
-      /* KK_WORKAROUND_10 All shaders will have buf0 bound */
+      alu_src_to_msl(ctx, instr, 0);
+      /* KK_WORKAROUND_10 All shaders will have buf0 bound. Must come after the
+       * condition, see docs. */
       if (!(ctx->disabled_workarounds & BITFIELD_BIT(10)) &&
           ctx->shader->info.stage == MESA_SHADER_COMPUTE)
-         P(ctx, "(ulong)&buf0.contents[0] && ");
-      alu_src_to_msl(ctx, instr, 0);
+         P(ctx, " && (ulong)&buf0.contents[0]");
       P(ctx, " ? ");
       alu_src_to_msl(ctx, instr, 1);
       P(ctx, " : ");
@@ -1768,6 +1769,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, ", 3);\n");
       break;
    case nir_intrinsic_reduce:
+      /* Metal's simd_* reductions always cover the whole simdgroup */
+      assert(nir_intrinsic_cluster_size(instr) == 0 ||
+             nir_intrinsic_cluster_size(instr) >= 32);
       switch (nir_intrinsic_reduction_op(instr)) {
       case nir_op_iadd:
       case nir_op_fadd:

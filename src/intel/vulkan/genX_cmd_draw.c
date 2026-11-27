@@ -430,6 +430,8 @@ cmd_buffer_emit_push_constant_all(struct anv_cmd_buffer *cmd_buffer,
                         .ShaderUpdateEnable = shader_mask,
                         .PointerBufferMask = buffer_mask,
                         .MOCS = isl_mocs(&cmd_buffer->device->isl_dev, 0, false));
+   if (dw == NULL)
+      return;
 
    for (int i = 0; i < buffer_count; i++) {
       const struct anv_push_range *range = &bind_map->push_ranges[i];
@@ -464,7 +466,7 @@ cmd_buffer_flush_gfx_push_constants(struct anv_cmd_buffer *cmd_buffer,
       const struct anv_shader *shader = gfx->shaders[stage];
       const struct anv_pipeline_bind_map *bind_map = &shader->bind_map;
       struct anv_push_constants *push = &bind_state->push_constants;
-      u_foreach_bit(r, shader->prog_data->robust_ubo_ranges) {
+      u_foreach_bit(r, shader->bin->info.push_layout.robust_ubo_ranges) {
          const struct anv_push_range *range = &bind_map->push_ranges[r];
 
          assert(range->length != 0);
@@ -505,8 +507,7 @@ cmd_buffer_flush_gfx_push_constants(struct anv_cmd_buffer *cmd_buffer,
       bind_state->push_constants_state = ANV_STATE_NULL;
 
 #if GFX_VERx10 >= 125
-   const struct brw_mesh_prog_data *mesh_prog_data =
-      get_gfx_mesh_prog_data(gfx);
+   const bool has_mesh = anv_gfx_has_stage(gfx, MESA_SHADER_MESH);
 #endif
 
    anv_foreach_stage(stage, dirty_stages) {
@@ -537,7 +538,7 @@ cmd_buffer_flush_gfx_push_constants(struct anv_cmd_buffer *cmd_buffer,
              * shaders.
              */
             if (range->set == ANV_DESCRIPTOR_SET_PER_PRIM_PADDING &&
-                mesh_prog_data && !mesh_prog_data->map.wa_18019110168_active) {
+                has_mesh && !gfx->shaders[MESA_SHADER_MESH]->bin->info.mesh.map.wa_18019110168_active) {
                break;
             }
 #endif
@@ -1129,9 +1130,9 @@ anv_use_generated_draws(const struct anv_cmd_buffer *cmd_buffer, uint32_t count)
 
 #define gfx_source_hashes(gfx) \
    (gfx->shaders[MESA_SHADER_VERTEX] != NULL ? \
-    gfx->shaders[MESA_SHADER_VERTEX]->prog_data->source_hash : 0ull), \
+    gfx->shaders[MESA_SHADER_VERTEX]->bin->info.source_hash : 0ull), \
    (gfx->shaders[MESA_SHADER_FRAGMENT] != NULL ? \
-    gfx->shaders[MESA_SHADER_FRAGMENT]->prog_data->source_hash : 0ull)
+    gfx->shaders[MESA_SHADER_FRAGMENT]->bin->info.source_hash : 0ull)
 
 #include "genX_cmd_draw_helpers.h"
 #include "genX_cmd_draw_generated_indirect.h"
@@ -1157,7 +1158,7 @@ cmd_buffer_pre_draw_wa(struct anv_cmd_buffer *cmd_buffer)
       if (ANV_DEBUG(SHADER_HASH)) {                                     \
          mi_store(&b,                                                   \
                   mi_mem64(device->workaround_address),                 \
-                  mi_imm(gfx->shaders[stage]->prog_data->source_hash)); \
+                  mi_imm(gfx->shaders[stage]->bin->info.source_hash)); \
       }                                                                 \
    } while (0)
 
@@ -1200,12 +1201,12 @@ cmd_buffer_pre_draw_wa(struct anv_cmd_buffer *cmd_buffer)
 #endif
 
 #if GFX_VER >= 12 && GFX_VER <= 30
-   const struct brw_fs_prog_data *fs_prog_data = get_gfx_fs_prog_data(gfx);
+   const struct intel_shader_info *info = get_gfx_fs_info(gfx);
    enum isl_aux_usage depth_aux_usage = gfx->depth_att.aux_usage;
    if (isl_aux_usage_has_hiz(depth_aux_usage) &&
        hw_state->wm_ds.DepthTestEnable &&
        !hw_state->wm_ds.DepthBufferWriteEnable &&
-       fs_prog_data && fs_prog_data->computed_depth_mode != PSCDEPTH_OFF) {
+       info && info->fs.computed_depth_mode != PSCDEPTH_OFF) {
       /* According to Bspec 72161 (r890) and HSD 22019411255, we can improve
        * performance by avoiding HiZ planes for draw calls which compute depth
        * and perform read-only depth tests. According to HSD 22019338931, this
@@ -1337,8 +1338,9 @@ void genX(CmdDraw)(
    genX(flush_pipeline_select_3d)(cmd_buffer);
 
 #if GFX_VER < 11
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
    cmd_buffer_emit_vertex_constants_and_flush(cmd_buffer,
-                                              get_gfx_vs_prog_data(gfx),
+                                              &gfx->shaders[MESA_SHADER_VERTEX]->bin->info,
                                               firstVertex, firstInstance, 0,
                                               false /* force_flush */);
 #endif
@@ -1397,9 +1399,10 @@ void genX(CmdDrawMultiEXT)(
 
    uint32_t i = 0;
 #if GFX_VER < 11
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
    vk_foreach_multi_draw(draw, i, pVertexInfo, drawCount, stride) {
       cmd_buffer_emit_vertex_constants_and_flush(cmd_buffer,
-                                                 get_gfx_vs_prog_data(gfx),
+                                                 &gfx->shaders[MESA_SHADER_VERTEX]->bin->info,
                                                  draw->firstVertex,
                                                  firstInstance, i, !i);
 
@@ -1495,8 +1498,10 @@ void genX(CmdDrawIndexed)(
    genX(flush_pipeline_select_3d)(cmd_buffer);
 
 #if GFX_VER < 11
-   const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
-   cmd_buffer_emit_vertex_constants_and_flush(cmd_buffer, vs_prog_data,
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
+   const struct intel_shader_info *info =
+      &gfx->shaders[MESA_SHADER_VERTEX]->bin->info;
+   cmd_buffer_emit_vertex_constants_and_flush(cmd_buffer, info,
                                               vertexOffset, firstInstance,
                                               0, false /* force_flush */);
 #endif
@@ -1555,17 +1560,19 @@ void genX(CmdDrawMultiIndexedEXT)(
 
    uint32_t i = 0;
 #if GFX_VER < 11
-   const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
+   const struct intel_shader_info *info =
+      &gfx->shaders[MESA_SHADER_VERTEX]->bin->info;
    if (pVertexOffset) {
-      if (vs_prog_data->uses_drawid) {
+      if (info->vs.uses_drawid) {
          bool emitted = true;
-         if (vs_prog_data->uses_firstvertex ||
-             vs_prog_data->uses_baseinstance) {
+         if (info->vs.uses_firstvertex ||
+             info->vs.uses_baseinstance) {
             emit_base_vertex_instance(cmd_buffer, *pVertexOffset, firstInstance);
             emitted = true;
          }
          vk_foreach_multi_draw_indexed(draw, i, pIndexInfo, drawCount, stride) {
-            if (vs_prog_data->uses_drawid) {
+            if (info->vs.uses_drawid) {
                emit_draw_index(cmd_buffer, i);
                emitted = true;
             }
@@ -1604,8 +1611,8 @@ void genX(CmdDrawMultiIndexedEXT)(
             emitted = false;
          }
       } else {
-         if (vs_prog_data->uses_firstvertex ||
-             vs_prog_data->uses_baseinstance) {
+         if (info->vs.uses_firstvertex ||
+             info->vs.uses_baseinstance) {
             emit_base_vertex_instance(cmd_buffer, *pVertexOffset, firstInstance);
             /* Emitting draw index or vertex index BOs may result in needing
              * additional VF cache flushes.
@@ -1643,7 +1650,7 @@ void genX(CmdDrawMultiIndexedEXT)(
       }
    } else {
       vk_foreach_multi_draw_indexed(draw, i, pIndexInfo, drawCount, stride) {
-         cmd_buffer_emit_vertex_constants_and_flush(cmd_buffer, vs_prog_data,
+         cmd_buffer_emit_vertex_constants_and_flush(cmd_buffer, info,
                                                     draw->vertexOffset,
                                                     firstInstance, i, i != 0);
 
@@ -1771,11 +1778,13 @@ void genX(CmdDrawIndirectByteCount2EXT)(
    genX(flush_pipeline_select_3d)(cmd_buffer);
 
 #if GFX_VER < 11
-   const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
-   if (vs_prog_data->uses_firstvertex ||
-       vs_prog_data->uses_baseinstance)
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
+   const struct intel_shader_info *info =
+      &gfx->shaders[MESA_SHADER_VERTEX]->bin->info;
+   if (info->vs.uses_firstvertex ||
+       info->vs.uses_baseinstance)
       emit_base_vertex_instance(cmd_buffer, firstVertex, firstInstance);
-   if (vs_prog_data->uses_drawid)
+   if (info->vs.uses_drawid)
       emit_draw_index(cmd_buffer, 0);
 #endif
 
@@ -1895,21 +1904,23 @@ execute_indirect_draw_supported(const struct anv_cmd_buffer *cmd_buffer)
 
 
    const struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
-   const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
-   const struct brw_task_prog_data *task_prog_data = get_gfx_task_prog_data(gfx);
-   const struct brw_mesh_prog_data *mesh_prog_data = get_gfx_mesh_prog_data(gfx);
+   const struct intel_shader_info *info =
+      gfx->shaders[MESA_SHADER_VERTEX] != NULL ?
+      &gfx->shaders[MESA_SHADER_VERTEX]->bin->info : NULL;
+   const bool has_task = anv_gfx_has_stage(gfx, MESA_SHADER_TASK);
+   const bool has_mesh = anv_gfx_has_stage(gfx, MESA_SHADER_MESH);
    const bool is_multiview = gfx->instance_multiplier > 1;
 
    const bool uses_draw_id =
-      (vs_prog_data && vs_prog_data->uses_drawid) ||
-      (mesh_prog_data && mesh_prog_data->uses_drawid) ||
-      (task_prog_data && task_prog_data->uses_drawid);
+      (info != NULL && info->vs.uses_drawid) ||
+      (has_mesh && gfx->shaders[MESA_SHADER_MESH]->bin->info.mesh.uses_drawid) ||
+      (has_task && gfx->shaders[MESA_SHADER_TASK]->bin->info.task.uses_drawid);
 
    const bool uses_firstvertex =
-      (vs_prog_data && vs_prog_data->uses_firstvertex);
+      (info != NULL && info->vs.uses_firstvertex);
 
    const bool uses_baseinstance =
-      (vs_prog_data && vs_prog_data->uses_baseinstance);
+      (info != NULL && info->vs.uses_baseinstance);
 
    return !is_multiview &&
           !uses_draw_id &&
@@ -1929,7 +1940,9 @@ emit_indirect_draws(struct anv_cmd_buffer *cmd_buffer,
 {
 #if GFX_VER < 11
    const struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
-   const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
+   const struct intel_shader_info *info =
+      &gfx->shaders[MESA_SHADER_VERTEX]->bin->info;
 #endif
 
 #if GFX_VER >= 20
@@ -1962,12 +1975,12 @@ emit_indirect_draws(struct anv_cmd_buffer *cmd_buffer,
        * We want the VkDrawIndirectCommand::vertexOffset field at offset 12 in
        * the structure.
        */
-      if (vs_prog_data->uses_firstvertex ||
-          vs_prog_data->uses_baseinstance) {
+      if (info->vs.uses_firstvertex ||
+          info->vs.uses_baseinstance) {
          emit_base_vertex_instance_bo(cmd_buffer,
                                       anv_address_add(draw, indexed ? 12 : 8));
       }
-      if (vs_prog_data->uses_drawid)
+      if (info->vs.uses_drawid)
          emit_draw_index(cmd_buffer, i);
 #endif
 
@@ -2293,7 +2306,9 @@ emit_indirect_count_draws(struct anv_cmd_buffer *cmd_buffer,
 {
 #if GFX_VER < 11
    const struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
-   const struct brw_vs_prog_data *vs_prog_data = get_gfx_vs_prog_data(gfx);
+   assert(gfx->shaders[MESA_SHADER_VERTEX] != NULL);
+   const struct intel_shader_info *info =
+      &gfx->shaders[MESA_SHADER_VERTEX]->bin->info;
 #endif
 
    cmd_buffer_flush_gfx(cmd_buffer);
@@ -2312,12 +2327,12 @@ emit_indirect_count_draws(struct anv_cmd_buffer *cmd_buffer,
       emit_draw_count_predicate_cond(cmd_buffer, &b, i, max);
 
 #if GFX_VER < 11
-      if (vs_prog_data->uses_firstvertex ||
-          vs_prog_data->uses_baseinstance) {
+      if (info->vs.uses_firstvertex ||
+          info->vs.uses_baseinstance) {
          emit_base_vertex_instance_bo(cmd_buffer,
                                       anv_address_add(draw, indexed ? 12 : 8));
       }
-      if (vs_prog_data->uses_drawid)
+      if (info->vs.uses_drawid)
          emit_draw_index(cmd_buffer, i);
 
       /* Emitting draw index or vertex index BOs may result in needing
@@ -2624,8 +2639,7 @@ void genX(CmdDrawMeshTasksIndirect2EXT)(
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
-   const struct brw_task_prog_data *task_prog_data = get_gfx_task_prog_data(gfx);
-   const struct brw_mesh_prog_data *mesh_prog_data = get_gfx_mesh_prog_data(gfx);
+   const bool has_task = anv_gfx_has_stage(gfx, MESA_SHADER_TASK);
    struct anv_cmd_state *cmd_state = &cmd_buffer->state;
 
    if (anv_batch_has_error(&cmd_buffer->batch))
@@ -2657,8 +2671,8 @@ void genX(CmdDrawMeshTasksIndirect2EXT)(
    if (cmd_state->conditional_render_enabled)
       genX(cmd_emit_conditional_render_predicate)(cmd_buffer);
 
-   bool uses_drawid = (task_prog_data && task_prog_data->uses_drawid) ||
-                       mesh_prog_data->uses_drawid;
+   bool uses_drawid = (has_task && gfx->shaders[MESA_SHADER_TASK]->bin->info.task.uses_drawid) ||
+                       gfx->shaders[MESA_SHADER_MESH]->bin->info.mesh.uses_drawid;
    struct mi_builder b;
    mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);
 
@@ -2683,8 +2697,7 @@ void genX(CmdDrawMeshTasksIndirectCount2EXT)(
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
-   const struct brw_task_prog_data *task_prog_data = get_gfx_task_prog_data(gfx);
-   const struct brw_mesh_prog_data *mesh_prog_data = get_gfx_mesh_prog_data(gfx);
+   const bool has_task = anv_gfx_has_stage(gfx, MESA_SHADER_TASK);
 
    if (anv_batch_has_error(&cmd_buffer->batch))
       return;
@@ -2715,8 +2728,8 @@ void genX(CmdDrawMeshTasksIndirectCount2EXT)(
 
    cmd_buffer_flush_gfx(cmd_buffer);
 
-   bool uses_drawid = (task_prog_data && task_prog_data->uses_drawid) ||
-                       mesh_prog_data->uses_drawid;
+   bool uses_drawid = (has_task && gfx->shaders[MESA_SHADER_TASK]->bin->info.task.uses_drawid) ||
+                       gfx->shaders[MESA_SHADER_MESH]->bin->info.mesh.uses_drawid;
 
    struct mi_builder b;
    mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);

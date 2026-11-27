@@ -17,6 +17,7 @@
 #include "util/hash_table.h"
 #include "util/log.h"
 #include "util/thread_sched.h"
+#include "util/u_process.h"
 #include "util/xmlconfig.h"
 #include "drm-uapi/amdgpu_drm.h"
 #include <xf86drm.h>
@@ -34,10 +35,6 @@ char amdgpu_userq_str[AMDGPU_MAX_QUEUES][8] = {
 
 static struct hash_table *dev_tab = NULL;
 static simple_mtx_t dev_tab_mutex = SIMPLE_MTX_INITIALIZER;
-
-#if MESA_DEBUG
-DEBUG_GET_ONCE_BOOL_OPTION(all_bos, "RADEON_ALL_BOS", false)
-#endif
 
 /* Helper function to do the ioctls needed for setup and init. */
 static bool do_winsys_init(struct amdgpu_winsys *aws,
@@ -57,9 +54,7 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
 
    aws->check_vm = options->check_vm;
    aws->noop_cs = options->noop_cs;
-#if MESA_DEBUG
-   aws->debug_all_bos = debug_get_option_all_bos();
-#endif
+   aws->debug_all_bos = options->list_all_bo;
    aws->reserve_vmid = options->reserve_vmid;
    aws->userq_job_log = options->userq_job_log;
    aws->ib_caches_flush = options->ib_caches_flush;
@@ -73,6 +68,15 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
 
    if (aws->userq_job_log)
       amdgpu_userq_start_job_log_thread(aws);
+
+   if (options->dump_bo_history) {
+      char bo_hist_filename[512];
+      sprintf(bo_hist_filename, "/tmp/radeonsi_bo_history_%.12s_%lu_%u.log",
+              util_get_process_name(), (long unsigned) getpid(), aws->fd);
+      aws->bo_history_logfile = fopen(bo_hist_filename, "w+");
+      if (!aws->bo_history_logfile)
+         mesa_loge("radeonsi: Failed to create /tmp/radeonsi_bo_history.log.\n");
+   }
 
    return true;
 
@@ -110,9 +114,7 @@ static void do_winsys_deinit(struct amdgpu_winsys *aws)
    pb_cache_deinit(&aws->bo_cache);
    _mesa_hash_table_destroy(aws->bo_export_table, NULL);
    simple_mtx_destroy(&aws->sws_list_lock);
-#if MESA_DEBUG
    simple_mtx_destroy(&aws->global_bo_list_lock);
-#endif
    simple_mtx_destroy(&aws->bo_export_table_lock);
 
    ac_addrlib_destroy(aws->addrlib);
@@ -120,6 +122,9 @@ static void do_winsys_deinit(struct amdgpu_winsys *aws)
    ac_drm_device_deinitialize(aws->dev);
    simple_mtx_destroy(&aws->bo_fence_lock);
    simple_mtx_destroy(&aws->stats_lock);
+
+   if (aws->bo_history_logfile)
+      fclose(aws->bo_history_logfile);
 
    FREE(aws);
 }
@@ -541,15 +546,11 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
 
       /* init reference */
       pipe_reference_init(&aws->reference, 1);
-#if MESA_DEBUG
       list_inithead(&aws->global_bo_list);
-#endif
       aws->bo_export_table = util_hash_table_create_ptr_keys();
 
       (void) simple_mtx_init(&aws->sws_list_lock, mtx_plain);
-#if MESA_DEBUG
       (void) simple_mtx_init(&aws->global_bo_list_lock, mtx_plain);
-#endif
       (void) simple_mtx_init(&aws->bo_fence_lock, mtx_plain);
       (void) simple_mtx_init(&aws->stats_lock, mtx_plain);
       (void) simple_mtx_init(&aws->bo_export_table_lock, mtx_plain);

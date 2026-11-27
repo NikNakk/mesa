@@ -39,10 +39,10 @@
 #include "AlignedBuf.h"
 #include "BumpPool.h"
 #include "ResourceTracker.h"
-#include "Resources.h"
 #include "Validation.h"
 #include "VulkanStreamGuest.h"
 #include "gfxstream/guest/IOStream.h"
+#include "gfxstream_vk_private.h"
 #include "goldfish_vk_counting_guest.h"
 #include "goldfish_vk_deepcopy_guest.h"
 #include "goldfish_vk_marshaling_guest.h"
@@ -124,33 +124,28 @@ VkResult VkEncoder::vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkInstanceCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkInstanceCreateInfo*)pool->alloc(sizeof(const VkInstanceCreateInfo));
-        deepcopy_VkInstanceCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                      (VkInstanceCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkInstanceCreateInfo(sResourceTracker,
-                                              (VkInstanceCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count_VkInstanceCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                               (VkInstanceCreateInfo*)(local_pCreateInfo), &count);
+                               (const VkInstanceCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateInstance, count, queueSubmitWithCommandsEnabled);
     reservedmarshal_VkInstanceCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                         (VkInstanceCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                         (const VkInstanceCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pInstance));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pInstance = create_gfxstream_vk_instance(cgen_var_0);
-    sResourceTracker->register_VkInstance(*pInstance);
+    *pInstance = cgen_var_0 ? create_gfxstream_vk_instance(pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pInstance)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateInstance_VkResult_return = (VkResult)0;
     stream->read(&vkCreateInstance_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateInstance_VkResult_return >= VK_SUCCESS) {
+        vkCreateInstance_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     sResourceTracker->on_vkCreateInstance(this, vkCreateInstance_VkResult_return, pCreateInfo,
                                           pAllocator, pInstance);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -171,8 +166,7 @@ void VkEncoder::vkDestroyInstance(VkInstance instance, const VkAllocationCallbac
     writeStreamVal(&streamPtr, gfxstream_vk_instance_to_host_u64(instance));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkInstance(instance);
-    delete_gfxstream_vk_instance(instance);
+    delete_gfxstream_vk_instance(instance, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -210,6 +204,7 @@ VkResult VkEncoder::vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pP
             }
         }
     }
+    bool guestCreateAllocFailed = false;
     uint64_t check_pPhysicalDeviceCount = stream->getBe64();
     if (pPhysicalDeviceCount) {
         if (!(check_pPhysicalDeviceCount)) {
@@ -227,13 +222,28 @@ VkResult VkEncoder::vkEnumeratePhysicalDevices(VkInstance instance, uint32_t* pP
             stream->alloc((void**)&cgen_var_0, (*pPhysicalDeviceCount) * 8);
             stream->read(cgen_var_0, (*pPhysicalDeviceCount) * 8);
             for (uint32_t k = 0; k < (*pPhysicalDeviceCount); ++k) {
-                pPhysicalDevices[k] = create_gfxstream_vk_physical_device(cgen_var_0[k]);
-                sResourceTracker->register_VkPhysicalDevice(pPhysicalDevices[k]);
+                pPhysicalDevices[k] = cgen_var_0[k] ? create_gfxstream_vk_physical_device(
+                                                          instance, nullptr, cgen_var_0[k])
+                                                    : VK_NULL_HANDLE;
+                if (cgen_var_0[k] && !(pPhysicalDevices[k])) {
+                    guestCreateAllocFailed = true;
+                }
+            }
+            if (guestCreateAllocFailed) {
+                for (uint32_t k = 0; k < (*pPhysicalDeviceCount); ++k) {
+                    if (pPhysicalDevices[k]) {
+                        delete_gfxstream_vk_physical_device(instance, pPhysicalDevices[k], nullptr);
+                        pPhysicalDevices[k] = VK_NULL_HANDLE;
+                    }
+                }
             }
         }
     }
     VkResult vkEnumeratePhysicalDevices_VkResult_return = (VkResult)0;
     stream->read(&vkEnumeratePhysicalDevices_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkEnumeratePhysicalDevices_VkResult_return >= VK_SUCCESS) {
+        vkEnumeratePhysicalDevices_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkEnumeratePhysicalDevices_VkResult_return;
@@ -477,35 +487,31 @@ VkResult VkEncoder::vkCreateDevice(VkPhysicalDevice physicalDevice,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDeviceCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkDeviceCreateInfo*)pool->alloc(sizeof(const VkDeviceCreateInfo));
-        deepcopy_VkDeviceCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                    (VkDeviceCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDeviceCreateInfo(sResourceTracker,
-                                            (VkDeviceCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDeviceCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                             (VkDeviceCreateInfo*)(local_pCreateInfo), &count);
+                             (const VkDeviceCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateDevice, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkDeviceCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                       (VkDeviceCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                       (const VkDeviceCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pDevice));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pDevice = create_gfxstream_vk_device(cgen_var_0);
-    sResourceTracker->register_VkDevice(*pDevice);
+    *pDevice = cgen_var_0 ? create_gfxstream_vk_device(physicalDevice, pAllocator, cgen_var_0)
+                          : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pDevice)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateDevice_VkResult_return = (VkResult)0;
     stream->read(&vkCreateDevice_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateDevice_VkResult_return >= VK_SUCCESS) {
+        vkCreateDevice_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     sResourceTracker->on_vkCreateDevice(this, vkCreateDevice_VkResult_return, physicalDevice,
                                         pCreateInfo, pAllocator, pDevice);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -527,8 +533,7 @@ void VkEncoder::vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pA
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkDevice(device);
-    delete_gfxstream_vk_device(device);
+    delete_gfxstream_vk_device(device, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -832,8 +837,7 @@ void VkEncoder::vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uin
     writeStreamVal(&streamPtr, (uint64_t)(*pQueue));
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pQueue = create_gfxstream_vk_queue(cgen_var_0);
-    sResourceTracker->register_VkQueue(*pQueue);
+    *pQueue = cgen_var_0 ? create_gfxstream_vk_queue(device, nullptr, cgen_var_0) : VK_NULL_HANDLE;
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -844,26 +848,12 @@ VkResult VkEncoder::vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkS
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubmitInfo* local_pSubmits = nullptr;
-    if (pSubmits) {
-        local_pSubmits = (VkSubmitInfo*)pool->alloc(submitCount * sizeof(const VkSubmitInfo));
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            deepcopy_VkSubmitInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubmits + i,
-                                  (VkSubmitInfo*)(local_pSubmits + i));
-        }
-    }
-    if (local_pSubmits) {
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            transform_tohost_VkSubmitInfo(sResourceTracker, (VkSubmitInfo*)(local_pSubmits + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         count_VkSubmitInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkSubmitInfo*)(local_pSubmits + i), &count);
+                           (const VkSubmitInfo*)(pSubmits + i), &count);
     }
     count += 8;
     uint8_t* streamPtr =
@@ -872,7 +862,7 @@ VkResult VkEncoder::vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkS
     writeStreamBytes(&streamPtr, &submitCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         reservedmarshal_VkSubmitInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkSubmitInfo*)(local_pSubmits + i), &streamPtr);
+                                     (const VkSubmitInfo*)(pSubmits + i), &streamPtr);
     }
     writeStreamVal(&streamPtr, gfxstream_vk_fence_to_host_u64(fence));
     VkResult vkQueueSubmit_VkResult_return = (VkResult)0;
@@ -947,12 +937,19 @@ VkResult VkEncoder::vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo
                                          (VkMemoryAllocateInfo*)(local_pAllocateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pMemory));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pMemory = create_gfxstream_vk_device_memory(cgen_var_0);
-    sResourceTracker->register_VkDeviceMemory(*pMemory);
+    *pMemory = cgen_var_0 ? create_gfxstream_vk_device_memory(device, pAllocator, cgen_var_0)
+                          : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pMemory)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkAllocateMemory_VkResult_return = (VkResult)0;
     stream->read(&vkAllocateMemory_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkAllocateMemory_VkResult_return >= VK_SUCCESS) {
+        vkAllocateMemory_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkAllocateMemory_VkResult_return;
@@ -977,7 +974,7 @@ void VkEncoder::vkFreeMemory(VkDevice device, VkDeviceMemory memory,
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
     sResourceTracker->unregister_VkDeviceMemory(memory);
-    delete_gfxstream_vk_device_memory(memory);
+    delete_gfxstream_vk_device_memory(device, memory, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1465,35 +1462,31 @@ VkResult VkEncoder::vkCreateFence(VkDevice device, const VkFenceCreateInfo* pCre
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkFenceCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkFenceCreateInfo*)pool->alloc(sizeof(const VkFenceCreateInfo));
-        deepcopy_VkFenceCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                   (VkFenceCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkFenceCreateInfo(sResourceTracker,
-                                           (VkFenceCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkFenceCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkFenceCreateInfo*)(local_pCreateInfo), &count);
+                            (const VkFenceCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateFence, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkFenceCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkFenceCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                      (const VkFenceCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pFence));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pFence = create_gfxstream_vk_fence(cgen_var_0);
-    sResourceTracker->register_VkFence(*pFence);
+    *pFence =
+        cgen_var_0 ? create_gfxstream_vk_fence(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pFence)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateFence_VkResult_return = (VkResult)0;
     stream->read(&vkCreateFence_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateFence_VkResult_return >= VK_SUCCESS) {
+        vkCreateFence_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateFence_VkResult_return;
@@ -1514,7 +1507,7 @@ void VkEncoder::vkDestroyFence(VkDevice device, VkFence fence,
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
     sResourceTracker->unregister_VkFence(fence);
-    delete_gfxstream_vk_fence(fence);
+    delete_gfxstream_vk_fence(device, fence, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1604,36 +1597,31 @@ VkResult VkEncoder::vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateIn
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSemaphoreCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkSemaphoreCreateInfo*)pool->alloc(sizeof(const VkSemaphoreCreateInfo));
-        deepcopy_VkSemaphoreCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                       (VkSemaphoreCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkSemaphoreCreateInfo(sResourceTracker,
-                                               (VkSemaphoreCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSemaphoreCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkSemaphoreCreateInfo*)(local_pCreateInfo), &count);
+                                (const VkSemaphoreCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateSemaphore, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSemaphoreCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkSemaphoreCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                          (const VkSemaphoreCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pSemaphore));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pSemaphore = create_gfxstream_vk_semaphore(cgen_var_0);
-    sResourceTracker->register_VkSemaphore(*pSemaphore);
+    *pSemaphore =
+        cgen_var_0 ? create_gfxstream_vk_semaphore(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pSemaphore)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateSemaphore_VkResult_return = (VkResult)0;
     stream->read(&vkCreateSemaphore_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateSemaphore_VkResult_return >= VK_SUCCESS) {
+        vkCreateSemaphore_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateSemaphore_VkResult_return;
@@ -1654,7 +1642,7 @@ void VkEncoder::vkDestroySemaphore(VkDevice device, VkSemaphore semaphore,
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
     sResourceTracker->unregister_VkSemaphore(semaphore);
-    delete_gfxstream_vk_semaphore(semaphore);
+    delete_gfxstream_vk_semaphore(device, semaphore, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1666,36 +1654,31 @@ VkResult VkEncoder::vkCreateQueryPool(VkDevice device, const VkQueryPoolCreateIn
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkQueryPoolCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkQueryPoolCreateInfo*)pool->alloc(sizeof(const VkQueryPoolCreateInfo));
-        deepcopy_VkQueryPoolCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                       (VkQueryPoolCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkQueryPoolCreateInfo(sResourceTracker,
-                                               (VkQueryPoolCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkQueryPoolCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkQueryPoolCreateInfo*)(local_pCreateInfo), &count);
+                                (const VkQueryPoolCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateQueryPool, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkQueryPoolCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkQueryPoolCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                          (const VkQueryPoolCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pQueryPool));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pQueryPool = create_gfxstream_vk_query_pool(cgen_var_0);
-    sResourceTracker->register_VkQueryPool(*pQueryPool);
+    *pQueryPool = cgen_var_0 ? create_gfxstream_vk_query_pool(device, pAllocator, cgen_var_0)
+                             : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pQueryPool)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateQueryPool_VkResult_return = (VkResult)0;
     stream->read(&vkCreateQueryPool_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateQueryPool_VkResult_return >= VK_SUCCESS) {
+        vkCreateQueryPool_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateQueryPool_VkResult_return;
@@ -1715,8 +1698,7 @@ void VkEncoder::vkDestroyQueryPool(VkDevice device, VkQueryPool queryPool,
     writeStreamVal(&streamPtr, gfxstream_vk_query_pool_to_host_u64(queryPool));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkQueryPool(queryPool);
-    delete_gfxstream_vk_query_pool(queryPool);
+    delete_gfxstream_vk_query_pool(device, queryPool, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1786,12 +1768,19 @@ VkResult VkEncoder::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pC
                                        (VkBufferCreateInfo*)(local_pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pBuffer));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pBuffer = create_gfxstream_vk_buffer(cgen_var_0);
-    sResourceTracker->register_VkBuffer(*pBuffer);
+    *pBuffer =
+        cgen_var_0 ? create_gfxstream_vk_buffer(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pBuffer)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateBuffer_VkResult_return = (VkResult)0;
     stream->read(&vkCreateBuffer_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateBuffer_VkResult_return >= VK_SUCCESS) {
+        vkCreateBuffer_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateBuffer_VkResult_return;
@@ -1811,8 +1800,7 @@ void VkEncoder::vkDestroyBuffer(VkDevice device, VkBuffer buffer,
     writeStreamVal(&streamPtr, gfxstream_vk_buffer_to_host_u64(buffer));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkBuffer(buffer);
-    delete_gfxstream_vk_buffer(buffer);
+    delete_gfxstream_vk_buffer(device, buffer, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1849,12 +1837,19 @@ VkResult VkEncoder::vkCreateImage(VkDevice device, const VkImageCreateInfo* pCre
                                       (VkImageCreateInfo*)(local_pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pImage));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pImage = create_gfxstream_vk_image(cgen_var_0);
-    sResourceTracker->register_VkImage(*pImage);
+    *pImage =
+        cgen_var_0 ? create_gfxstream_vk_image(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pImage)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateImage_VkResult_return = (VkResult)0;
     stream->read(&vkCreateImage_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateImage_VkResult_return >= VK_SUCCESS) {
+        vkCreateImage_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateImage_VkResult_return;
@@ -1874,8 +1869,7 @@ void VkEncoder::vkDestroyImage(VkDevice device, VkImage image,
     writeStreamVal(&streamPtr, gfxstream_vk_image_to_host_u64(image));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkImage(image);
-    delete_gfxstream_vk_image(image);
+    delete_gfxstream_vk_image(device, image, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1914,36 +1908,31 @@ VkResult VkEncoder::vkCreateImageView(VkDevice device, const VkImageViewCreateIn
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageViewCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkImageViewCreateInfo*)pool->alloc(sizeof(const VkImageViewCreateInfo));
-        deepcopy_VkImageViewCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                       (VkImageViewCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkImageViewCreateInfo(sResourceTracker,
-                                               (VkImageViewCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImageViewCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkImageViewCreateInfo*)(local_pCreateInfo), &count);
+                                (const VkImageViewCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateImageView, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImageViewCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkImageViewCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                          (const VkImageViewCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pView));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pView = create_gfxstream_vk_image_view(cgen_var_0);
-    sResourceTracker->register_VkImageView(*pView);
+    *pView = cgen_var_0 ? create_gfxstream_vk_image_view(device, pAllocator, cgen_var_0)
+                        : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pView)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateImageView_VkResult_return = (VkResult)0;
     stream->read(&vkCreateImageView_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateImageView_VkResult_return >= VK_SUCCESS) {
+        vkCreateImageView_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateImageView_VkResult_return;
@@ -1963,8 +1952,7 @@ void VkEncoder::vkDestroyImageView(VkDevice device, VkImageView imageView,
     writeStreamVal(&streamPtr, gfxstream_vk_image_view_to_host_u64(imageView));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkImageView(imageView);
-    delete_gfxstream_vk_image_view(imageView);
+    delete_gfxstream_vk_image_view(device, imageView, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -1976,37 +1964,32 @@ VkResult VkEncoder::vkCreateCommandPool(VkDevice device, const VkCommandPoolCrea
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCommandPoolCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkCommandPoolCreateInfo*)pool->alloc(sizeof(const VkCommandPoolCreateInfo));
-        deepcopy_VkCommandPoolCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                         (VkCommandPoolCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkCommandPoolCreateInfo(sResourceTracker,
-                                                 (VkCommandPoolCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCommandPoolCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkCommandPoolCreateInfo*)(local_pCreateInfo), &count);
+                                  (const VkCommandPoolCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateCommandPool, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkCommandPoolCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                            (VkCommandPoolCreateInfo*)(local_pCreateInfo),
+                                            (const VkCommandPoolCreateInfo*)(pCreateInfo),
                                             &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pCommandPool));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pCommandPool = create_gfxstream_vk_command_pool(cgen_var_0);
-    sResourceTracker->register_VkCommandPool(*pCommandPool);
+    *pCommandPool = cgen_var_0 ? create_gfxstream_vk_command_pool(device, pAllocator, cgen_var_0)
+                               : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pCommandPool)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateCommandPool_VkResult_return = (VkResult)0;
     stream->read(&vkCreateCommandPool_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateCommandPool_VkResult_return >= VK_SUCCESS) {
+        vkCreateCommandPool_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateCommandPool_VkResult_return;
@@ -2027,7 +2010,7 @@ void VkEncoder::vkDestroyCommandPool(VkDevice device, VkCommandPool commandPool,
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
     sResourceTracker->unregister_VkCommandPool(commandPool);
-    delete_gfxstream_vk_command_pool(commandPool);
+    delete_gfxstream_vk_command_pool(device, commandPool, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -2060,22 +2043,10 @@ VkResult VkEncoder::vkAllocateCommandBuffers(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCommandBufferAllocateInfo* local_pAllocateInfo = nullptr;
-    if (pAllocateInfo) {
-        local_pAllocateInfo =
-            (VkCommandBufferAllocateInfo*)pool->alloc(sizeof(const VkCommandBufferAllocateInfo));
-        deepcopy_VkCommandBufferAllocateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pAllocateInfo,
-                                             (VkCommandBufferAllocateInfo*)(local_pAllocateInfo));
-    }
-    if (local_pAllocateInfo) {
-        transform_tohost_VkCommandBufferAllocateInfo(
-            sResourceTracker, (VkCommandBufferAllocateInfo*)(local_pAllocateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCommandBufferAllocateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkCommandBufferAllocateInfo*)(local_pAllocateInfo), &count);
+                                      (const VkCommandBufferAllocateInfo*)(pAllocateInfo), &count);
     if (pAllocateInfo->commandBufferCount) {
         count += pAllocateInfo->commandBufferCount * 8;
     }
@@ -2083,24 +2054,48 @@ VkResult VkEncoder::vkAllocateCommandBuffers(VkDevice device,
         reservePacket(stream, OP_vkAllocateCommandBuffers, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkCommandBufferAllocateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                (VkCommandBufferAllocateInfo*)(local_pAllocateInfo),
+                                                (const VkCommandBufferAllocateInfo*)(pAllocateInfo),
                                                 &streamPtr);
     if (pAllocateInfo->commandBufferCount) {
         for (uint32_t k = 0; k < pAllocateInfo->commandBufferCount; ++k) {
             writeStreamVal(&streamPtr, (uint64_t)(pCommandBuffers[k]));
         }
     }
+    bool guestCreateAllocFailed = false;
     if (pAllocateInfo->commandBufferCount) {
         uint64_t* cgen_var_0;
         stream->alloc((void**)&cgen_var_0, pAllocateInfo->commandBufferCount * 8);
         stream->read(cgen_var_0, pAllocateInfo->commandBufferCount * 8);
         for (uint32_t k = 0; k < pAllocateInfo->commandBufferCount; ++k) {
-            pCommandBuffers[k] = create_gfxstream_vk_command_buffer(cgen_var_0[k]);
-            sResourceTracker->register_VkCommandBuffer(pCommandBuffers[k]);
+            pCommandBuffers[k] =
+                cgen_var_0[k]
+                    ? create_gfxstream_vk_command_buffer(
+                          device,
+                          &gfxstream_vk_command_pool_from_handle(pAllocateInfo->commandPool)
+                               ->base.alloc,
+                          cgen_var_0[k])
+                    : VK_NULL_HANDLE;
+            if (cgen_var_0[k] && !(pCommandBuffers[k])) {
+                guestCreateAllocFailed = true;
+            }
+        }
+        if (guestCreateAllocFailed) {
+            for (uint32_t k = 0; k < pAllocateInfo->commandBufferCount; ++k) {
+                if (pCommandBuffers[k]) {
+                    delete_gfxstream_vk_command_buffer(
+                        device, pCommandBuffers[k],
+                        &gfxstream_vk_command_pool_from_handle(pAllocateInfo->commandPool)
+                             ->base.alloc);
+                    pCommandBuffers[k] = VK_NULL_HANDLE;
+                }
+            }
         }
     }
     VkResult vkAllocateCommandBuffers_VkResult_return = (VkResult)0;
     stream->read(&vkAllocateCommandBuffers_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkAllocateCommandBuffers_VkResult_return >= VK_SUCCESS) {
+        vkAllocateCommandBuffers_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkAllocateCommandBuffers_VkResult_return;
@@ -2140,7 +2135,9 @@ void VkEncoder::vkFreeCommandBuffers(VkDevice device, VkCommandPool commandPool,
     if (pCommandBuffers) {
         for (uint32_t i = 0; i < commandBufferCount; ++i) {
             sResourceTracker->unregister_VkCommandBuffer(pCommandBuffers[i]);
-            delete_gfxstream_vk_command_buffer(pCommandBuffers[i]);
+            delete_gfxstream_vk_command_buffer(
+                device, pCommandBuffers[i],
+                &gfxstream_vk_command_pool_from_handle(commandPool)->base.alloc);
         }
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -2154,29 +2151,17 @@ VkResult VkEncoder::vkBeginCommandBuffer(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCommandBufferBeginInfo* local_pBeginInfo = nullptr;
-    if (pBeginInfo) {
-        local_pBeginInfo =
-            (VkCommandBufferBeginInfo*)pool->alloc(sizeof(const VkCommandBufferBeginInfo));
-        deepcopy_VkCommandBufferBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBeginInfo,
-                                          (VkCommandBufferBeginInfo*)(local_pBeginInfo));
-    }
-    if (local_pBeginInfo) {
-        transform_tohost_VkCommandBufferBeginInfo(sResourceTracker,
-                                                  (VkCommandBufferBeginInfo*)(local_pBeginInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCommandBufferBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkCommandBufferBeginInfo*)(local_pBeginInfo), &count);
+                                   (const VkCommandBufferBeginInfo*)(pBeginInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkBeginCommandBuffer, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkCommandBufferBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                             (VkCommandBufferBeginInfo*)(local_pBeginInfo),
+                                             (const VkCommandBufferBeginInfo*)(pBeginInfo),
                                              &streamPtr);
     VkResult vkBeginCommandBuffer_VkResult_return = (VkResult)0;
     stream->read(&vkBeginCommandBuffer_VkResult_return, sizeof(VkResult));
@@ -2420,54 +2405,6 @@ void VkEncoder::vkCmdPipelineBarrier(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkMemoryBarrier* local_pMemoryBarriers = nullptr;
-    VkBufferMemoryBarrier* local_pBufferMemoryBarriers = nullptr;
-    VkImageMemoryBarrier* local_pImageMemoryBarriers = nullptr;
-    if (pMemoryBarriers) {
-        local_pMemoryBarriers =
-            (VkMemoryBarrier*)pool->alloc(memoryBarrierCount * sizeof(const VkMemoryBarrier));
-        for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
-            deepcopy_VkMemoryBarrier(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pMemoryBarriers + i,
-                                     (VkMemoryBarrier*)(local_pMemoryBarriers + i));
-        }
-    }
-    if (pBufferMemoryBarriers) {
-        local_pBufferMemoryBarriers = (VkBufferMemoryBarrier*)pool->alloc(
-            bufferMemoryBarrierCount * sizeof(const VkBufferMemoryBarrier));
-        for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
-            deepcopy_VkBufferMemoryBarrier(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBufferMemoryBarriers + i,
-                (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i));
-        }
-    }
-    if (pImageMemoryBarriers) {
-        local_pImageMemoryBarriers = (VkImageMemoryBarrier*)pool->alloc(
-            imageMemoryBarrierCount * sizeof(const VkImageMemoryBarrier));
-        for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
-            deepcopy_VkImageMemoryBarrier(pool, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          pImageMemoryBarriers + i,
-                                          (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i));
-        }
-    }
-    if (local_pMemoryBarriers) {
-        for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
-            transform_tohost_VkMemoryBarrier(sResourceTracker,
-                                             (VkMemoryBarrier*)(local_pMemoryBarriers + i));
-        }
-    }
-    if (local_pBufferMemoryBarriers) {
-        for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
-            transform_tohost_VkBufferMemoryBarrier(
-                sResourceTracker, (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i));
-        }
-    }
-    if (local_pImageMemoryBarriers) {
-        for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
-            transform_tohost_VkImageMemoryBarrier(
-                sResourceTracker, (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += 2 * sizeof(VkPipelineStageFlags);
@@ -2475,18 +2412,18 @@ void VkEncoder::vkCmdPipelineBarrier(
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
         count_VkMemoryBarrier(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkMemoryBarrier*)(local_pMemoryBarriers + i), &count);
+                              (const VkMemoryBarrier*)(pMemoryBarriers + i), &count);
     }
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
         count_VkBufferMemoryBarrier(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i),
+                                    (const VkBufferMemoryBarrier*)(pBufferMemoryBarriers + i),
                                     &count);
     }
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
         count_VkImageMemoryBarrier(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i), &count);
+                                   (const VkImageMemoryBarrier*)(pImageMemoryBarriers + i), &count);
     }
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdPipelineBarrier, count, queueSubmitWithCommandsEnabled);
@@ -2499,19 +2436,19 @@ void VkEncoder::vkCmdPipelineBarrier(
     writeStreamBytes(&streamPtr, &memoryBarrierCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
         reservedmarshal_VkMemoryBarrier(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkMemoryBarrier*)(local_pMemoryBarriers + i), &streamPtr);
+                                        (const VkMemoryBarrier*)(pMemoryBarriers + i), &streamPtr);
     }
     writeStreamBytes(&streamPtr, &bufferMemoryBarrierCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
         reservedmarshal_VkBufferMemoryBarrier(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i), &streamPtr);
+            (const VkBufferMemoryBarrier*)(pBufferMemoryBarriers + i), &streamPtr);
     }
     writeStreamBytes(&streamPtr, &imageMemoryBarrierCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
         reservedmarshal_VkImageMemoryBarrier(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i), &streamPtr);
+            (const VkImageMemoryBarrier*)(pImageMemoryBarriers + i), &streamPtr);
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -2671,35 +2608,31 @@ VkResult VkEncoder::vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCre
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkEventCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkEventCreateInfo*)pool->alloc(sizeof(const VkEventCreateInfo));
-        deepcopy_VkEventCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                   (VkEventCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkEventCreateInfo(sResourceTracker,
-                                           (VkEventCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkEventCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkEventCreateInfo*)(local_pCreateInfo), &count);
+                            (const VkEventCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateEvent, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkEventCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkEventCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                      (const VkEventCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pEvent));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pEvent = create_gfxstream_vk_event(cgen_var_0);
-    sResourceTracker->register_VkEvent(*pEvent);
+    *pEvent =
+        cgen_var_0 ? create_gfxstream_vk_event(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pEvent)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateEvent_VkResult_return = (VkResult)0;
     stream->read(&vkCreateEvent_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateEvent_VkResult_return >= VK_SUCCESS) {
+        vkCreateEvent_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateEvent_VkResult_return;
@@ -2719,8 +2652,7 @@ void VkEncoder::vkDestroyEvent(VkDevice device, VkEvent event,
     writeStreamVal(&streamPtr, gfxstream_vk_event_to_host_u64(event));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkEvent(event);
-    delete_gfxstream_vk_event(event);
+    delete_gfxstream_vk_event(device, event, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -2786,37 +2718,32 @@ VkResult VkEncoder::vkCreateBufferView(VkDevice device, const VkBufferViewCreate
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferViewCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkBufferViewCreateInfo*)pool->alloc(sizeof(const VkBufferViewCreateInfo));
-        deepcopy_VkBufferViewCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                        (VkBufferViewCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkBufferViewCreateInfo(sResourceTracker,
-                                                (VkBufferViewCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferViewCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                 (VkBufferViewCreateInfo*)(local_pCreateInfo), &count);
+                                 (const VkBufferViewCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateBufferView, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferViewCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                           (VkBufferViewCreateInfo*)(local_pCreateInfo),
+                                           (const VkBufferViewCreateInfo*)(pCreateInfo),
                                            &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pView));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pView = create_gfxstream_vk_buffer_view(cgen_var_0);
-    sResourceTracker->register_VkBufferView(*pView);
+    *pView = cgen_var_0 ? create_gfxstream_vk_buffer_view(device, pAllocator, cgen_var_0)
+                        : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pView)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateBufferView_VkResult_return = (VkResult)0;
     stream->read(&vkCreateBufferView_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateBufferView_VkResult_return >= VK_SUCCESS) {
+        vkCreateBufferView_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateBufferView_VkResult_return;
@@ -2836,8 +2763,7 @@ void VkEncoder::vkDestroyBufferView(VkDevice device, VkBufferView bufferView,
     writeStreamVal(&streamPtr, gfxstream_vk_buffer_view_to_host_u64(bufferView));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkBufferView(bufferView);
-    delete_gfxstream_vk_buffer_view(bufferView);
+    delete_gfxstream_vk_buffer_view(device, bufferView, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -2850,37 +2776,32 @@ VkResult VkEncoder::vkCreateShaderModule(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkShaderModuleCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkShaderModuleCreateInfo*)pool->alloc(sizeof(const VkShaderModuleCreateInfo));
-        deepcopy_VkShaderModuleCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                          (VkShaderModuleCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkShaderModuleCreateInfo(sResourceTracker,
-                                                  (VkShaderModuleCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkShaderModuleCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkShaderModuleCreateInfo*)(local_pCreateInfo), &count);
+                                   (const VkShaderModuleCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateShaderModule, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkShaderModuleCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                             (VkShaderModuleCreateInfo*)(local_pCreateInfo),
+                                             (const VkShaderModuleCreateInfo*)(pCreateInfo),
                                              &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pShaderModule));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pShaderModule = create_gfxstream_vk_shader_module(cgen_var_0);
-    sResourceTracker->register_VkShaderModule(*pShaderModule);
+    *pShaderModule = cgen_var_0 ? create_gfxstream_vk_shader_module(device, pAllocator, cgen_var_0)
+                                : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pShaderModule)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateShaderModule_VkResult_return = (VkResult)0;
     stream->read(&vkCreateShaderModule_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateShaderModule_VkResult_return >= VK_SUCCESS) {
+        vkCreateShaderModule_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateShaderModule_VkResult_return;
@@ -2900,8 +2821,7 @@ void VkEncoder::vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModu
     writeStreamVal(&streamPtr, gfxstream_vk_shader_module_to_host_u64(shaderModule));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkShaderModule(shaderModule);
-    delete_gfxstream_vk_shader_module(shaderModule);
+    delete_gfxstream_vk_shader_module(device, shaderModule, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -2914,37 +2834,33 @@ VkResult VkEncoder::vkCreatePipelineCache(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPipelineCacheCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkPipelineCacheCreateInfo*)pool->alloc(sizeof(const VkPipelineCacheCreateInfo));
-        deepcopy_VkPipelineCacheCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                           (VkPipelineCacheCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkPipelineCacheCreateInfo(sResourceTracker,
-                                                   (VkPipelineCacheCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPipelineCacheCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkPipelineCacheCreateInfo*)(local_pCreateInfo), &count);
+                                    (const VkPipelineCacheCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreatePipelineCache, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPipelineCacheCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                              (VkPipelineCacheCreateInfo*)(local_pCreateInfo),
+                                              (const VkPipelineCacheCreateInfo*)(pCreateInfo),
                                               &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pPipelineCache));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pPipelineCache = create_gfxstream_vk_pipeline_cache(cgen_var_0);
-    sResourceTracker->register_VkPipelineCache(*pPipelineCache);
+    *pPipelineCache = cgen_var_0
+                          ? create_gfxstream_vk_pipeline_cache(device, pAllocator, cgen_var_0)
+                          : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pPipelineCache)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreatePipelineCache_VkResult_return = (VkResult)0;
     stream->read(&vkCreatePipelineCache_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreatePipelineCache_VkResult_return >= VK_SUCCESS) {
+        vkCreatePipelineCache_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreatePipelineCache_VkResult_return;
@@ -2964,8 +2880,7 @@ void VkEncoder::vkDestroyPipelineCache(VkDevice device, VkPipelineCache pipeline
     writeStreamVal(&streamPtr, gfxstream_vk_pipeline_cache_to_host_u64(pipelineCache));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkPipelineCache(pipelineCache);
-    delete_gfxstream_vk_pipeline_cache(pipelineCache);
+    delete_gfxstream_vk_pipeline_cache(device, pipelineCache, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -3061,29 +2976,12 @@ VkResult VkEncoder::vkCreateComputePipelines(VkDevice device, VkPipelineCache pi
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkComputePipelineCreateInfo* local_pCreateInfos = nullptr;
-    if (pCreateInfos) {
-        local_pCreateInfos = (VkComputePipelineCreateInfo*)pool->alloc(
-            createInfoCount * sizeof(const VkComputePipelineCreateInfo));
-        for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
-            deepcopy_VkComputePipelineCreateInfo(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfos + i,
-                (VkComputePipelineCreateInfo*)(local_pCreateInfos + i));
-        }
-    }
-    if (local_pCreateInfos) {
-        for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
-            transform_tohost_VkComputePipelineCreateInfo(
-                sResourceTracker, (VkComputePipelineCreateInfo*)(local_pCreateInfos + i));
-        }
-    }
     size_t count = 0;
     count += 2 * 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
         count_VkComputePipelineCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkComputePipelineCreateInfo*)(local_pCreateInfos + i),
+                                          (const VkComputePipelineCreateInfo*)(pCreateInfos + i),
                                           &count);
     }
     count += 8;
@@ -3098,7 +2996,7 @@ VkResult VkEncoder::vkCreateComputePipelines(VkDevice device, VkPipelineCache pi
     for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
         reservedmarshal_VkComputePipelineCreateInfo(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkComputePipelineCreateInfo*)(local_pCreateInfos + i), &streamPtr);
+            (const VkComputePipelineCreateInfo*)(pCreateInfos + i), &streamPtr);
     }
     putBe64WithStreamPtr(&streamPtr, 0);
     if (createInfoCount) {
@@ -3106,17 +3004,33 @@ VkResult VkEncoder::vkCreateComputePipelines(VkDevice device, VkPipelineCache pi
             writeStreamVal(&streamPtr, (uint64_t)(pPipelines[k]));
         }
     }
+    bool guestCreateAllocFailed = false;
     if (createInfoCount) {
         uint64_t* cgen_var_0;
         stream->alloc((void**)&cgen_var_0, createInfoCount * 8);
         stream->read(cgen_var_0, createInfoCount * 8);
         for (uint32_t k = 0; k < createInfoCount; ++k) {
-            pPipelines[k] = create_gfxstream_vk_pipeline(cgen_var_0[k]);
-            sResourceTracker->register_VkPipeline(pPipelines[k]);
+            pPipelines[k] = cgen_var_0[k]
+                                ? create_gfxstream_vk_pipeline(device, pAllocator, cgen_var_0[k])
+                                : VK_NULL_HANDLE;
+            if (cgen_var_0[k] && !(pPipelines[k])) {
+                guestCreateAllocFailed = true;
+            }
+        }
+        if (guestCreateAllocFailed) {
+            for (uint32_t k = 0; k < createInfoCount; ++k) {
+                if (pPipelines[k]) {
+                    delete_gfxstream_vk_pipeline(device, pPipelines[k], pAllocator);
+                    pPipelines[k] = VK_NULL_HANDLE;
+                }
+            }
         }
     }
     VkResult vkCreateComputePipelines_VkResult_return = (VkResult)0;
     stream->read(&vkCreateComputePipelines_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateComputePipelines_VkResult_return >= VK_SUCCESS) {
+        vkCreateComputePipelines_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateComputePipelines_VkResult_return;
@@ -3136,8 +3050,7 @@ void VkEncoder::vkDestroyPipeline(VkDevice device, VkPipeline pipeline,
     writeStreamVal(&streamPtr, gfxstream_vk_pipeline_to_host_u64(pipeline));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkPipeline(pipeline);
-    delete_gfxstream_vk_pipeline(pipeline);
+    delete_gfxstream_vk_pipeline(device, pipeline, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -3150,37 +3063,33 @@ VkResult VkEncoder::vkCreatePipelineLayout(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPipelineLayoutCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkPipelineLayoutCreateInfo*)pool->alloc(sizeof(const VkPipelineLayoutCreateInfo));
-        deepcopy_VkPipelineLayoutCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                            (VkPipelineLayoutCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkPipelineLayoutCreateInfo(
-            sResourceTracker, (VkPipelineLayoutCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPipelineLayoutCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkPipelineLayoutCreateInfo*)(local_pCreateInfo), &count);
+                                     (const VkPipelineLayoutCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreatePipelineLayout, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPipelineLayoutCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                               (VkPipelineLayoutCreateInfo*)(local_pCreateInfo),
+                                               (const VkPipelineLayoutCreateInfo*)(pCreateInfo),
                                                &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pPipelineLayout));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pPipelineLayout = create_gfxstream_vk_pipeline_layout(cgen_var_0);
-    sResourceTracker->register_VkPipelineLayout(*pPipelineLayout);
+    *pPipelineLayout = cgen_var_0
+                           ? create_gfxstream_vk_pipeline_layout(device, pAllocator, cgen_var_0)
+                           : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pPipelineLayout)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreatePipelineLayout_VkResult_return = (VkResult)0;
     stream->read(&vkCreatePipelineLayout_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreatePipelineLayout_VkResult_return >= VK_SUCCESS) {
+        vkCreatePipelineLayout_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreatePipelineLayout_VkResult_return;
@@ -3200,8 +3109,7 @@ void VkEncoder::vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout pipeli
     writeStreamVal(&streamPtr, gfxstream_vk_pipeline_layout_to_host_u64(pipelineLayout));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkPipelineLayout(pipelineLayout);
-    delete_gfxstream_vk_pipeline_layout(pipelineLayout);
+    delete_gfxstream_vk_pipeline_layout(device, pipelineLayout, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -3213,35 +3121,31 @@ VkResult VkEncoder::vkCreateSampler(VkDevice device, const VkSamplerCreateInfo* 
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSamplerCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkSamplerCreateInfo*)pool->alloc(sizeof(const VkSamplerCreateInfo));
-        deepcopy_VkSamplerCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                     (VkSamplerCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkSamplerCreateInfo(sResourceTracker,
-                                             (VkSamplerCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSamplerCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkSamplerCreateInfo*)(local_pCreateInfo), &count);
+                              (const VkSamplerCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateSampler, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSamplerCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkSamplerCreateInfo*)(local_pCreateInfo), &streamPtr);
+                                        (const VkSamplerCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pSampler));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pSampler = create_gfxstream_vk_sampler(cgen_var_0);
-    sResourceTracker->register_VkSampler(*pSampler);
+    *pSampler =
+        cgen_var_0 ? create_gfxstream_vk_sampler(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pSampler)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateSampler_VkResult_return = (VkResult)0;
     stream->read(&vkCreateSampler_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateSampler_VkResult_return >= VK_SUCCESS) {
+        vkCreateSampler_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateSampler_VkResult_return;
@@ -3261,8 +3165,7 @@ void VkEncoder::vkDestroySampler(VkDevice device, VkSampler sampler,
     writeStreamVal(&streamPtr, gfxstream_vk_sampler_to_host_u64(sampler));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkSampler(sampler);
-    delete_gfxstream_vk_sampler(sampler);
+    delete_gfxstream_vk_sampler(device, sampler, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -3276,39 +3179,34 @@ VkResult VkEncoder::vkCreateDescriptorSetLayout(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorSetLayoutCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkDescriptorSetLayoutCreateInfo*)pool->alloc(
-            sizeof(const VkDescriptorSetLayoutCreateInfo));
-        deepcopy_VkDescriptorSetLayoutCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDescriptorSetLayoutCreateInfo(
-            sResourceTracker, (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorSetLayoutCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo),
+                                          (const VkDescriptorSetLayoutCreateInfo*)(pCreateInfo),
                                           &count);
     count += 2 * 8;
     uint8_t* streamPtr = reservePacket(stream, OP_vkCreateDescriptorSetLayout, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorSetLayoutCreateInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkDescriptorSetLayoutCreateInfo*)(pCreateInfo),
         &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pSetLayout));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pSetLayout = create_gfxstream_vk_descriptor_set_layout(cgen_var_0);
-    sResourceTracker->register_VkDescriptorSetLayout(*pSetLayout);
+    *pSetLayout = cgen_var_0
+                      ? create_gfxstream_vk_descriptor_set_layout(device, pAllocator, cgen_var_0)
+                      : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pSetLayout)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateDescriptorSetLayout_VkResult_return = (VkResult)0;
     stream->read(&vkCreateDescriptorSetLayout_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateDescriptorSetLayout_VkResult_return >= VK_SUCCESS) {
+        vkCreateDescriptorSetLayout_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateDescriptorSetLayout_VkResult_return;
@@ -3330,8 +3228,7 @@ void VkEncoder::vkDestroyDescriptorSetLayout(VkDevice device,
     writeStreamVal(&streamPtr, gfxstream_vk_descriptor_set_layout_to_host_u64(descriptorSetLayout));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkDescriptorSetLayout(descriptorSetLayout);
-    delete_gfxstream_vk_descriptor_set_layout(descriptorSetLayout);
+    delete_gfxstream_vk_descriptor_set_layout(device, descriptorSetLayout, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -3344,37 +3241,33 @@ VkResult VkEncoder::vkCreateDescriptorPool(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorPoolCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkDescriptorPoolCreateInfo*)pool->alloc(sizeof(const VkDescriptorPoolCreateInfo));
-        deepcopy_VkDescriptorPoolCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                            (VkDescriptorPoolCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDescriptorPoolCreateInfo(
-            sResourceTracker, (VkDescriptorPoolCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorPoolCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkDescriptorPoolCreateInfo*)(local_pCreateInfo), &count);
+                                     (const VkDescriptorPoolCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateDescriptorPool, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorPoolCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                               (VkDescriptorPoolCreateInfo*)(local_pCreateInfo),
+                                               (const VkDescriptorPoolCreateInfo*)(pCreateInfo),
                                                &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pDescriptorPool));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pDescriptorPool = create_gfxstream_vk_descriptor_pool(cgen_var_0);
-    sResourceTracker->register_VkDescriptorPool(*pDescriptorPool);
+    *pDescriptorPool = cgen_var_0
+                           ? create_gfxstream_vk_descriptor_pool(device, pAllocator, cgen_var_0)
+                           : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pDescriptorPool)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateDescriptorPool_VkResult_return = (VkResult)0;
     stream->read(&vkCreateDescriptorPool_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateDescriptorPool_VkResult_return >= VK_SUCCESS) {
+        vkCreateDescriptorPool_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateDescriptorPool_VkResult_return;
@@ -3394,8 +3287,7 @@ void VkEncoder::vkDestroyDescriptorPool(VkDevice device, VkDescriptorPool descri
     writeStreamVal(&streamPtr, gfxstream_vk_descriptor_pool_to_host_u64(descriptorPool));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkDescriptorPool(descriptorPool);
-    delete_gfxstream_vk_descriptor_pool(descriptorPool);
+    delete_gfxstream_vk_descriptor_pool(device, descriptorPool, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -3428,22 +3320,10 @@ VkResult VkEncoder::vkAllocateDescriptorSets(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorSetAllocateInfo* local_pAllocateInfo = nullptr;
-    if (pAllocateInfo) {
-        local_pAllocateInfo =
-            (VkDescriptorSetAllocateInfo*)pool->alloc(sizeof(const VkDescriptorSetAllocateInfo));
-        deepcopy_VkDescriptorSetAllocateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pAllocateInfo,
-                                             (VkDescriptorSetAllocateInfo*)(local_pAllocateInfo));
-    }
-    if (local_pAllocateInfo) {
-        transform_tohost_VkDescriptorSetAllocateInfo(
-            sResourceTracker, (VkDescriptorSetAllocateInfo*)(local_pAllocateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorSetAllocateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkDescriptorSetAllocateInfo*)(local_pAllocateInfo), &count);
+                                      (const VkDescriptorSetAllocateInfo*)(pAllocateInfo), &count);
     if (pAllocateInfo->descriptorSetCount) {
         count += pAllocateInfo->descriptorSetCount * 8;
     }
@@ -3451,24 +3331,40 @@ VkResult VkEncoder::vkAllocateDescriptorSets(VkDevice device,
         reservePacket(stream, OP_vkAllocateDescriptorSets, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorSetAllocateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                (VkDescriptorSetAllocateInfo*)(local_pAllocateInfo),
+                                                (const VkDescriptorSetAllocateInfo*)(pAllocateInfo),
                                                 &streamPtr);
     if (pAllocateInfo->descriptorSetCount) {
         for (uint32_t k = 0; k < pAllocateInfo->descriptorSetCount; ++k) {
             writeStreamVal(&streamPtr, (uint64_t)(pDescriptorSets[k]));
         }
     }
+    bool guestCreateAllocFailed = false;
     if (pAllocateInfo->descriptorSetCount) {
         uint64_t* cgen_var_0;
         stream->alloc((void**)&cgen_var_0, pAllocateInfo->descriptorSetCount * 8);
         stream->read(cgen_var_0, pAllocateInfo->descriptorSetCount * 8);
         for (uint32_t k = 0; k < pAllocateInfo->descriptorSetCount; ++k) {
-            pDescriptorSets[k] = create_gfxstream_vk_descriptor_set(cgen_var_0[k]);
-            sResourceTracker->register_VkDescriptorSet(pDescriptorSets[k]);
+            pDescriptorSets[k] =
+                cgen_var_0[k] ? create_gfxstream_vk_descriptor_set(device, nullptr, cgen_var_0[k])
+                              : VK_NULL_HANDLE;
+            if (cgen_var_0[k] && !(pDescriptorSets[k])) {
+                guestCreateAllocFailed = true;
+            }
+        }
+        if (guestCreateAllocFailed) {
+            for (uint32_t k = 0; k < pAllocateInfo->descriptorSetCount; ++k) {
+                if (pDescriptorSets[k]) {
+                    delete_gfxstream_vk_descriptor_set(device, pDescriptorSets[k], nullptr);
+                    pDescriptorSets[k] = VK_NULL_HANDLE;
+                }
+            }
         }
     }
     VkResult vkAllocateDescriptorSets_VkResult_return = (VkResult)0;
     stream->read(&vkAllocateDescriptorSets_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkAllocateDescriptorSets_VkResult_return >= VK_SUCCESS) {
+        vkAllocateDescriptorSets_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkAllocateDescriptorSets_VkResult_return;
@@ -3508,8 +3404,7 @@ VkResult VkEncoder::vkFreeDescriptorSets(VkDevice device, VkDescriptorPool descr
     stream->read(&vkFreeDescriptorSets_VkResult_return, sizeof(VkResult));
     if (pDescriptorSets) {
         for (uint32_t i = 0; i < descriptorSetCount; ++i) {
-            sResourceTracker->unregister_VkDescriptorSet(pDescriptorSets[i]);
-            delete_gfxstream_vk_descriptor_set(pDescriptorSets[i]);
+            delete_gfxstream_vk_descriptor_set(device, pDescriptorSets[i], nullptr);
         }
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -3526,48 +3421,17 @@ void VkEncoder::vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWrite
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkWriteDescriptorSet* local_pDescriptorWrites = nullptr;
-    VkCopyDescriptorSet* local_pDescriptorCopies = nullptr;
-    if (pDescriptorWrites) {
-        local_pDescriptorWrites = (VkWriteDescriptorSet*)pool->alloc(
-            descriptorWriteCount * sizeof(const VkWriteDescriptorSet));
-        for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
-            deepcopy_VkWriteDescriptorSet(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDescriptorWrites + i,
-                                          (VkWriteDescriptorSet*)(local_pDescriptorWrites + i));
-        }
-    }
-    if (pDescriptorCopies) {
-        local_pDescriptorCopies = (VkCopyDescriptorSet*)pool->alloc(
-            descriptorCopyCount * sizeof(const VkCopyDescriptorSet));
-        for (uint32_t i = 0; i < (uint32_t)descriptorCopyCount; ++i) {
-            deepcopy_VkCopyDescriptorSet(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDescriptorCopies + i,
-                                         (VkCopyDescriptorSet*)(local_pDescriptorCopies + i));
-        }
-    }
-    if (local_pDescriptorWrites) {
-        for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
-            transform_tohost_VkWriteDescriptorSet(
-                sResourceTracker, (VkWriteDescriptorSet*)(local_pDescriptorWrites + i));
-        }
-    }
-    if (local_pDescriptorCopies) {
-        for (uint32_t i = 0; i < (uint32_t)descriptorCopyCount; ++i) {
-            transform_tohost_VkCopyDescriptorSet(
-                sResourceTracker, (VkCopyDescriptorSet*)(local_pDescriptorCopies + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
         count_VkWriteDescriptorSet(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkWriteDescriptorSet*)(local_pDescriptorWrites + i), &count);
+                                   (const VkWriteDescriptorSet*)(pDescriptorWrites + i), &count);
     }
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)descriptorCopyCount; ++i) {
         count_VkCopyDescriptorSet(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkCopyDescriptorSet*)(local_pDescriptorCopies + i), &count);
+                                  (const VkCopyDescriptorSet*)(pDescriptorCopies + i), &count);
     }
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkUpdateDescriptorSets, count, queueSubmitWithCommandsEnabled);
@@ -3575,13 +3439,13 @@ void VkEncoder::vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWrite
     writeStreamBytes(&streamPtr, &descriptorWriteCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
         reservedmarshal_VkWriteDescriptorSet(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                             (VkWriteDescriptorSet*)(local_pDescriptorWrites + i),
+                                             (const VkWriteDescriptorSet*)(pDescriptorWrites + i),
                                              &streamPtr);
     }
     writeStreamBytes(&streamPtr, &descriptorCopyCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)descriptorCopyCount; ++i) {
         reservedmarshal_VkCopyDescriptorSet(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                            (VkCopyDescriptorSet*)(local_pDescriptorCopies + i),
+                                            (const VkCopyDescriptorSet*)(pDescriptorCopies + i),
                                             &streamPtr);
     }
     stream->flush();
@@ -3781,54 +3645,6 @@ void VkEncoder::vkCmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCou
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkMemoryBarrier* local_pMemoryBarriers = nullptr;
-    VkBufferMemoryBarrier* local_pBufferMemoryBarriers = nullptr;
-    VkImageMemoryBarrier* local_pImageMemoryBarriers = nullptr;
-    if (pMemoryBarriers) {
-        local_pMemoryBarriers =
-            (VkMemoryBarrier*)pool->alloc(memoryBarrierCount * sizeof(const VkMemoryBarrier));
-        for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
-            deepcopy_VkMemoryBarrier(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pMemoryBarriers + i,
-                                     (VkMemoryBarrier*)(local_pMemoryBarriers + i));
-        }
-    }
-    if (pBufferMemoryBarriers) {
-        local_pBufferMemoryBarriers = (VkBufferMemoryBarrier*)pool->alloc(
-            bufferMemoryBarrierCount * sizeof(const VkBufferMemoryBarrier));
-        for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
-            deepcopy_VkBufferMemoryBarrier(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBufferMemoryBarriers + i,
-                (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i));
-        }
-    }
-    if (pImageMemoryBarriers) {
-        local_pImageMemoryBarriers = (VkImageMemoryBarrier*)pool->alloc(
-            imageMemoryBarrierCount * sizeof(const VkImageMemoryBarrier));
-        for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
-            deepcopy_VkImageMemoryBarrier(pool, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          pImageMemoryBarriers + i,
-                                          (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i));
-        }
-    }
-    if (local_pMemoryBarriers) {
-        for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
-            transform_tohost_VkMemoryBarrier(sResourceTracker,
-                                             (VkMemoryBarrier*)(local_pMemoryBarriers + i));
-        }
-    }
-    if (local_pBufferMemoryBarriers) {
-        for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
-            transform_tohost_VkBufferMemoryBarrier(
-                sResourceTracker, (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i));
-        }
-    }
-    if (local_pImageMemoryBarriers) {
-        for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
-            transform_tohost_VkImageMemoryBarrier(
-                sResourceTracker, (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
@@ -3839,18 +3655,18 @@ void VkEncoder::vkCmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCou
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
         count_VkMemoryBarrier(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkMemoryBarrier*)(local_pMemoryBarriers + i), &count);
+                              (const VkMemoryBarrier*)(pMemoryBarriers + i), &count);
     }
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
         count_VkBufferMemoryBarrier(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i),
+                                    (const VkBufferMemoryBarrier*)(pBufferMemoryBarriers + i),
                                     &count);
     }
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
         count_VkImageMemoryBarrier(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i), &count);
+                                   (const VkImageMemoryBarrier*)(pImageMemoryBarriers + i), &count);
     }
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdWaitEvents, count, queueSubmitWithCommandsEnabled);
@@ -3868,19 +3684,19 @@ void VkEncoder::vkCmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCou
     writeStreamBytes(&streamPtr, &memoryBarrierCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)memoryBarrierCount; ++i) {
         reservedmarshal_VkMemoryBarrier(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkMemoryBarrier*)(local_pMemoryBarriers + i), &streamPtr);
+                                        (const VkMemoryBarrier*)(pMemoryBarriers + i), &streamPtr);
     }
     writeStreamBytes(&streamPtr, &bufferMemoryBarrierCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)bufferMemoryBarrierCount; ++i) {
         reservedmarshal_VkBufferMemoryBarrier(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkBufferMemoryBarrier*)(local_pBufferMemoryBarriers + i), &streamPtr);
+            (const VkBufferMemoryBarrier*)(pBufferMemoryBarriers + i), &streamPtr);
     }
     writeStreamBytes(&streamPtr, &imageMemoryBarrierCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)imageMemoryBarrierCount; ++i) {
         reservedmarshal_VkImageMemoryBarrier(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkImageMemoryBarrier*)(local_pImageMemoryBarriers + i), &streamPtr);
+            (const VkImageMemoryBarrier*)(pImageMemoryBarriers + i), &streamPtr);
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -3925,29 +3741,12 @@ VkResult VkEncoder::vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkGraphicsPipelineCreateInfo* local_pCreateInfos = nullptr;
-    if (pCreateInfos) {
-        local_pCreateInfos = (VkGraphicsPipelineCreateInfo*)pool->alloc(
-            createInfoCount * sizeof(const VkGraphicsPipelineCreateInfo));
-        for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
-            deepcopy_VkGraphicsPipelineCreateInfo(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfos + i,
-                (VkGraphicsPipelineCreateInfo*)(local_pCreateInfos + i));
-        }
-    }
-    if (local_pCreateInfos) {
-        for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
-            transform_tohost_VkGraphicsPipelineCreateInfo(
-                sResourceTracker, (VkGraphicsPipelineCreateInfo*)(local_pCreateInfos + i));
-        }
-    }
     size_t count = 0;
     count += 2 * 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
         count_VkGraphicsPipelineCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                           (VkGraphicsPipelineCreateInfo*)(local_pCreateInfos + i),
+                                           (const VkGraphicsPipelineCreateInfo*)(pCreateInfos + i),
                                            &count);
     }
     count += 8;
@@ -3962,7 +3761,7 @@ VkResult VkEncoder::vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
     for (uint32_t i = 0; i < (uint32_t)createInfoCount; ++i) {
         reservedmarshal_VkGraphicsPipelineCreateInfo(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkGraphicsPipelineCreateInfo*)(local_pCreateInfos + i), &streamPtr);
+            (const VkGraphicsPipelineCreateInfo*)(pCreateInfos + i), &streamPtr);
     }
     putBe64WithStreamPtr(&streamPtr, 0);
     if (createInfoCount) {
@@ -3970,17 +3769,33 @@ VkResult VkEncoder::vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache p
             writeStreamVal(&streamPtr, (uint64_t)(pPipelines[k]));
         }
     }
+    bool guestCreateAllocFailed = false;
     if (createInfoCount) {
         uint64_t* cgen_var_0;
         stream->alloc((void**)&cgen_var_0, createInfoCount * 8);
         stream->read(cgen_var_0, createInfoCount * 8);
         for (uint32_t k = 0; k < createInfoCount; ++k) {
-            pPipelines[k] = create_gfxstream_vk_pipeline(cgen_var_0[k]);
-            sResourceTracker->register_VkPipeline(pPipelines[k]);
+            pPipelines[k] = cgen_var_0[k]
+                                ? create_gfxstream_vk_pipeline(device, pAllocator, cgen_var_0[k])
+                                : VK_NULL_HANDLE;
+            if (cgen_var_0[k] && !(pPipelines[k])) {
+                guestCreateAllocFailed = true;
+            }
+        }
+        if (guestCreateAllocFailed) {
+            for (uint32_t k = 0; k < createInfoCount; ++k) {
+                if (pPipelines[k]) {
+                    delete_gfxstream_vk_pipeline(device, pPipelines[k], pAllocator);
+                    pPipelines[k] = VK_NULL_HANDLE;
+                }
+            }
         }
     }
     VkResult vkCreateGraphicsPipelines_VkResult_return = (VkResult)0;
     stream->read(&vkCreateGraphicsPipelines_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateGraphicsPipelines_VkResult_return >= VK_SUCCESS) {
+        vkCreateGraphicsPipelines_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateGraphicsPipelines_VkResult_return;
@@ -3993,37 +3808,32 @@ VkResult VkEncoder::vkCreateFramebuffer(VkDevice device, const VkFramebufferCrea
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkFramebufferCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkFramebufferCreateInfo*)pool->alloc(sizeof(const VkFramebufferCreateInfo));
-        deepcopy_VkFramebufferCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                         (VkFramebufferCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkFramebufferCreateInfo(sResourceTracker,
-                                                 (VkFramebufferCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkFramebufferCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkFramebufferCreateInfo*)(local_pCreateInfo), &count);
+                                  (const VkFramebufferCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateFramebuffer, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkFramebufferCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                            (VkFramebufferCreateInfo*)(local_pCreateInfo),
+                                            (const VkFramebufferCreateInfo*)(pCreateInfo),
                                             &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pFramebuffer));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pFramebuffer = create_gfxstream_vk_framebuffer(cgen_var_0);
-    sResourceTracker->register_VkFramebuffer(*pFramebuffer);
+    *pFramebuffer = cgen_var_0 ? create_gfxstream_vk_framebuffer(device, pAllocator, cgen_var_0)
+                               : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pFramebuffer)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateFramebuffer_VkResult_return = (VkResult)0;
     stream->read(&vkCreateFramebuffer_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateFramebuffer_VkResult_return >= VK_SUCCESS) {
+        vkCreateFramebuffer_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateFramebuffer_VkResult_return;
@@ -4043,8 +3853,7 @@ void VkEncoder::vkDestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer,
     writeStreamVal(&streamPtr, gfxstream_vk_framebuffer_to_host_u64(framebuffer));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkFramebuffer(framebuffer);
-    delete_gfxstream_vk_framebuffer(framebuffer);
+    delete_gfxstream_vk_framebuffer(device, framebuffer, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -4056,37 +3865,32 @@ VkResult VkEncoder::vkCreateRenderPass(VkDevice device, const VkRenderPassCreate
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderPassCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkRenderPassCreateInfo*)pool->alloc(sizeof(const VkRenderPassCreateInfo));
-        deepcopy_VkRenderPassCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                        (VkRenderPassCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkRenderPassCreateInfo(sResourceTracker,
-                                                (VkRenderPassCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderPassCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                 (VkRenderPassCreateInfo*)(local_pCreateInfo), &count);
+                                 (const VkRenderPassCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateRenderPass, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkRenderPassCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                           (VkRenderPassCreateInfo*)(local_pCreateInfo),
+                                           (const VkRenderPassCreateInfo*)(pCreateInfo),
                                            &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pRenderPass));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pRenderPass = create_gfxstream_vk_render_pass(cgen_var_0);
-    sResourceTracker->register_VkRenderPass(*pRenderPass);
+    *pRenderPass = cgen_var_0 ? create_gfxstream_vk_render_pass(device, pAllocator, cgen_var_0)
+                              : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pRenderPass)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateRenderPass_VkResult_return = (VkResult)0;
     stream->read(&vkCreateRenderPass_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateRenderPass_VkResult_return >= VK_SUCCESS) {
+        vkCreateRenderPass_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateRenderPass_VkResult_return;
@@ -4106,8 +3910,7 @@ void VkEncoder::vkDestroyRenderPass(VkDevice device, VkRenderPass renderPass,
     writeStreamVal(&streamPtr, gfxstream_vk_render_pass_to_host_u64(renderPass));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkRenderPass(renderPass);
-    delete_gfxstream_vk_render_pass(renderPass);
+    delete_gfxstream_vk_render_pass(device, renderPass, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -4643,22 +4446,10 @@ void VkEncoder::vkCmdBeginRenderPass(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderPassBeginInfo* local_pRenderPassBegin = nullptr;
-    if (pRenderPassBegin) {
-        local_pRenderPassBegin =
-            (VkRenderPassBeginInfo*)pool->alloc(sizeof(const VkRenderPassBeginInfo));
-        deepcopy_VkRenderPassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderPassBegin,
-                                       (VkRenderPassBeginInfo*)(local_pRenderPassBegin));
-    }
-    if (local_pRenderPassBegin) {
-        transform_tohost_VkRenderPassBeginInfo(sResourceTracker,
-                                               (VkRenderPassBeginInfo*)(local_pRenderPassBegin));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderPassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkRenderPassBeginInfo*)(local_pRenderPassBegin), &count);
+                                (const VkRenderPassBeginInfo*)(pRenderPassBegin), &count);
     count += sizeof(VkSubpassContents);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdBeginRenderPass, count, queueSubmitWithCommandsEnabled);
@@ -4666,7 +4457,7 @@ void VkEncoder::vkCmdBeginRenderPass(VkCommandBuffer commandBuffer,
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkRenderPassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkRenderPassBeginInfo*)(local_pRenderPassBegin),
+                                          (const VkRenderPassBeginInfo*)(pRenderPassBegin),
                                           &streamPtr);
     writeStreamBytes(&streamPtr, &contents, sizeof(VkSubpassContents));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -4922,15 +4713,6 @@ VkResult VkEncoder::vkEnumeratePhysicalDeviceGroups(
             }
         }
     }
-    if (pPhysicalDeviceGroupCount) {
-        if (pPhysicalDeviceGroupProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pPhysicalDeviceGroupCount); ++i) {
-                transform_fromhost_VkPhysicalDeviceGroupProperties(
-                    sResourceTracker,
-                    (VkPhysicalDeviceGroupProperties*)(pPhysicalDeviceGroupProperties + i));
-            }
-        }
-    }
     VkResult vkEnumeratePhysicalDeviceGroups_VkResult_return = (VkResult)0;
     stream->read(&vkEnumeratePhysicalDeviceGroups_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -4946,29 +4728,17 @@ void VkEncoder::vkGetImageMemoryRequirements2(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageMemoryRequirementsInfo2* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo = (VkImageMemoryRequirementsInfo2*)pool->alloc(
-            sizeof(const VkImageMemoryRequirementsInfo2));
-        deepcopy_VkImageMemoryRequirementsInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                                (VkImageMemoryRequirementsInfo2*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkImageMemoryRequirementsInfo2(
-            sResourceTracker, (VkImageMemoryRequirementsInfo2*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImageMemoryRequirementsInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                         (VkImageMemoryRequirementsInfo2*)(local_pInfo), &count);
+                                         (const VkImageMemoryRequirementsInfo2*)(pInfo), &count);
     count_VkMemoryRequirements2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                 (VkMemoryRequirements2*)(pMemoryRequirements), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetImageMemoryRequirements2, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImageMemoryRequirementsInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                   (VkImageMemoryRequirementsInfo2*)(local_pInfo),
+                                                   (const VkImageMemoryRequirementsInfo2*)(pInfo),
                                                    &streamPtr);
     reservedmarshal_VkMemoryRequirements2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                           (VkMemoryRequirements2*)(pMemoryRequirements),
@@ -4991,29 +4761,17 @@ void VkEncoder::vkGetBufferMemoryRequirements2(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferMemoryRequirementsInfo2* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo = (VkBufferMemoryRequirementsInfo2*)pool->alloc(
-            sizeof(const VkBufferMemoryRequirementsInfo2));
-        deepcopy_VkBufferMemoryRequirementsInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                                 (VkBufferMemoryRequirementsInfo2*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkBufferMemoryRequirementsInfo2(
-            sResourceTracker, (VkBufferMemoryRequirementsInfo2*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferMemoryRequirementsInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkBufferMemoryRequirementsInfo2*)(local_pInfo), &count);
+                                          (const VkBufferMemoryRequirementsInfo2*)(pInfo), &count);
     count_VkMemoryRequirements2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                 (VkMemoryRequirements2*)(pMemoryRequirements), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetBufferMemoryRequirements2, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferMemoryRequirementsInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                    (VkBufferMemoryRequirementsInfo2*)(local_pInfo),
+                                                    (const VkBufferMemoryRequirementsInfo2*)(pInfo),
                                                     &streamPtr);
     reservedmarshal_VkMemoryRequirements2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                           (VkMemoryRequirements2*)(pMemoryRequirements),
@@ -5036,23 +4794,10 @@ void VkEncoder::vkGetImageSparseMemoryRequirements2(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageSparseMemoryRequirementsInfo2* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo = (VkImageSparseMemoryRequirementsInfo2*)pool->alloc(
-            sizeof(const VkImageSparseMemoryRequirementsInfo2));
-        deepcopy_VkImageSparseMemoryRequirementsInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-            (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkImageSparseMemoryRequirementsInfo2(
-            sResourceTracker, (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImageSparseMemoryRequirementsInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                               (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo),
+                                               (const VkImageSparseMemoryRequirementsInfo2*)(pInfo),
                                                &count);
     count += 8;
     if (pSparseMemoryRequirementCount) {
@@ -5072,7 +4817,7 @@ void VkEncoder::vkGetImageSparseMemoryRequirements2(
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImageSparseMemoryRequirementsInfo2(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkImageSparseMemoryRequirementsInfo2*)(pInfo),
         &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pSparseMemoryRequirementCount);
     if (pSparseMemoryRequirementCount) {
@@ -5107,15 +4852,6 @@ void VkEncoder::vkGetImageSparseMemoryRequirements2(
             }
         }
     }
-    if (pSparseMemoryRequirementCount) {
-        if (pSparseMemoryRequirements) {
-            for (uint32_t i = 0; i < (uint32_t)(*pSparseMemoryRequirementCount); ++i) {
-                transform_fromhost_VkSparseImageMemoryRequirements2(
-                    sResourceTracker,
-                    (VkSparseImageMemoryRequirements2*)(pSparseMemoryRequirements + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5138,10 +4874,6 @@ void VkEncoder::vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
                                               (VkPhysicalDeviceFeatures2*)(pFeatures), &streamPtr);
     unmarshal_VkPhysicalDeviceFeatures2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                         (VkPhysicalDeviceFeatures2*)(pFeatures));
-    if (pFeatures) {
-        transform_fromhost_VkPhysicalDeviceFeatures2(sResourceTracker,
-                                                     (VkPhysicalDeviceFeatures2*)(pFeatures));
-    }
     sResourceTracker->on_vkGetPhysicalDeviceFeatures2(this, physicalDevice, pFeatures);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -5166,10 +4898,6 @@ void VkEncoder::vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
                                                 &streamPtr);
     unmarshal_VkPhysicalDeviceProperties2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                           (VkPhysicalDeviceProperties2*)(pProperties));
-    if (pProperties) {
-        transform_fromhost_VkPhysicalDeviceProperties2(sResourceTracker,
-                                                       (VkPhysicalDeviceProperties2*)(pProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5195,10 +4923,6 @@ void VkEncoder::vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDe
                                         (VkFormatProperties2*)(pFormatProperties), &streamPtr);
     unmarshal_VkFormatProperties2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                   (VkFormatProperties2*)(pFormatProperties));
-    if (pFormatProperties) {
-        transform_fromhost_VkFormatProperties2(sResourceTracker,
-                                               (VkFormatProperties2*)(pFormatProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5309,14 +5033,6 @@ void VkEncoder::vkGetPhysicalDeviceQueueFamilyProperties2(
             }
         }
     }
-    if (pQueueFamilyPropertyCount) {
-        if (pQueueFamilyProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pQueueFamilyPropertyCount); ++i) {
-                transform_fromhost_VkQueueFamilyProperties2(
-                    sResourceTracker, (VkQueueFamilyProperties2*)(pQueueFamilyProperties + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5342,10 +5058,6 @@ void VkEncoder::vkGetPhysicalDeviceMemoryProperties2(
     unmarshal_VkPhysicalDeviceMemoryProperties2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkPhysicalDeviceMemoryProperties2*)(pMemoryProperties));
-    if (pMemoryProperties) {
-        transform_fromhost_VkPhysicalDeviceMemoryProperties2(
-            sResourceTracker, (VkPhysicalDeviceMemoryProperties2*)(pMemoryProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5357,24 +5069,11 @@ void VkEncoder::vkGetPhysicalDeviceSparseImageFormatProperties2(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPhysicalDeviceSparseImageFormatInfo2* local_pFormatInfo = nullptr;
-    if (pFormatInfo) {
-        local_pFormatInfo = (VkPhysicalDeviceSparseImageFormatInfo2*)pool->alloc(
-            sizeof(const VkPhysicalDeviceSparseImageFormatInfo2));
-        deepcopy_VkPhysicalDeviceSparseImageFormatInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pFormatInfo,
-            (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo));
-    }
-    if (local_pFormatInfo) {
-        transform_tohost_VkPhysicalDeviceSparseImageFormatInfo2(
-            sResourceTracker, (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPhysicalDeviceSparseImageFormatInfo2(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo), &count);
+        (const VkPhysicalDeviceSparseImageFormatInfo2*)(pFormatInfo), &count);
     count += 8;
     if (pPropertyCount) {
         count += sizeof(uint32_t);
@@ -5394,7 +5093,7 @@ void VkEncoder::vkGetPhysicalDeviceSparseImageFormatProperties2(
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkPhysicalDeviceSparseImageFormatInfo2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo), &streamPtr);
+        (const VkPhysicalDeviceSparseImageFormatInfo2*)(pFormatInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pPropertyCount);
     if (pPropertyCount) {
         writeStreamBytes(&streamPtr, pPropertyCount, sizeof(uint32_t));
@@ -5427,14 +5126,6 @@ void VkEncoder::vkGetPhysicalDeviceSparseImageFormatProperties2(
             }
         }
     }
-    if (pPropertyCount) {
-        if (pProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pPropertyCount); ++i) {
-                transform_fromhost_VkSparseImageFormatProperties2(
-                    sResourceTracker, (VkSparseImageFormatProperties2*)(pProperties + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5464,32 +5155,20 @@ void VkEncoder::vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQu
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDeviceQueueInfo2* local_pQueueInfo = nullptr;
-    if (pQueueInfo) {
-        local_pQueueInfo = (VkDeviceQueueInfo2*)pool->alloc(sizeof(const VkDeviceQueueInfo2));
-        deepcopy_VkDeviceQueueInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pQueueInfo,
-                                    (VkDeviceQueueInfo2*)(local_pQueueInfo));
-    }
-    if (local_pQueueInfo) {
-        transform_tohost_VkDeviceQueueInfo2(sResourceTracker,
-                                            (VkDeviceQueueInfo2*)(local_pQueueInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDeviceQueueInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                             (VkDeviceQueueInfo2*)(local_pQueueInfo), &count);
+                             (const VkDeviceQueueInfo2*)(pQueueInfo), &count);
     count += 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkGetDeviceQueue2, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDeviceQueueInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                       (VkDeviceQueueInfo2*)(local_pQueueInfo), &streamPtr);
+                                       (const VkDeviceQueueInfo2*)(pQueueInfo), &streamPtr);
     writeStreamVal(&streamPtr, (uint64_t)(*pQueue));
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pQueue = create_gfxstream_vk_queue(cgen_var_0);
-    sResourceTracker->register_VkQueue(*pQueue);
+    *pQueue = cgen_var_0 ? create_gfxstream_vk_queue(device, nullptr, cgen_var_0) : VK_NULL_HANDLE;
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5552,24 +5231,11 @@ void VkEncoder::vkGetPhysicalDeviceExternalFenceProperties(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPhysicalDeviceExternalFenceInfo* local_pExternalFenceInfo = nullptr;
-    if (pExternalFenceInfo) {
-        local_pExternalFenceInfo = (VkPhysicalDeviceExternalFenceInfo*)pool->alloc(
-            sizeof(const VkPhysicalDeviceExternalFenceInfo));
-        deepcopy_VkPhysicalDeviceExternalFenceInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pExternalFenceInfo,
-            (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo));
-    }
-    if (local_pExternalFenceInfo) {
-        transform_tohost_VkPhysicalDeviceExternalFenceInfo(
-            sResourceTracker, (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPhysicalDeviceExternalFenceInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo), &count);
+        (const VkPhysicalDeviceExternalFenceInfo*)(pExternalFenceInfo), &count);
     count_VkExternalFenceProperties(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                     (VkExternalFenceProperties*)(pExternalFenceProperties), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetPhysicalDeviceExternalFenceProperties, count,
@@ -5577,16 +5243,12 @@ void VkEncoder::vkGetPhysicalDeviceExternalFenceProperties(
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkPhysicalDeviceExternalFenceInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo), &streamPtr);
+        (const VkPhysicalDeviceExternalFenceInfo*)(pExternalFenceInfo), &streamPtr);
     reservedmarshal_VkExternalFenceProperties(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkExternalFenceProperties*)(pExternalFenceProperties),
         &streamPtr);
     unmarshal_VkExternalFenceProperties(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                         (VkExternalFenceProperties*)(pExternalFenceProperties));
-    if (pExternalFenceProperties) {
-        transform_fromhost_VkExternalFenceProperties(
-            sResourceTracker, (VkExternalFenceProperties*)(pExternalFenceProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5599,25 +5261,11 @@ void VkEncoder::vkGetPhysicalDeviceExternalSemaphoreProperties(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPhysicalDeviceExternalSemaphoreInfo* local_pExternalSemaphoreInfo = nullptr;
-    if (pExternalSemaphoreInfo) {
-        local_pExternalSemaphoreInfo = (VkPhysicalDeviceExternalSemaphoreInfo*)pool->alloc(
-            sizeof(const VkPhysicalDeviceExternalSemaphoreInfo));
-        deepcopy_VkPhysicalDeviceExternalSemaphoreInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pExternalSemaphoreInfo,
-            (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo));
-    }
-    if (local_pExternalSemaphoreInfo) {
-        transform_tohost_VkPhysicalDeviceExternalSemaphoreInfo(
-            sResourceTracker,
-            (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPhysicalDeviceExternalSemaphoreInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo), &count);
+        (const VkPhysicalDeviceExternalSemaphoreInfo*)(pExternalSemaphoreInfo), &count);
     count_VkExternalSemaphoreProperties(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties), &count);
@@ -5626,17 +5274,13 @@ void VkEncoder::vkGetPhysicalDeviceExternalSemaphoreProperties(
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkPhysicalDeviceExternalSemaphoreInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo), &streamPtr);
+        (const VkPhysicalDeviceExternalSemaphoreInfo*)(pExternalSemaphoreInfo), &streamPtr);
     reservedmarshal_VkExternalSemaphoreProperties(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties), &streamPtr);
     unmarshal_VkExternalSemaphoreProperties(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties));
-    if (pExternalSemaphoreProperties) {
-        transform_fromhost_VkExternalSemaphoreProperties(
-            sResourceTracker, (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties));
-    }
     sResourceTracker->on_vkGetPhysicalDeviceExternalSemaphoreProperties(
         this, physicalDevice, pExternalSemaphoreInfo, pExternalSemaphoreProperties);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -5678,42 +5322,38 @@ VkResult VkEncoder::vkCreateDescriptorUpdateTemplate(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorUpdateTemplateCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkDescriptorUpdateTemplateCreateInfo*)pool->alloc(
-            sizeof(const VkDescriptorUpdateTemplateCreateInfo));
-        deepcopy_VkDescriptorUpdateTemplateCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDescriptorUpdateTemplateCreateInfo(
-            sResourceTracker, (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorUpdateTemplateCreateInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo), &count);
+        (const VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr = reservePacket(stream, OP_vkCreateDescriptorUpdateTemplate, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorUpdateTemplateCreateInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo), &streamPtr);
+        (const VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pDescriptorUpdateTemplate));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pDescriptorUpdateTemplate = create_gfxstream_vk_descriptor_update_template(cgen_var_0);
-    sResourceTracker->register_VkDescriptorUpdateTemplate(*pDescriptorUpdateTemplate);
+    *pDescriptorUpdateTemplate =
+        cgen_var_0 ? create_gfxstream_vk_descriptor_update_template(device, pAllocator, cgen_var_0)
+                   : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pDescriptorUpdateTemplate)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateDescriptorUpdateTemplate_VkResult_return = (VkResult)0;
     stream->read(&vkCreateDescriptorUpdateTemplate_VkResult_return, sizeof(VkResult));
-    sResourceTracker->on_vkCreateDescriptorUpdateTemplate(
-        this, vkCreateDescriptorUpdateTemplate_VkResult_return, device, pCreateInfo, pAllocator,
-        pDescriptorUpdateTemplate);
+    if (guestCreateAllocFailed && vkCreateDescriptorUpdateTemplate_VkResult_return >= VK_SUCCESS) {
+        vkCreateDescriptorUpdateTemplate_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkCreateDescriptorUpdateTemplate_VkResult_return =
+        sResourceTracker->on_vkCreateDescriptorUpdateTemplate(
+            this, vkCreateDescriptorUpdateTemplate_VkResult_return, device, pCreateInfo, pAllocator,
+            pDescriptorUpdateTemplate);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateDescriptorUpdateTemplate_VkResult_return;
@@ -5735,8 +5375,7 @@ void VkEncoder::vkDestroyDescriptorUpdateTemplate(
                    gfxstream_vk_descriptor_update_template_to_host_u64(descriptorUpdateTemplate));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkDescriptorUpdateTemplate(descriptorUpdateTemplate);
-    delete_gfxstream_vk_descriptor_update_template(descriptorUpdateTemplate);
+    delete_gfxstream_vk_descriptor_update_template(device, descriptorUpdateTemplate, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5776,23 +5415,10 @@ void VkEncoder::vkGetDescriptorSetLayoutSupport(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorSetLayoutCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkDescriptorSetLayoutCreateInfo*)pool->alloc(
-            sizeof(const VkDescriptorSetLayoutCreateInfo));
-        deepcopy_VkDescriptorSetLayoutCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDescriptorSetLayoutCreateInfo(
-            sResourceTracker, (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorSetLayoutCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo),
+                                          (const VkDescriptorSetLayoutCreateInfo*)(pCreateInfo),
                                           &count);
     count_VkDescriptorSetLayoutSupport(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                        (VkDescriptorSetLayoutSupport*)(pSupport), &count);
@@ -5800,16 +5426,12 @@ void VkEncoder::vkGetDescriptorSetLayoutSupport(VkDevice device,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorSetLayoutCreateInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkDescriptorSetLayoutCreateInfo*)(pCreateInfo),
         &streamPtr);
     reservedmarshal_VkDescriptorSetLayoutSupport(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkDescriptorSetLayoutSupport*)(pSupport), &streamPtr);
     unmarshal_VkDescriptorSetLayoutSupport(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                            (VkDescriptorSetLayoutSupport*)(pSupport));
-    if (pSupport) {
-        transform_fromhost_VkDescriptorSetLayoutSupport(sResourceTracker,
-                                                        (VkDescriptorSetLayoutSupport*)(pSupport));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5822,39 +5444,34 @@ VkResult VkEncoder::vkCreateSamplerYcbcrConversion(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSamplerYcbcrConversionCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkSamplerYcbcrConversionCreateInfo*)pool->alloc(
-            sizeof(const VkSamplerYcbcrConversionCreateInfo));
-        deepcopy_VkSamplerYcbcrConversionCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkSamplerYcbcrConversionCreateInfo(
-            sResourceTracker, (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSamplerYcbcrConversionCreateInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo), &count);
+        (const VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr = reservePacket(stream, OP_vkCreateSamplerYcbcrConversion, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSamplerYcbcrConversionCreateInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo), &streamPtr);
+        (const VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pYcbcrConversion));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pYcbcrConversion = create_gfxstream_vk_sampler_ycbcr_conversion(cgen_var_0);
-    sResourceTracker->register_VkSamplerYcbcrConversion(*pYcbcrConversion);
+    *pYcbcrConversion =
+        cgen_var_0 ? create_gfxstream_vk_sampler_ycbcr_conversion(device, pAllocator, cgen_var_0)
+                   : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pYcbcrConversion)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateSamplerYcbcrConversion_VkResult_return = (VkResult)0;
     stream->read(&vkCreateSamplerYcbcrConversion_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateSamplerYcbcrConversion_VkResult_return >= VK_SUCCESS) {
+        vkCreateSamplerYcbcrConversion_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateSamplerYcbcrConversion_VkResult_return;
@@ -5876,8 +5493,7 @@ void VkEncoder::vkDestroySamplerYcbcrConversion(VkDevice device,
     writeStreamVal(&streamPtr, gfxstream_vk_sampler_ycbcr_conversion_to_host_u64(ycbcrConversion));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkSamplerYcbcrConversion(ycbcrConversion);
-    delete_gfxstream_vk_sampler_ycbcr_conversion(ycbcrConversion);
+    delete_gfxstream_vk_sampler_ycbcr_conversion(device, ycbcrConversion, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -5932,27 +5548,16 @@ VkResult VkEncoder::vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo*
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSemaphoreWaitInfo* local_pWaitInfo = nullptr;
-    if (pWaitInfo) {
-        local_pWaitInfo = (VkSemaphoreWaitInfo*)pool->alloc(sizeof(const VkSemaphoreWaitInfo));
-        deepcopy_VkSemaphoreWaitInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pWaitInfo,
-                                     (VkSemaphoreWaitInfo*)(local_pWaitInfo));
-    }
-    if (local_pWaitInfo) {
-        transform_tohost_VkSemaphoreWaitInfo(sResourceTracker,
-                                             (VkSemaphoreWaitInfo*)(local_pWaitInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSemaphoreWaitInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkSemaphoreWaitInfo*)(local_pWaitInfo), &count);
+                              (const VkSemaphoreWaitInfo*)(pWaitInfo), &count);
     count += sizeof(uint64_t);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkWaitSemaphores, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSemaphoreWaitInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkSemaphoreWaitInfo*)(local_pWaitInfo), &streamPtr);
+                                        (const VkSemaphoreWaitInfo*)(pWaitInfo), &streamPtr);
     writeStreamBytes(&streamPtr, &timeout, sizeof(uint64_t));
     VkResult vkWaitSemaphores_VkResult_return = (VkResult)0;
     stream->read(&vkWaitSemaphores_VkResult_return, sizeof(VkResult));
@@ -5967,27 +5572,15 @@ VkResult VkEncoder::vkSignalSemaphore(VkDevice device, const VkSemaphoreSignalIn
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSemaphoreSignalInfo* local_pSignalInfo = nullptr;
-    if (pSignalInfo) {
-        local_pSignalInfo =
-            (VkSemaphoreSignalInfo*)pool->alloc(sizeof(const VkSemaphoreSignalInfo));
-        deepcopy_VkSemaphoreSignalInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSignalInfo,
-                                       (VkSemaphoreSignalInfo*)(local_pSignalInfo));
-    }
-    if (local_pSignalInfo) {
-        transform_tohost_VkSemaphoreSignalInfo(sResourceTracker,
-                                               (VkSemaphoreSignalInfo*)(local_pSignalInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSemaphoreSignalInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkSemaphoreSignalInfo*)(local_pSignalInfo), &count);
+                                (const VkSemaphoreSignalInfo*)(pSignalInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkSignalSemaphore, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSemaphoreSignalInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkSemaphoreSignalInfo*)(local_pSignalInfo), &streamPtr);
+                                          (const VkSemaphoreSignalInfo*)(pSignalInfo), &streamPtr);
     VkResult vkSignalSemaphore_VkResult_return = (VkResult)0;
     stream->read(&vkSignalSemaphore_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -6002,27 +5595,15 @@ VkDeviceAddress VkEncoder::vkGetBufferDeviceAddress(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferDeviceAddressInfo* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo =
-            (VkBufferDeviceAddressInfo*)pool->alloc(sizeof(const VkBufferDeviceAddressInfo));
-        deepcopy_VkBufferDeviceAddressInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                           (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkBufferDeviceAddressInfo(sResourceTracker,
-                                                   (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferDeviceAddressInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkBufferDeviceAddressInfo*)(local_pInfo), &count);
+                                    (const VkBufferDeviceAddressInfo*)(pInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkGetBufferDeviceAddress, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferDeviceAddressInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkBufferDeviceAddressInfo*)(local_pInfo), &streamPtr);
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkBufferDeviceAddressInfo*)(pInfo), &streamPtr);
     VkDeviceAddress vkGetBufferDeviceAddress_VkDeviceAddress_return = (VkDeviceAddress)0;
     stream->read(&vkGetBufferDeviceAddress_VkDeviceAddress_return, sizeof(VkDeviceAddress));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -6037,27 +5618,15 @@ uint64_t VkEncoder::vkGetBufferOpaqueCaptureAddress(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferDeviceAddressInfo* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo =
-            (VkBufferDeviceAddressInfo*)pool->alloc(sizeof(const VkBufferDeviceAddressInfo));
-        deepcopy_VkBufferDeviceAddressInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                           (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkBufferDeviceAddressInfo(sResourceTracker,
-                                                   (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferDeviceAddressInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkBufferDeviceAddressInfo*)(local_pInfo), &count);
+                                    (const VkBufferDeviceAddressInfo*)(pInfo), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetBufferOpaqueCaptureAddress, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferDeviceAddressInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkBufferDeviceAddressInfo*)(local_pInfo), &streamPtr);
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkBufferDeviceAddressInfo*)(pInfo), &streamPtr);
     uint64_t vkGetBufferOpaqueCaptureAddress_uint64_t_return = (uint64_t)0;
     stream->read(&vkGetBufferOpaqueCaptureAddress_uint64_t_return, sizeof(uint64_t));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -6169,37 +5738,32 @@ VkResult VkEncoder::vkCreateRenderPass2(VkDevice device, const VkRenderPassCreat
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderPassCreateInfo2* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkRenderPassCreateInfo2*)pool->alloc(sizeof(const VkRenderPassCreateInfo2));
-        deepcopy_VkRenderPassCreateInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                         (VkRenderPassCreateInfo2*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkRenderPassCreateInfo2(sResourceTracker,
-                                                 (VkRenderPassCreateInfo2*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderPassCreateInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkRenderPassCreateInfo2*)(local_pCreateInfo), &count);
+                                  (const VkRenderPassCreateInfo2*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateRenderPass2, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkRenderPassCreateInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                            (VkRenderPassCreateInfo2*)(local_pCreateInfo),
+                                            (const VkRenderPassCreateInfo2*)(pCreateInfo),
                                             &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pRenderPass));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pRenderPass = create_gfxstream_vk_render_pass(cgen_var_0);
-    sResourceTracker->register_VkRenderPass(*pRenderPass);
+    *pRenderPass = cgen_var_0 ? create_gfxstream_vk_render_pass(device, pAllocator, cgen_var_0)
+                              : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pRenderPass)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateRenderPass2_VkResult_return = (VkResult)0;
     stream->read(&vkCreateRenderPass2_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateRenderPass2_VkResult_return >= VK_SUCCESS) {
+        vkCreateRenderPass2_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateRenderPass2_VkResult_return;
@@ -6213,45 +5777,22 @@ void VkEncoder::vkCmdBeginRenderPass2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderPassBeginInfo* local_pRenderPassBegin = nullptr;
-    VkSubpassBeginInfo* local_pSubpassBeginInfo = nullptr;
-    if (pRenderPassBegin) {
-        local_pRenderPassBegin =
-            (VkRenderPassBeginInfo*)pool->alloc(sizeof(const VkRenderPassBeginInfo));
-        deepcopy_VkRenderPassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderPassBegin,
-                                       (VkRenderPassBeginInfo*)(local_pRenderPassBegin));
-    }
-    if (pSubpassBeginInfo) {
-        local_pSubpassBeginInfo =
-            (VkSubpassBeginInfo*)pool->alloc(sizeof(const VkSubpassBeginInfo));
-        deepcopy_VkSubpassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassBeginInfo,
-                                    (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
-    if (local_pRenderPassBegin) {
-        transform_tohost_VkRenderPassBeginInfo(sResourceTracker,
-                                               (VkRenderPassBeginInfo*)(local_pRenderPassBegin));
-    }
-    if (local_pSubpassBeginInfo) {
-        transform_tohost_VkSubpassBeginInfo(sResourceTracker,
-                                            (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderPassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkRenderPassBeginInfo*)(local_pRenderPassBegin), &count);
+                                (const VkRenderPassBeginInfo*)(pRenderPassBegin), &count);
     count_VkSubpassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                             (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &count);
+                             (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdBeginRenderPass2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkRenderPassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkRenderPassBeginInfo*)(local_pRenderPassBegin),
+                                          (const VkRenderPassBeginInfo*)(pRenderPassBegin),
                                           &streamPtr);
     reservedmarshal_VkSubpassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                       (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &streamPtr);
+                                       (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6263,43 +5804,21 @@ void VkEncoder::vkCmdNextSubpass2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubpassBeginInfo* local_pSubpassBeginInfo = nullptr;
-    VkSubpassEndInfo* local_pSubpassEndInfo = nullptr;
-    if (pSubpassBeginInfo) {
-        local_pSubpassBeginInfo =
-            (VkSubpassBeginInfo*)pool->alloc(sizeof(const VkSubpassBeginInfo));
-        deepcopy_VkSubpassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassBeginInfo,
-                                    (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
-    if (pSubpassEndInfo) {
-        local_pSubpassEndInfo = (VkSubpassEndInfo*)pool->alloc(sizeof(const VkSubpassEndInfo));
-        deepcopy_VkSubpassEndInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassEndInfo,
-                                  (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
-    if (local_pSubpassBeginInfo) {
-        transform_tohost_VkSubpassBeginInfo(sResourceTracker,
-                                            (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
-    if (local_pSubpassEndInfo) {
-        transform_tohost_VkSubpassEndInfo(sResourceTracker,
-                                          (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSubpassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                             (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &count);
+                             (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &count);
     count_VkSubpassEndInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkSubpassEndInfo*)(local_pSubpassEndInfo), &count);
+                           (const VkSubpassEndInfo*)(pSubpassEndInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdNextSubpass2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkSubpassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                       (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &streamPtr);
+                                       (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &streamPtr);
     reservedmarshal_VkSubpassEndInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkSubpassEndInfo*)(local_pSubpassEndInfo), &streamPtr);
+                                     (const VkSubpassEndInfo*)(pSubpassEndInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6310,28 +5829,17 @@ void VkEncoder::vkCmdEndRenderPass2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubpassEndInfo* local_pSubpassEndInfo = nullptr;
-    if (pSubpassEndInfo) {
-        local_pSubpassEndInfo = (VkSubpassEndInfo*)pool->alloc(sizeof(const VkSubpassEndInfo));
-        deepcopy_VkSubpassEndInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassEndInfo,
-                                  (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
-    if (local_pSubpassEndInfo) {
-        transform_tohost_VkSubpassEndInfo(sResourceTracker,
-                                          (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSubpassEndInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkSubpassEndInfo*)(local_pSubpassEndInfo), &count);
+                           (const VkSubpassEndInfo*)(pSubpassEndInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdEndRenderPass2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkSubpassEndInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkSubpassEndInfo*)(local_pSubpassEndInfo), &streamPtr);
+                                     (const VkSubpassEndInfo*)(pSubpassEndInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6395,14 +5903,6 @@ VkResult VkEncoder::vkGetPhysicalDeviceToolProperties(
             }
         }
     }
-    if (pToolCount) {
-        if (pToolProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pToolCount); ++i) {
-                transform_fromhost_VkPhysicalDeviceToolProperties(
-                    sResourceTracker, (VkPhysicalDeviceToolProperties*)(pToolProperties + i));
-            }
-        }
-    }
     VkResult vkGetPhysicalDeviceToolProperties_VkResult_return = (VkResult)0;
     stream->read(&vkGetPhysicalDeviceToolProperties_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -6418,37 +5918,33 @@ VkResult VkEncoder::vkCreatePrivateDataSlot(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPrivateDataSlotCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkPrivateDataSlotCreateInfo*)pool->alloc(sizeof(const VkPrivateDataSlotCreateInfo));
-        deepcopy_VkPrivateDataSlotCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                             (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkPrivateDataSlotCreateInfo(
-            sResourceTracker, (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPrivateDataSlotCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo), &count);
+                                      (const VkPrivateDataSlotCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreatePrivateDataSlot, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPrivateDataSlotCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo),
+                                                (const VkPrivateDataSlotCreateInfo*)(pCreateInfo),
                                                 &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pPrivateDataSlot));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pPrivateDataSlot = create_gfxstream_vk_private_data_slot(cgen_var_0);
-    sResourceTracker->register_VkPrivateDataSlot(*pPrivateDataSlot);
+    *pPrivateDataSlot = cgen_var_0
+                            ? create_gfxstream_vk_private_data_slot(device, pAllocator, cgen_var_0)
+                            : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pPrivateDataSlot)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreatePrivateDataSlot_VkResult_return = (VkResult)0;
     stream->read(&vkCreatePrivateDataSlot_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreatePrivateDataSlot_VkResult_return >= VK_SUCCESS) {
+        vkCreatePrivateDataSlot_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreatePrivateDataSlot_VkResult_return;
@@ -6468,8 +5964,7 @@ void VkEncoder::vkDestroyPrivateDataSlot(VkDevice device, VkPrivateDataSlot priv
     writeStreamVal(&streamPtr, gfxstream_vk_private_data_slot_to_host_u64(privateDataSlot));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkPrivateDataSlot(privateDataSlot);
-    delete_gfxstream_vk_private_data_slot(privateDataSlot);
+    delete_gfxstream_vk_private_data_slot(device, privateDataSlot, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6532,28 +6027,17 @@ void VkEncoder::vkCmdPipelineBarrier2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDependencyInfo* local_pDependencyInfo = nullptr;
-    if (pDependencyInfo) {
-        local_pDependencyInfo = (VkDependencyInfo*)pool->alloc(sizeof(const VkDependencyInfo));
-        deepcopy_VkDependencyInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDependencyInfo,
-                                  (VkDependencyInfo*)(local_pDependencyInfo));
-    }
-    if (local_pDependencyInfo) {
-        transform_tohost_VkDependencyInfo(sResourceTracker,
-                                          (VkDependencyInfo*)(local_pDependencyInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDependencyInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkDependencyInfo*)(local_pDependencyInfo), &count);
+                           (const VkDependencyInfo*)(pDependencyInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdPipelineBarrier2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkDependencyInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkDependencyInfo*)(local_pDependencyInfo), &streamPtr);
+                                     (const VkDependencyInfo*)(pDependencyInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6587,26 +6071,12 @@ VkResult VkEncoder::vkQueueSubmit2(VkQueue queue, uint32_t submitCount,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubmitInfo2* local_pSubmits = nullptr;
-    if (pSubmits) {
-        local_pSubmits = (VkSubmitInfo2*)pool->alloc(submitCount * sizeof(const VkSubmitInfo2));
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            deepcopy_VkSubmitInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubmits + i,
-                                   (VkSubmitInfo2*)(local_pSubmits + i));
-        }
-    }
-    if (local_pSubmits) {
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            transform_tohost_VkSubmitInfo2(sResourceTracker, (VkSubmitInfo2*)(local_pSubmits + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         count_VkSubmitInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkSubmitInfo2*)(local_pSubmits + i), &count);
+                            (const VkSubmitInfo2*)(pSubmits + i), &count);
     }
     count += 8;
     uint8_t* streamPtr =
@@ -6615,7 +6085,7 @@ VkResult VkEncoder::vkQueueSubmit2(VkQueue queue, uint32_t submitCount,
     writeStreamBytes(&streamPtr, &submitCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         reservedmarshal_VkSubmitInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkSubmitInfo2*)(local_pSubmits + i), &streamPtr);
+                                      (const VkSubmitInfo2*)(pSubmits + i), &streamPtr);
     }
     writeStreamVal(&streamPtr, gfxstream_vk_fence_to_host_u64(fence));
     VkResult vkQueueSubmit2_VkResult_return = (VkResult)0;
@@ -6631,28 +6101,17 @@ void VkEncoder::vkCmdCopyBuffer2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyBufferInfo2* local_pCopyBufferInfo = nullptr;
-    if (pCopyBufferInfo) {
-        local_pCopyBufferInfo = (VkCopyBufferInfo2*)pool->alloc(sizeof(const VkCopyBufferInfo2));
-        deepcopy_VkCopyBufferInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyBufferInfo,
-                                   (VkCopyBufferInfo2*)(local_pCopyBufferInfo));
-    }
-    if (local_pCopyBufferInfo) {
-        transform_tohost_VkCopyBufferInfo2(sResourceTracker,
-                                           (VkCopyBufferInfo2*)(local_pCopyBufferInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyBufferInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkCopyBufferInfo2*)(local_pCopyBufferInfo), &count);
+                            (const VkCopyBufferInfo2*)(pCopyBufferInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdCopyBuffer2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkCopyBufferInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkCopyBufferInfo2*)(local_pCopyBufferInfo), &streamPtr);
+                                      (const VkCopyBufferInfo2*)(pCopyBufferInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6663,28 +6122,17 @@ void VkEncoder::vkCmdCopyImage2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyImageInfo2* local_pCopyImageInfo = nullptr;
-    if (pCopyImageInfo) {
-        local_pCopyImageInfo = (VkCopyImageInfo2*)pool->alloc(sizeof(const VkCopyImageInfo2));
-        deepcopy_VkCopyImageInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyImageInfo,
-                                  (VkCopyImageInfo2*)(local_pCopyImageInfo));
-    }
-    if (local_pCopyImageInfo) {
-        transform_tohost_VkCopyImageInfo2(sResourceTracker,
-                                          (VkCopyImageInfo2*)(local_pCopyImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkCopyImageInfo2*)(local_pCopyImageInfo), &count);
+                           (const VkCopyImageInfo2*)(pCopyImageInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdCopyImage2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkCopyImageInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkCopyImageInfo2*)(local_pCopyImageInfo), &streamPtr);
+                                     (const VkCopyImageInfo2*)(pCopyImageInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6696,23 +6144,10 @@ void VkEncoder::vkCmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyBufferToImageInfo2* local_pCopyBufferToImageInfo = nullptr;
-    if (pCopyBufferToImageInfo) {
-        local_pCopyBufferToImageInfo =
-            (VkCopyBufferToImageInfo2*)pool->alloc(sizeof(const VkCopyBufferToImageInfo2));
-        deepcopy_VkCopyBufferToImageInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyBufferToImageInfo,
-            (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo));
-    }
-    if (local_pCopyBufferToImageInfo) {
-        transform_tohost_VkCopyBufferToImageInfo2(
-            sResourceTracker, (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyBufferToImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo),
+                                   (const VkCopyBufferToImageInfo2*)(pCopyBufferToImageInfo),
                                    &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdCopyBufferToImage2, count, queueSubmitWithCommandsEnabled);
@@ -6721,7 +6156,7 @@ void VkEncoder::vkCmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkCopyBufferToImageInfo2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo), &streamPtr);
+        (const VkCopyBufferToImageInfo2*)(pCopyBufferToImageInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6733,23 +6168,10 @@ void VkEncoder::vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyImageToBufferInfo2* local_pCopyImageToBufferInfo = nullptr;
-    if (pCopyImageToBufferInfo) {
-        local_pCopyImageToBufferInfo =
-            (VkCopyImageToBufferInfo2*)pool->alloc(sizeof(const VkCopyImageToBufferInfo2));
-        deepcopy_VkCopyImageToBufferInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyImageToBufferInfo,
-            (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo));
-    }
-    if (local_pCopyImageToBufferInfo) {
-        transform_tohost_VkCopyImageToBufferInfo2(
-            sResourceTracker, (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyImageToBufferInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo),
+                                   (const VkCopyImageToBufferInfo2*)(pCopyImageToBufferInfo),
                                    &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdCopyImageToBuffer2, count, queueSubmitWithCommandsEnabled);
@@ -6758,7 +6180,7 @@ void VkEncoder::vkCmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkCopyImageToBufferInfo2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo), &streamPtr);
+        (const VkCopyImageToBufferInfo2*)(pCopyImageToBufferInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6931,15 +6353,6 @@ void VkEncoder::vkGetDeviceImageSparseMemoryRequirements(
             }
         }
     }
-    if (pSparseMemoryRequirementCount) {
-        if (pSparseMemoryRequirements) {
-            for (uint32_t i = 0; i < (uint32_t)(*pSparseMemoryRequirementCount); ++i) {
-                transform_fromhost_VkSparseImageMemoryRequirements2(
-                    sResourceTracker,
-                    (VkSparseImageMemoryRequirements2*)(pSparseMemoryRequirements + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -6952,21 +6365,10 @@ void VkEncoder::vkCmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDependencyInfo* local_pDependencyInfo = nullptr;
-    if (pDependencyInfo) {
-        local_pDependencyInfo = (VkDependencyInfo*)pool->alloc(sizeof(const VkDependencyInfo));
-        deepcopy_VkDependencyInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDependencyInfo,
-                                  (VkDependencyInfo*)(local_pDependencyInfo));
-    }
-    if (local_pDependencyInfo) {
-        transform_tohost_VkDependencyInfo(sResourceTracker,
-                                          (VkDependencyInfo*)(local_pDependencyInfo));
-    }
     size_t count = 0;
     count += 2 * 8;
     count_VkDependencyInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkDependencyInfo*)(local_pDependencyInfo), &count);
+                           (const VkDependencyInfo*)(pDependencyInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdSetEvent2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -6974,7 +6376,7 @@ void VkEncoder::vkCmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event,
     }
     writeStreamVal(&streamPtr, gfxstream_vk_event_to_host_u64(event));
     reservedmarshal_VkDependencyInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkDependencyInfo*)(local_pDependencyInfo), &streamPtr);
+                                     (const VkDependencyInfo*)(pDependencyInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7006,22 +6408,6 @@ void VkEncoder::vkCmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCo
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDependencyInfo* local_pDependencyInfos = nullptr;
-    if (pDependencyInfos) {
-        local_pDependencyInfos =
-            (VkDependencyInfo*)pool->alloc(eventCount * sizeof(const VkDependencyInfo));
-        for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
-            deepcopy_VkDependencyInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDependencyInfos + i,
-                                      (VkDependencyInfo*)(local_pDependencyInfos + i));
-        }
-    }
-    if (local_pDependencyInfos) {
-        for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
-            transform_tohost_VkDependencyInfo(sResourceTracker,
-                                              (VkDependencyInfo*)(local_pDependencyInfos + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
@@ -7030,7 +6416,7 @@ void VkEncoder::vkCmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCo
     }
     for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
         count_VkDependencyInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                               (VkDependencyInfo*)(local_pDependencyInfos + i), &count);
+                               (const VkDependencyInfo*)(pDependencyInfos + i), &count);
     }
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdWaitEvents2, count, queueSubmitWithCommandsEnabled);
@@ -7045,7 +6431,7 @@ void VkEncoder::vkCmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCo
     }
     for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
         reservedmarshal_VkDependencyInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                         (VkDependencyInfo*)(local_pDependencyInfos + i),
+                                         (const VkDependencyInfo*)(pDependencyInfos + i),
                                          &streamPtr);
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -7060,28 +6446,17 @@ void VkEncoder::vkCmdBlitImage2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBlitImageInfo2* local_pBlitImageInfo = nullptr;
-    if (pBlitImageInfo) {
-        local_pBlitImageInfo = (VkBlitImageInfo2*)pool->alloc(sizeof(const VkBlitImageInfo2));
-        deepcopy_VkBlitImageInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBlitImageInfo,
-                                  (VkBlitImageInfo2*)(local_pBlitImageInfo));
-    }
-    if (local_pBlitImageInfo) {
-        transform_tohost_VkBlitImageInfo2(sResourceTracker,
-                                          (VkBlitImageInfo2*)(local_pBlitImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBlitImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkBlitImageInfo2*)(local_pBlitImageInfo), &count);
+                           (const VkBlitImageInfo2*)(pBlitImageInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdBlitImage2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkBlitImageInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkBlitImageInfo2*)(local_pBlitImageInfo), &streamPtr);
+                                     (const VkBlitImageInfo2*)(pBlitImageInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7092,29 +6467,17 @@ void VkEncoder::vkCmdResolveImage2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkResolveImageInfo2* local_pResolveImageInfo = nullptr;
-    if (pResolveImageInfo) {
-        local_pResolveImageInfo =
-            (VkResolveImageInfo2*)pool->alloc(sizeof(const VkResolveImageInfo2));
-        deepcopy_VkResolveImageInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pResolveImageInfo,
-                                     (VkResolveImageInfo2*)(local_pResolveImageInfo));
-    }
-    if (local_pResolveImageInfo) {
-        transform_tohost_VkResolveImageInfo2(sResourceTracker,
-                                             (VkResolveImageInfo2*)(local_pResolveImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkResolveImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkResolveImageInfo2*)(local_pResolveImageInfo), &count);
+                              (const VkResolveImageInfo2*)(pResolveImageInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdResolveImage2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkResolveImageInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkResolveImageInfo2*)(local_pResolveImageInfo),
+                                        (const VkResolveImageInfo2*)(pResolveImageInfo),
                                         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -7126,28 +6489,17 @@ void VkEncoder::vkCmdBeginRendering(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingInfo* local_pRenderingInfo = nullptr;
-    if (pRenderingInfo) {
-        local_pRenderingInfo = (VkRenderingInfo*)pool->alloc(sizeof(const VkRenderingInfo));
-        deepcopy_VkRenderingInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderingInfo,
-                                 (VkRenderingInfo*)(local_pRenderingInfo));
-    }
-    if (local_pRenderingInfo) {
-        transform_tohost_VkRenderingInfo(sResourceTracker,
-                                         (VkRenderingInfo*)(local_pRenderingInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                          (VkRenderingInfo*)(local_pRenderingInfo), &count);
+                          (const VkRenderingInfo*)(pRenderingInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdBeginRendering, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkRenderingInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkRenderingInfo*)(local_pRenderingInfo), &streamPtr);
+                                    (const VkRenderingInfo*)(pRenderingInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7572,9 +6924,6 @@ void VkEncoder::vkGetDeviceImageSubresourceLayout(VkDevice device,
                                          (VkSubresourceLayout2*)(pLayout), &streamPtr);
     unmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkSubresourceLayout2*)(pLayout));
-    if (pLayout) {
-        transform_fromhost_VkSubresourceLayout2(sResourceTracker, (VkSubresourceLayout2*)(pLayout));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7586,21 +6935,10 @@ void VkEncoder::vkGetImageSubresourceLayout2(VkDevice device, VkImage image,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageSubresource2* local_pSubresource = nullptr;
-    if (pSubresource) {
-        local_pSubresource = (VkImageSubresource2*)pool->alloc(sizeof(const VkImageSubresource2));
-        deepcopy_VkImageSubresource2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubresource,
-                                     (VkImageSubresource2*)(local_pSubresource));
-    }
-    if (local_pSubresource) {
-        transform_tohost_VkImageSubresource2(sResourceTracker,
-                                             (VkImageSubresource2*)(local_pSubresource));
-    }
     size_t count = 0;
     count += 2 * 8;
     count_VkImageSubresource2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkImageSubresource2*)(local_pSubresource), &count);
+                              (const VkImageSubresource2*)(pSubresource), &count);
     count_VkSubresourceLayout2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                (VkSubresourceLayout2*)(pLayout), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetImageSubresourceLayout2, count,
@@ -7608,14 +6946,11 @@ void VkEncoder::vkGetImageSubresourceLayout2(VkDevice device, VkImage image,
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     writeStreamVal(&streamPtr, gfxstream_vk_image_to_host_u64(image));
     reservedmarshal_VkImageSubresource2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkImageSubresource2*)(local_pSubresource), &streamPtr);
+                                        (const VkImageSubresource2*)(pSubresource), &streamPtr);
     reservedmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                          (VkSubresourceLayout2*)(pLayout), &streamPtr);
     unmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkSubresourceLayout2*)(pLayout));
-    if (pLayout) {
-        transform_fromhost_VkSubresourceLayout2(sResourceTracker, (VkSubresourceLayout2*)(pLayout));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7693,27 +7028,15 @@ VkResult VkEncoder::vkCopyImageToImage(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyImageToImageInfo* local_pCopyImageToImageInfo = nullptr;
-    if (pCopyImageToImageInfo) {
-        local_pCopyImageToImageInfo =
-            (VkCopyImageToImageInfo*)pool->alloc(sizeof(const VkCopyImageToImageInfo));
-        deepcopy_VkCopyImageToImageInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyImageToImageInfo,
-                                        (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo));
-    }
-    if (local_pCopyImageToImageInfo) {
-        transform_tohost_VkCopyImageToImageInfo(
-            sResourceTracker, (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyImageToImageInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                 (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo), &count);
+                                 (const VkCopyImageToImageInfo*)(pCopyImageToImageInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCopyImageToImage, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkCopyImageToImageInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                           (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo),
+                                           (const VkCopyImageToImageInfo*)(pCopyImageToImageInfo),
                                            &streamPtr);
     VkResult vkCopyImageToImage_VkResult_return = (VkResult)0;
     stream->read(&vkCopyImageToImage_VkResult_return, sizeof(VkResult));
@@ -7729,30 +7052,13 @@ VkResult VkEncoder::vkTransitionImageLayout(VkDevice device, uint32_t transition
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkHostImageLayoutTransitionInfo* local_pTransitions = nullptr;
-    if (pTransitions) {
-        local_pTransitions = (VkHostImageLayoutTransitionInfo*)pool->alloc(
-            transitionCount * sizeof(const VkHostImageLayoutTransitionInfo));
-        for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
-            deepcopy_VkHostImageLayoutTransitionInfo(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pTransitions + i,
-                (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i));
-        }
-    }
-    if (local_pTransitions) {
-        for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
-            transform_tohost_VkHostImageLayoutTransitionInfo(
-                sResourceTracker, (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
         count_VkHostImageLayoutTransitionInfo(
             sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i), &count);
+            (const VkHostImageLayoutTransitionInfo*)(pTransitions + i), &count);
     }
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkTransitionImageLayout, count, queueSubmitWithCommandsEnabled);
@@ -7761,7 +7067,7 @@ VkResult VkEncoder::vkTransitionImageLayout(VkDevice device, uint32_t transition
     for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
         reservedmarshal_VkHostImageLayoutTransitionInfo(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i), &streamPtr);
+            (const VkHostImageLayoutTransitionInfo*)(pTransitions + i), &streamPtr);
     }
     VkResult vkTransitionImageLayout_VkResult_return = (VkResult)0;
     stream->read(&vkTransitionImageLayout_VkResult_return, sizeof(VkResult));
@@ -7782,22 +7088,6 @@ void VkEncoder::vkCmdPushDescriptorSet(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkWriteDescriptorSet* local_pDescriptorWrites = nullptr;
-    if (pDescriptorWrites) {
-        local_pDescriptorWrites = (VkWriteDescriptorSet*)pool->alloc(
-            descriptorWriteCount * sizeof(const VkWriteDescriptorSet));
-        for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
-            deepcopy_VkWriteDescriptorSet(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDescriptorWrites + i,
-                                          (VkWriteDescriptorSet*)(local_pDescriptorWrites + i));
-        }
-    }
-    if (local_pDescriptorWrites) {
-        for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
-            transform_tohost_VkWriteDescriptorSet(
-                sResourceTracker, (VkWriteDescriptorSet*)(local_pDescriptorWrites + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(VkPipelineBindPoint);
@@ -7805,7 +7095,7 @@ void VkEncoder::vkCmdPushDescriptorSet(VkCommandBuffer commandBuffer,
     count += 2 * sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
         count_VkWriteDescriptorSet(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkWriteDescriptorSet*)(local_pDescriptorWrites + i), &count);
+                                   (const VkWriteDescriptorSet*)(pDescriptorWrites + i), &count);
     }
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdPushDescriptorSet, count, queueSubmitWithCommandsEnabled);
@@ -7818,7 +7108,7 @@ void VkEncoder::vkCmdPushDescriptorSet(VkCommandBuffer commandBuffer,
     writeStreamBytes(&streamPtr, &descriptorWriteCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
         reservedmarshal_VkWriteDescriptorSet(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                             (VkWriteDescriptorSet*)(local_pDescriptorWrites + i),
+                                             (const VkWriteDescriptorSet*)(pDescriptorWrites + i),
                                              &streamPtr);
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -7863,23 +7153,10 @@ void VkEncoder::vkCmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBindDescriptorSetsInfo* local_pBindDescriptorSetsInfo = nullptr;
-    if (pBindDescriptorSetsInfo) {
-        local_pBindDescriptorSetsInfo =
-            (VkBindDescriptorSetsInfo*)pool->alloc(sizeof(const VkBindDescriptorSetsInfo));
-        deepcopy_VkBindDescriptorSetsInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBindDescriptorSetsInfo,
-            (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo));
-    }
-    if (local_pBindDescriptorSetsInfo) {
-        transform_tohost_VkBindDescriptorSetsInfo(
-            sResourceTracker, (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBindDescriptorSetsInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo),
+                                   (const VkBindDescriptorSetsInfo*)(pBindDescriptorSetsInfo),
                                    &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdBindDescriptorSets2, count,
                                           queueSubmitWithCommandsEnabled);
@@ -7888,7 +7165,7 @@ void VkEncoder::vkCmdBindDescriptorSets2(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkBindDescriptorSetsInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo), &streamPtr);
+        (const VkBindDescriptorSetsInfo*)(pBindDescriptorSetsInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7900,29 +7177,17 @@ void VkEncoder::vkCmdPushConstants2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPushConstantsInfo* local_pPushConstantsInfo = nullptr;
-    if (pPushConstantsInfo) {
-        local_pPushConstantsInfo =
-            (VkPushConstantsInfo*)pool->alloc(sizeof(const VkPushConstantsInfo));
-        deepcopy_VkPushConstantsInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPushConstantsInfo,
-                                     (VkPushConstantsInfo*)(local_pPushConstantsInfo));
-    }
-    if (local_pPushConstantsInfo) {
-        transform_tohost_VkPushConstantsInfo(sResourceTracker,
-                                             (VkPushConstantsInfo*)(local_pPushConstantsInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPushConstantsInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkPushConstantsInfo*)(local_pPushConstantsInfo), &count);
+                              (const VkPushConstantsInfo*)(pPushConstantsInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdPushConstants2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkPushConstantsInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkPushConstantsInfo*)(local_pPushConstantsInfo),
+                                        (const VkPushConstantsInfo*)(pPushConstantsInfo),
                                         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -7935,22 +7200,10 @@ void VkEncoder::vkCmdPushDescriptorSet2(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPushDescriptorSetInfo* local_pPushDescriptorSetInfo = nullptr;
-    if (pPushDescriptorSetInfo) {
-        local_pPushDescriptorSetInfo =
-            (VkPushDescriptorSetInfo*)pool->alloc(sizeof(const VkPushDescriptorSetInfo));
-        deepcopy_VkPushDescriptorSetInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPushDescriptorSetInfo,
-                                         (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo));
-    }
-    if (local_pPushDescriptorSetInfo) {
-        transform_tohost_VkPushDescriptorSetInfo(
-            sResourceTracker, (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPushDescriptorSetInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo), &count);
+                                  (const VkPushDescriptorSetInfo*)(pPushDescriptorSetInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdPushDescriptorSet2, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -7958,7 +7211,7 @@ void VkEncoder::vkCmdPushDescriptorSet2(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkPushDescriptorSetInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo), &streamPtr);
+        (const VkPushDescriptorSetInfo*)(pPushDescriptorSetInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -7971,26 +7224,11 @@ void VkEncoder::vkCmdPushDescriptorSetWithTemplate2(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPushDescriptorSetWithTemplateInfo* local_pPushDescriptorSetWithTemplateInfo = nullptr;
-    if (pPushDescriptorSetWithTemplateInfo) {
-        local_pPushDescriptorSetWithTemplateInfo =
-            (VkPushDescriptorSetWithTemplateInfo*)pool->alloc(
-                sizeof(const VkPushDescriptorSetWithTemplateInfo));
-        deepcopy_VkPushDescriptorSetWithTemplateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPushDescriptorSetWithTemplateInfo,
-            (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo));
-    }
-    if (local_pPushDescriptorSetWithTemplateInfo) {
-        transform_tohost_VkPushDescriptorSetWithTemplateInfo(
-            sResourceTracker,
-            (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPushDescriptorSetWithTemplateInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo), &count);
+        (const VkPushDescriptorSetWithTemplateInfo*)(pPushDescriptorSetWithTemplateInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdPushDescriptorSetWithTemplate2, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -7998,7 +7236,7 @@ void VkEncoder::vkCmdPushDescriptorSetWithTemplate2(
     }
     reservedmarshal_VkPushDescriptorSetWithTemplateInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo),
+        (const VkPushDescriptorSetWithTemplateInfo*)(pPushDescriptorSetWithTemplateInfo),
         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -8058,28 +7296,16 @@ void VkEncoder::vkGetRenderingAreaGranularity(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingAreaInfo* local_pRenderingAreaInfo = nullptr;
-    if (pRenderingAreaInfo) {
-        local_pRenderingAreaInfo =
-            (VkRenderingAreaInfo*)pool->alloc(sizeof(const VkRenderingAreaInfo));
-        deepcopy_VkRenderingAreaInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderingAreaInfo,
-                                     (VkRenderingAreaInfo*)(local_pRenderingAreaInfo));
-    }
-    if (local_pRenderingAreaInfo) {
-        transform_tohost_VkRenderingAreaInfo(sResourceTracker,
-                                             (VkRenderingAreaInfo*)(local_pRenderingAreaInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingAreaInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkRenderingAreaInfo*)(local_pRenderingAreaInfo), &count);
+                              (const VkRenderingAreaInfo*)(pRenderingAreaInfo), &count);
     count_VkExtent2D(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM, (VkExtent2D*)(pGranularity), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetRenderingAreaGranularity, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkRenderingAreaInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkRenderingAreaInfo*)(local_pRenderingAreaInfo),
+                                        (const VkRenderingAreaInfo*)(pRenderingAreaInfo),
                                         &streamPtr);
     reservedmarshal_VkExtent2D(stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkExtent2D*)(pGranularity),
                                &streamPtr);
@@ -8095,24 +7321,11 @@ void VkEncoder::vkCmdSetRenderingAttachmentLocations(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingAttachmentLocationInfo* local_pLocationInfo = nullptr;
-    if (pLocationInfo) {
-        local_pLocationInfo = (VkRenderingAttachmentLocationInfo*)pool->alloc(
-            sizeof(const VkRenderingAttachmentLocationInfo));
-        deepcopy_VkRenderingAttachmentLocationInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pLocationInfo,
-            (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo));
-    }
-    if (local_pLocationInfo) {
-        transform_tohost_VkRenderingAttachmentLocationInfo(
-            sResourceTracker, (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingAttachmentLocationInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo), &count);
+        (const VkRenderingAttachmentLocationInfo*)(pLocationInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdSetRenderingAttachmentLocations, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -8120,7 +7333,7 @@ void VkEncoder::vkCmdSetRenderingAttachmentLocations(
     }
     reservedmarshal_VkRenderingAttachmentLocationInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo), &streamPtr);
+        (const VkRenderingAttachmentLocationInfo*)(pLocationInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8132,25 +7345,11 @@ void VkEncoder::vkCmdSetRenderingInputAttachmentIndices(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingInputAttachmentIndexInfo* local_pInputAttachmentIndexInfo = nullptr;
-    if (pInputAttachmentIndexInfo) {
-        local_pInputAttachmentIndexInfo = (VkRenderingInputAttachmentIndexInfo*)pool->alloc(
-            sizeof(const VkRenderingInputAttachmentIndexInfo));
-        deepcopy_VkRenderingInputAttachmentIndexInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInputAttachmentIndexInfo,
-            (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo));
-    }
-    if (local_pInputAttachmentIndexInfo) {
-        transform_tohost_VkRenderingInputAttachmentIndexInfo(
-            sResourceTracker,
-            (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingInputAttachmentIndexInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo), &count);
+        (const VkRenderingInputAttachmentIndexInfo*)(pInputAttachmentIndexInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdSetRenderingInputAttachmentIndices, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -8158,7 +7357,7 @@ void VkEncoder::vkCmdSetRenderingInputAttachmentIndices(
     }
     reservedmarshal_VkRenderingInputAttachmentIndexInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo), &streamPtr);
+        (const VkRenderingInputAttachmentIndexInfo*)(pInputAttachmentIndexInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8171,28 +7370,17 @@ void VkEncoder::vkCmdBeginRenderingKHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingInfo* local_pRenderingInfo = nullptr;
-    if (pRenderingInfo) {
-        local_pRenderingInfo = (VkRenderingInfo*)pool->alloc(sizeof(const VkRenderingInfo));
-        deepcopy_VkRenderingInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderingInfo,
-                                 (VkRenderingInfo*)(local_pRenderingInfo));
-    }
-    if (local_pRenderingInfo) {
-        transform_tohost_VkRenderingInfo(sResourceTracker,
-                                         (VkRenderingInfo*)(local_pRenderingInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                          (VkRenderingInfo*)(local_pRenderingInfo), &count);
+                          (const VkRenderingInfo*)(pRenderingInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdBeginRenderingKHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkRenderingInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkRenderingInfo*)(local_pRenderingInfo), &streamPtr);
+                                    (const VkRenderingInfo*)(pRenderingInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8233,10 +7421,6 @@ void VkEncoder::vkGetPhysicalDeviceFeatures2KHR(VkPhysicalDevice physicalDevice,
                                               (VkPhysicalDeviceFeatures2*)(pFeatures), &streamPtr);
     unmarshal_VkPhysicalDeviceFeatures2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                         (VkPhysicalDeviceFeatures2*)(pFeatures));
-    if (pFeatures) {
-        transform_fromhost_VkPhysicalDeviceFeatures2(sResourceTracker,
-                                                     (VkPhysicalDeviceFeatures2*)(pFeatures));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8260,10 +7444,6 @@ void VkEncoder::vkGetPhysicalDeviceProperties2KHR(VkPhysicalDevice physicalDevic
                                                 &streamPtr);
     unmarshal_VkPhysicalDeviceProperties2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                           (VkPhysicalDeviceProperties2*)(pProperties));
-    if (pProperties) {
-        transform_fromhost_VkPhysicalDeviceProperties2(sResourceTracker,
-                                                       (VkPhysicalDeviceProperties2*)(pProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8289,10 +7469,6 @@ void VkEncoder::vkGetPhysicalDeviceFormatProperties2KHR(VkPhysicalDevice physica
                                         (VkFormatProperties2*)(pFormatProperties), &streamPtr);
     unmarshal_VkFormatProperties2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                   (VkFormatProperties2*)(pFormatProperties));
-    if (pFormatProperties) {
-        transform_fromhost_VkFormatProperties2(sResourceTracker,
-                                               (VkFormatProperties2*)(pFormatProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8403,14 +7579,6 @@ void VkEncoder::vkGetPhysicalDeviceQueueFamilyProperties2KHR(
             }
         }
     }
-    if (pQueueFamilyPropertyCount) {
-        if (pQueueFamilyProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pQueueFamilyPropertyCount); ++i) {
-                transform_fromhost_VkQueueFamilyProperties2(
-                    sResourceTracker, (VkQueueFamilyProperties2*)(pQueueFamilyProperties + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8436,10 +7604,6 @@ void VkEncoder::vkGetPhysicalDeviceMemoryProperties2KHR(
     unmarshal_VkPhysicalDeviceMemoryProperties2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkPhysicalDeviceMemoryProperties2*)(pMemoryProperties));
-    if (pMemoryProperties) {
-        transform_fromhost_VkPhysicalDeviceMemoryProperties2(
-            sResourceTracker, (VkPhysicalDeviceMemoryProperties2*)(pMemoryProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8451,24 +7615,11 @@ void VkEncoder::vkGetPhysicalDeviceSparseImageFormatProperties2KHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPhysicalDeviceSparseImageFormatInfo2* local_pFormatInfo = nullptr;
-    if (pFormatInfo) {
-        local_pFormatInfo = (VkPhysicalDeviceSparseImageFormatInfo2*)pool->alloc(
-            sizeof(const VkPhysicalDeviceSparseImageFormatInfo2));
-        deepcopy_VkPhysicalDeviceSparseImageFormatInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pFormatInfo,
-            (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo));
-    }
-    if (local_pFormatInfo) {
-        transform_tohost_VkPhysicalDeviceSparseImageFormatInfo2(
-            sResourceTracker, (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPhysicalDeviceSparseImageFormatInfo2(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo), &count);
+        (const VkPhysicalDeviceSparseImageFormatInfo2*)(pFormatInfo), &count);
     count += 8;
     if (pPropertyCount) {
         count += sizeof(uint32_t);
@@ -8489,7 +7640,7 @@ void VkEncoder::vkGetPhysicalDeviceSparseImageFormatProperties2KHR(
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkPhysicalDeviceSparseImageFormatInfo2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceSparseImageFormatInfo2*)(local_pFormatInfo), &streamPtr);
+        (const VkPhysicalDeviceSparseImageFormatInfo2*)(pFormatInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pPropertyCount);
     if (pPropertyCount) {
         writeStreamBytes(&streamPtr, pPropertyCount, sizeof(uint32_t));
@@ -8519,14 +7670,6 @@ void VkEncoder::vkGetPhysicalDeviceSparseImageFormatProperties2KHR(
                 unmarshal_VkSparseImageFormatProperties2(
                     stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                     (VkSparseImageFormatProperties2*)(pProperties + i));
-            }
-        }
-    }
-    if (pPropertyCount) {
-        if (pProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pPropertyCount); ++i) {
-                transform_fromhost_VkSparseImageFormatProperties2(
-                    sResourceTracker, (VkSparseImageFormatProperties2*)(pProperties + i));
             }
         }
     }
@@ -8686,15 +7829,6 @@ VkResult VkEncoder::vkEnumeratePhysicalDeviceGroupsKHR(
             }
         }
     }
-    if (pPhysicalDeviceGroupCount) {
-        if (pPhysicalDeviceGroupProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pPhysicalDeviceGroupCount); ++i) {
-                transform_fromhost_VkPhysicalDeviceGroupProperties(
-                    sResourceTracker,
-                    (VkPhysicalDeviceGroupProperties*)(pPhysicalDeviceGroupProperties + i));
-            }
-        }
-    }
     VkResult vkEnumeratePhysicalDeviceGroupsKHR_VkResult_return = (VkResult)0;
     stream->read(&vkEnumeratePhysicalDeviceGroupsKHR_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -8765,25 +7899,11 @@ void VkEncoder::vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPhysicalDeviceExternalSemaphoreInfo* local_pExternalSemaphoreInfo = nullptr;
-    if (pExternalSemaphoreInfo) {
-        local_pExternalSemaphoreInfo = (VkPhysicalDeviceExternalSemaphoreInfo*)pool->alloc(
-            sizeof(const VkPhysicalDeviceExternalSemaphoreInfo));
-        deepcopy_VkPhysicalDeviceExternalSemaphoreInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pExternalSemaphoreInfo,
-            (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo));
-    }
-    if (local_pExternalSemaphoreInfo) {
-        transform_tohost_VkPhysicalDeviceExternalSemaphoreInfo(
-            sResourceTracker,
-            (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPhysicalDeviceExternalSemaphoreInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo), &count);
+        (const VkPhysicalDeviceExternalSemaphoreInfo*)(pExternalSemaphoreInfo), &count);
     count_VkExternalSemaphoreProperties(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties), &count);
@@ -8792,17 +7912,13 @@ void VkEncoder::vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkPhysicalDeviceExternalSemaphoreInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalSemaphoreInfo*)(local_pExternalSemaphoreInfo), &streamPtr);
+        (const VkPhysicalDeviceExternalSemaphoreInfo*)(pExternalSemaphoreInfo), &streamPtr);
     reservedmarshal_VkExternalSemaphoreProperties(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties), &streamPtr);
     unmarshal_VkExternalSemaphoreProperties(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
         (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties));
-    if (pExternalSemaphoreProperties) {
-        transform_fromhost_VkExternalSemaphoreProperties(
-            sResourceTracker, (VkExternalSemaphoreProperties*)(pExternalSemaphoreProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -8816,30 +7932,17 @@ VkResult VkEncoder::vkImportSemaphoreFdKHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImportSemaphoreFdInfoKHR* local_pImportSemaphoreFdInfo = nullptr;
-    if (pImportSemaphoreFdInfo) {
-        local_pImportSemaphoreFdInfo =
-            (VkImportSemaphoreFdInfoKHR*)pool->alloc(sizeof(const VkImportSemaphoreFdInfoKHR));
-        deepcopy_VkImportSemaphoreFdInfoKHR(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pImportSemaphoreFdInfo,
-            (VkImportSemaphoreFdInfoKHR*)(local_pImportSemaphoreFdInfo));
-    }
-    if (local_pImportSemaphoreFdInfo) {
-        transform_tohost_VkImportSemaphoreFdInfoKHR(
-            sResourceTracker, (VkImportSemaphoreFdInfoKHR*)(local_pImportSemaphoreFdInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImportSemaphoreFdInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkImportSemaphoreFdInfoKHR*)(local_pImportSemaphoreFdInfo),
+                                     (const VkImportSemaphoreFdInfoKHR*)(pImportSemaphoreFdInfo),
                                      &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkImportSemaphoreFdKHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImportSemaphoreFdInfoKHR(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkImportSemaphoreFdInfoKHR*)(local_pImportSemaphoreFdInfo), &streamPtr);
+        (const VkImportSemaphoreFdInfoKHR*)(pImportSemaphoreFdInfo), &streamPtr);
     VkResult vkImportSemaphoreFdKHR_VkResult_return = (VkResult)0;
     stream->read(&vkImportSemaphoreFdKHR_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -8853,28 +7956,16 @@ VkResult VkEncoder::vkGetSemaphoreFdKHR(VkDevice device, const VkSemaphoreGetFdI
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSemaphoreGetFdInfoKHR* local_pGetFdInfo = nullptr;
-    if (pGetFdInfo) {
-        local_pGetFdInfo =
-            (VkSemaphoreGetFdInfoKHR*)pool->alloc(sizeof(const VkSemaphoreGetFdInfoKHR));
-        deepcopy_VkSemaphoreGetFdInfoKHR(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pGetFdInfo,
-                                         (VkSemaphoreGetFdInfoKHR*)(local_pGetFdInfo));
-    }
-    if (local_pGetFdInfo) {
-        transform_tohost_VkSemaphoreGetFdInfoKHR(sResourceTracker,
-                                                 (VkSemaphoreGetFdInfoKHR*)(local_pGetFdInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSemaphoreGetFdInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkSemaphoreGetFdInfoKHR*)(local_pGetFdInfo), &count);
+                                  (const VkSemaphoreGetFdInfoKHR*)(pGetFdInfo), &count);
     count += sizeof(int);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkGetSemaphoreFdKHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSemaphoreGetFdInfoKHR(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                            (VkSemaphoreGetFdInfoKHR*)(local_pGetFdInfo),
+                                            (const VkSemaphoreGetFdInfoKHR*)(pGetFdInfo),
                                             &streamPtr);
     writeStreamBytes(&streamPtr, pFd, sizeof(int));
     stream->read(pFd, sizeof(int));
@@ -8897,22 +7988,6 @@ void VkEncoder::vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkWriteDescriptorSet* local_pDescriptorWrites = nullptr;
-    if (pDescriptorWrites) {
-        local_pDescriptorWrites = (VkWriteDescriptorSet*)pool->alloc(
-            descriptorWriteCount * sizeof(const VkWriteDescriptorSet));
-        for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
-            deepcopy_VkWriteDescriptorSet(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDescriptorWrites + i,
-                                          (VkWriteDescriptorSet*)(local_pDescriptorWrites + i));
-        }
-    }
-    if (local_pDescriptorWrites) {
-        for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
-            transform_tohost_VkWriteDescriptorSet(
-                sResourceTracker, (VkWriteDescriptorSet*)(local_pDescriptorWrites + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(VkPipelineBindPoint);
@@ -8920,7 +7995,7 @@ void VkEncoder::vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
     count += 2 * sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
         count_VkWriteDescriptorSet(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkWriteDescriptorSet*)(local_pDescriptorWrites + i), &count);
+                                   (const VkWriteDescriptorSet*)(pDescriptorWrites + i), &count);
     }
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdPushDescriptorSetKHR, count,
                                           queueSubmitWithCommandsEnabled);
@@ -8933,7 +8008,7 @@ void VkEncoder::vkCmdPushDescriptorSetKHR(VkCommandBuffer commandBuffer,
     writeStreamBytes(&streamPtr, &descriptorWriteCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)descriptorWriteCount; ++i) {
         reservedmarshal_VkWriteDescriptorSet(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                             (VkWriteDescriptorSet*)(local_pDescriptorWrites + i),
+                                             (const VkWriteDescriptorSet*)(pDescriptorWrites + i),
                                              &streamPtr);
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -8981,42 +8056,39 @@ VkResult VkEncoder::vkCreateDescriptorUpdateTemplateKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorUpdateTemplateCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkDescriptorUpdateTemplateCreateInfo*)pool->alloc(
-            sizeof(const VkDescriptorUpdateTemplateCreateInfo));
-        deepcopy_VkDescriptorUpdateTemplateCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDescriptorUpdateTemplateCreateInfo(
-            sResourceTracker, (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorUpdateTemplateCreateInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo), &count);
+        (const VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr = reservePacket(stream, OP_vkCreateDescriptorUpdateTemplateKHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorUpdateTemplateCreateInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkDescriptorUpdateTemplateCreateInfo*)(local_pCreateInfo), &streamPtr);
+        (const VkDescriptorUpdateTemplateCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pDescriptorUpdateTemplate));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pDescriptorUpdateTemplate = create_gfxstream_vk_descriptor_update_template(cgen_var_0);
-    sResourceTracker->register_VkDescriptorUpdateTemplate(*pDescriptorUpdateTemplate);
+    *pDescriptorUpdateTemplate =
+        cgen_var_0 ? create_gfxstream_vk_descriptor_update_template(device, pAllocator, cgen_var_0)
+                   : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pDescriptorUpdateTemplate)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateDescriptorUpdateTemplateKHR_VkResult_return = (VkResult)0;
     stream->read(&vkCreateDescriptorUpdateTemplateKHR_VkResult_return, sizeof(VkResult));
-    sResourceTracker->on_vkCreateDescriptorUpdateTemplateKHR(
-        this, vkCreateDescriptorUpdateTemplateKHR_VkResult_return, device, pCreateInfo, pAllocator,
-        pDescriptorUpdateTemplate);
+    if (guestCreateAllocFailed &&
+        vkCreateDescriptorUpdateTemplateKHR_VkResult_return >= VK_SUCCESS) {
+        vkCreateDescriptorUpdateTemplateKHR_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    vkCreateDescriptorUpdateTemplateKHR_VkResult_return =
+        sResourceTracker->on_vkCreateDescriptorUpdateTemplateKHR(
+            this, vkCreateDescriptorUpdateTemplateKHR_VkResult_return, device, pCreateInfo,
+            pAllocator, pDescriptorUpdateTemplate);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateDescriptorUpdateTemplateKHR_VkResult_return;
@@ -9038,8 +8110,7 @@ void VkEncoder::vkDestroyDescriptorUpdateTemplateKHR(
                    gfxstream_vk_descriptor_update_template_to_host_u64(descriptorUpdateTemplate));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkDescriptorUpdateTemplate(descriptorUpdateTemplate);
-    delete_gfxstream_vk_descriptor_update_template(descriptorUpdateTemplate);
+    delete_gfxstream_vk_descriptor_update_template(device, descriptorUpdateTemplate, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9081,37 +8152,32 @@ VkResult VkEncoder::vkCreateRenderPass2KHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderPassCreateInfo2* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkRenderPassCreateInfo2*)pool->alloc(sizeof(const VkRenderPassCreateInfo2));
-        deepcopy_VkRenderPassCreateInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                         (VkRenderPassCreateInfo2*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkRenderPassCreateInfo2(sResourceTracker,
-                                                 (VkRenderPassCreateInfo2*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderPassCreateInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkRenderPassCreateInfo2*)(local_pCreateInfo), &count);
+                                  (const VkRenderPassCreateInfo2*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreateRenderPass2KHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkRenderPassCreateInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                            (VkRenderPassCreateInfo2*)(local_pCreateInfo),
+                                            (const VkRenderPassCreateInfo2*)(pCreateInfo),
                                             &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pRenderPass));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pRenderPass = create_gfxstream_vk_render_pass(cgen_var_0);
-    sResourceTracker->register_VkRenderPass(*pRenderPass);
+    *pRenderPass = cgen_var_0 ? create_gfxstream_vk_render_pass(device, pAllocator, cgen_var_0)
+                              : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pRenderPass)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateRenderPass2KHR_VkResult_return = (VkResult)0;
     stream->read(&vkCreateRenderPass2KHR_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateRenderPass2KHR_VkResult_return >= VK_SUCCESS) {
+        vkCreateRenderPass2KHR_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateRenderPass2KHR_VkResult_return;
@@ -9125,45 +8191,22 @@ void VkEncoder::vkCmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderPassBeginInfo* local_pRenderPassBegin = nullptr;
-    VkSubpassBeginInfo* local_pSubpassBeginInfo = nullptr;
-    if (pRenderPassBegin) {
-        local_pRenderPassBegin =
-            (VkRenderPassBeginInfo*)pool->alloc(sizeof(const VkRenderPassBeginInfo));
-        deepcopy_VkRenderPassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderPassBegin,
-                                       (VkRenderPassBeginInfo*)(local_pRenderPassBegin));
-    }
-    if (pSubpassBeginInfo) {
-        local_pSubpassBeginInfo =
-            (VkSubpassBeginInfo*)pool->alloc(sizeof(const VkSubpassBeginInfo));
-        deepcopy_VkSubpassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassBeginInfo,
-                                    (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
-    if (local_pRenderPassBegin) {
-        transform_tohost_VkRenderPassBeginInfo(sResourceTracker,
-                                               (VkRenderPassBeginInfo*)(local_pRenderPassBegin));
-    }
-    if (local_pSubpassBeginInfo) {
-        transform_tohost_VkSubpassBeginInfo(sResourceTracker,
-                                            (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderPassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkRenderPassBeginInfo*)(local_pRenderPassBegin), &count);
+                                (const VkRenderPassBeginInfo*)(pRenderPassBegin), &count);
     count_VkSubpassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                             (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &count);
+                             (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdBeginRenderPass2KHR, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkRenderPassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkRenderPassBeginInfo*)(local_pRenderPassBegin),
+                                          (const VkRenderPassBeginInfo*)(pRenderPassBegin),
                                           &streamPtr);
     reservedmarshal_VkSubpassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                       (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &streamPtr);
+                                       (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9175,43 +8218,21 @@ void VkEncoder::vkCmdNextSubpass2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubpassBeginInfo* local_pSubpassBeginInfo = nullptr;
-    VkSubpassEndInfo* local_pSubpassEndInfo = nullptr;
-    if (pSubpassBeginInfo) {
-        local_pSubpassBeginInfo =
-            (VkSubpassBeginInfo*)pool->alloc(sizeof(const VkSubpassBeginInfo));
-        deepcopy_VkSubpassBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassBeginInfo,
-                                    (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
-    if (pSubpassEndInfo) {
-        local_pSubpassEndInfo = (VkSubpassEndInfo*)pool->alloc(sizeof(const VkSubpassEndInfo));
-        deepcopy_VkSubpassEndInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassEndInfo,
-                                  (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
-    if (local_pSubpassBeginInfo) {
-        transform_tohost_VkSubpassBeginInfo(sResourceTracker,
-                                            (VkSubpassBeginInfo*)(local_pSubpassBeginInfo));
-    }
-    if (local_pSubpassEndInfo) {
-        transform_tohost_VkSubpassEndInfo(sResourceTracker,
-                                          (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSubpassBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                             (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &count);
+                             (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &count);
     count_VkSubpassEndInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkSubpassEndInfo*)(local_pSubpassEndInfo), &count);
+                           (const VkSubpassEndInfo*)(pSubpassEndInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdNextSubpass2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkSubpassBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                       (VkSubpassBeginInfo*)(local_pSubpassBeginInfo), &streamPtr);
+                                       (const VkSubpassBeginInfo*)(pSubpassBeginInfo), &streamPtr);
     reservedmarshal_VkSubpassEndInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkSubpassEndInfo*)(local_pSubpassEndInfo), &streamPtr);
+                                     (const VkSubpassEndInfo*)(pSubpassEndInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9222,28 +8243,17 @@ void VkEncoder::vkCmdEndRenderPass2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubpassEndInfo* local_pSubpassEndInfo = nullptr;
-    if (pSubpassEndInfo) {
-        local_pSubpassEndInfo = (VkSubpassEndInfo*)pool->alloc(sizeof(const VkSubpassEndInfo));
-        deepcopy_VkSubpassEndInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubpassEndInfo,
-                                  (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
-    if (local_pSubpassEndInfo) {
-        transform_tohost_VkSubpassEndInfo(sResourceTracker,
-                                          (VkSubpassEndInfo*)(local_pSubpassEndInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSubpassEndInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkSubpassEndInfo*)(local_pSubpassEndInfo), &count);
+                           (const VkSubpassEndInfo*)(pSubpassEndInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdEndRenderPass2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkSubpassEndInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkSubpassEndInfo*)(local_pSubpassEndInfo), &streamPtr);
+                                     (const VkSubpassEndInfo*)(pSubpassEndInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9257,24 +8267,11 @@ void VkEncoder::vkGetPhysicalDeviceExternalFencePropertiesKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPhysicalDeviceExternalFenceInfo* local_pExternalFenceInfo = nullptr;
-    if (pExternalFenceInfo) {
-        local_pExternalFenceInfo = (VkPhysicalDeviceExternalFenceInfo*)pool->alloc(
-            sizeof(const VkPhysicalDeviceExternalFenceInfo));
-        deepcopy_VkPhysicalDeviceExternalFenceInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pExternalFenceInfo,
-            (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo));
-    }
-    if (local_pExternalFenceInfo) {
-        transform_tohost_VkPhysicalDeviceExternalFenceInfo(
-            sResourceTracker, (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPhysicalDeviceExternalFenceInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo), &count);
+        (const VkPhysicalDeviceExternalFenceInfo*)(pExternalFenceInfo), &count);
     count_VkExternalFenceProperties(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                     (VkExternalFenceProperties*)(pExternalFenceProperties), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetPhysicalDeviceExternalFencePropertiesKHR,
@@ -9282,16 +8279,12 @@ void VkEncoder::vkGetPhysicalDeviceExternalFencePropertiesKHR(
     writeStreamVal(&streamPtr, gfxstream_vk_physical_device_to_host_u64(physicalDevice));
     reservedmarshal_VkPhysicalDeviceExternalFenceInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPhysicalDeviceExternalFenceInfo*)(local_pExternalFenceInfo), &streamPtr);
+        (const VkPhysicalDeviceExternalFenceInfo*)(pExternalFenceInfo), &streamPtr);
     reservedmarshal_VkExternalFenceProperties(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkExternalFenceProperties*)(pExternalFenceProperties),
         &streamPtr);
     unmarshal_VkExternalFenceProperties(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                         (VkExternalFenceProperties*)(pExternalFenceProperties));
-    if (pExternalFenceProperties) {
-        transform_fromhost_VkExternalFenceProperties(
-            sResourceTracker, (VkExternalFenceProperties*)(pExternalFenceProperties));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9305,27 +8298,15 @@ VkResult VkEncoder::vkImportFenceFdKHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImportFenceFdInfoKHR* local_pImportFenceFdInfo = nullptr;
-    if (pImportFenceFdInfo) {
-        local_pImportFenceFdInfo =
-            (VkImportFenceFdInfoKHR*)pool->alloc(sizeof(const VkImportFenceFdInfoKHR));
-        deepcopy_VkImportFenceFdInfoKHR(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pImportFenceFdInfo,
-                                        (VkImportFenceFdInfoKHR*)(local_pImportFenceFdInfo));
-    }
-    if (local_pImportFenceFdInfo) {
-        transform_tohost_VkImportFenceFdInfoKHR(
-            sResourceTracker, (VkImportFenceFdInfoKHR*)(local_pImportFenceFdInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImportFenceFdInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                 (VkImportFenceFdInfoKHR*)(local_pImportFenceFdInfo), &count);
+                                 (const VkImportFenceFdInfoKHR*)(pImportFenceFdInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkImportFenceFdKHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImportFenceFdInfoKHR(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                           (VkImportFenceFdInfoKHR*)(local_pImportFenceFdInfo),
+                                           (const VkImportFenceFdInfoKHR*)(pImportFenceFdInfo),
                                            &streamPtr);
     VkResult vkImportFenceFdKHR_VkResult_return = (VkResult)0;
     stream->read(&vkImportFenceFdKHR_VkResult_return, sizeof(VkResult));
@@ -9340,27 +8321,16 @@ VkResult VkEncoder::vkGetFenceFdKHR(VkDevice device, const VkFenceGetFdInfoKHR* 
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkFenceGetFdInfoKHR* local_pGetFdInfo = nullptr;
-    if (pGetFdInfo) {
-        local_pGetFdInfo = (VkFenceGetFdInfoKHR*)pool->alloc(sizeof(const VkFenceGetFdInfoKHR));
-        deepcopy_VkFenceGetFdInfoKHR(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pGetFdInfo,
-                                     (VkFenceGetFdInfoKHR*)(local_pGetFdInfo));
-    }
-    if (local_pGetFdInfo) {
-        transform_tohost_VkFenceGetFdInfoKHR(sResourceTracker,
-                                             (VkFenceGetFdInfoKHR*)(local_pGetFdInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkFenceGetFdInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkFenceGetFdInfoKHR*)(local_pGetFdInfo), &count);
+                              (const VkFenceGetFdInfoKHR*)(pGetFdInfo), &count);
     count += sizeof(int);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkGetFenceFdKHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkFenceGetFdInfoKHR(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkFenceGetFdInfoKHR*)(local_pGetFdInfo), &streamPtr);
+                                        (const VkFenceGetFdInfoKHR*)(pGetFdInfo), &streamPtr);
     writeStreamBytes(&streamPtr, pFd, sizeof(int));
     stream->read(pFd, sizeof(int));
     VkResult vkGetFenceFdKHR_VkResult_return = (VkResult)0;
@@ -9380,29 +8350,17 @@ void VkEncoder::vkGetImageMemoryRequirements2KHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageMemoryRequirementsInfo2* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo = (VkImageMemoryRequirementsInfo2*)pool->alloc(
-            sizeof(const VkImageMemoryRequirementsInfo2));
-        deepcopy_VkImageMemoryRequirementsInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                                (VkImageMemoryRequirementsInfo2*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkImageMemoryRequirementsInfo2(
-            sResourceTracker, (VkImageMemoryRequirementsInfo2*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImageMemoryRequirementsInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                         (VkImageMemoryRequirementsInfo2*)(local_pInfo), &count);
+                                         (const VkImageMemoryRequirementsInfo2*)(pInfo), &count);
     count_VkMemoryRequirements2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                 (VkMemoryRequirements2*)(pMemoryRequirements), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetImageMemoryRequirements2KHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImageMemoryRequirementsInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                   (VkImageMemoryRequirementsInfo2*)(local_pInfo),
+                                                   (const VkImageMemoryRequirementsInfo2*)(pInfo),
                                                    &streamPtr);
     reservedmarshal_VkMemoryRequirements2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                           (VkMemoryRequirements2*)(pMemoryRequirements),
@@ -9425,29 +8383,17 @@ void VkEncoder::vkGetBufferMemoryRequirements2KHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferMemoryRequirementsInfo2* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo = (VkBufferMemoryRequirementsInfo2*)pool->alloc(
-            sizeof(const VkBufferMemoryRequirementsInfo2));
-        deepcopy_VkBufferMemoryRequirementsInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                                 (VkBufferMemoryRequirementsInfo2*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkBufferMemoryRequirementsInfo2(
-            sResourceTracker, (VkBufferMemoryRequirementsInfo2*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferMemoryRequirementsInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkBufferMemoryRequirementsInfo2*)(local_pInfo), &count);
+                                          (const VkBufferMemoryRequirementsInfo2*)(pInfo), &count);
     count_VkMemoryRequirements2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                 (VkMemoryRequirements2*)(pMemoryRequirements), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetBufferMemoryRequirements2KHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferMemoryRequirementsInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                    (VkBufferMemoryRequirementsInfo2*)(local_pInfo),
+                                                    (const VkBufferMemoryRequirementsInfo2*)(pInfo),
                                                     &streamPtr);
     reservedmarshal_VkMemoryRequirements2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                           (VkMemoryRequirements2*)(pMemoryRequirements),
@@ -9470,23 +8416,10 @@ void VkEncoder::vkGetImageSparseMemoryRequirements2KHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageSparseMemoryRequirementsInfo2* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo = (VkImageSparseMemoryRequirementsInfo2*)pool->alloc(
-            sizeof(const VkImageSparseMemoryRequirementsInfo2));
-        deepcopy_VkImageSparseMemoryRequirementsInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-            (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkImageSparseMemoryRequirementsInfo2(
-            sResourceTracker, (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkImageSparseMemoryRequirementsInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                               (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo),
+                                               (const VkImageSparseMemoryRequirementsInfo2*)(pInfo),
                                                &count);
     count += 8;
     if (pSparseMemoryRequirementCount) {
@@ -9506,7 +8439,7 @@ void VkEncoder::vkGetImageSparseMemoryRequirements2KHR(
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkImageSparseMemoryRequirementsInfo2(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkImageSparseMemoryRequirementsInfo2*)(local_pInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkImageSparseMemoryRequirementsInfo2*)(pInfo),
         &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pSparseMemoryRequirementCount);
     if (pSparseMemoryRequirementCount) {
@@ -9541,15 +8474,6 @@ void VkEncoder::vkGetImageSparseMemoryRequirements2KHR(
             }
         }
     }
-    if (pSparseMemoryRequirementCount) {
-        if (pSparseMemoryRequirements) {
-            for (uint32_t i = 0; i < (uint32_t)(*pSparseMemoryRequirementCount); ++i) {
-                transform_fromhost_VkSparseImageMemoryRequirements2(
-                    sResourceTracker,
-                    (VkSparseImageMemoryRequirements2*)(pSparseMemoryRequirements + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9564,39 +8488,34 @@ VkResult VkEncoder::vkCreateSamplerYcbcrConversionKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSamplerYcbcrConversionCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkSamplerYcbcrConversionCreateInfo*)pool->alloc(
-            sizeof(const VkSamplerYcbcrConversionCreateInfo));
-        deepcopy_VkSamplerYcbcrConversionCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkSamplerYcbcrConversionCreateInfo(
-            sResourceTracker, (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSamplerYcbcrConversionCreateInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo), &count);
+        (const VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr = reservePacket(stream, OP_vkCreateSamplerYcbcrConversionKHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSamplerYcbcrConversionCreateInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkSamplerYcbcrConversionCreateInfo*)(local_pCreateInfo), &streamPtr);
+        (const VkSamplerYcbcrConversionCreateInfo*)(pCreateInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pYcbcrConversion));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pYcbcrConversion = create_gfxstream_vk_sampler_ycbcr_conversion(cgen_var_0);
-    sResourceTracker->register_VkSamplerYcbcrConversion(*pYcbcrConversion);
+    *pYcbcrConversion =
+        cgen_var_0 ? create_gfxstream_vk_sampler_ycbcr_conversion(device, pAllocator, cgen_var_0)
+                   : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pYcbcrConversion)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreateSamplerYcbcrConversionKHR_VkResult_return = (VkResult)0;
     stream->read(&vkCreateSamplerYcbcrConversionKHR_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreateSamplerYcbcrConversionKHR_VkResult_return >= VK_SUCCESS) {
+        vkCreateSamplerYcbcrConversionKHR_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateSamplerYcbcrConversionKHR_VkResult_return;
@@ -9618,8 +8537,7 @@ void VkEncoder::vkDestroySamplerYcbcrConversionKHR(VkDevice device,
     writeStreamVal(&streamPtr, gfxstream_vk_sampler_ycbcr_conversion_to_host_u64(ycbcrConversion));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkSamplerYcbcrConversion(ycbcrConversion);
-    delete_gfxstream_vk_sampler_ycbcr_conversion(ycbcrConversion);
+    delete_gfxstream_vk_sampler_ycbcr_conversion(device, ycbcrConversion, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9727,23 +8645,10 @@ void VkEncoder::vkGetDescriptorSetLayoutSupportKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDescriptorSetLayoutCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo = (VkDescriptorSetLayoutCreateInfo*)pool->alloc(
-            sizeof(const VkDescriptorSetLayoutCreateInfo));
-        deepcopy_VkDescriptorSetLayoutCreateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-            (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkDescriptorSetLayoutCreateInfo(
-            sResourceTracker, (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDescriptorSetLayoutCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo),
+                                          (const VkDescriptorSetLayoutCreateInfo*)(pCreateInfo),
                                           &count);
     count_VkDescriptorSetLayoutSupport(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                        (VkDescriptorSetLayoutSupport*)(pSupport), &count);
@@ -9751,16 +8656,12 @@ void VkEncoder::vkGetDescriptorSetLayoutSupportKHR(
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkDescriptorSetLayoutCreateInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkDescriptorSetLayoutCreateInfo*)(local_pCreateInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkDescriptorSetLayoutCreateInfo*)(pCreateInfo),
         &streamPtr);
     reservedmarshal_VkDescriptorSetLayoutSupport(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkDescriptorSetLayoutSupport*)(pSupport), &streamPtr);
     unmarshal_VkDescriptorSetLayoutSupport(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                            (VkDescriptorSetLayoutSupport*)(pSupport));
-    if (pSupport) {
-        transform_fromhost_VkDescriptorSetLayoutSupport(sResourceTracker,
-                                                        (VkDescriptorSetLayoutSupport*)(pSupport));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9856,27 +8757,16 @@ VkResult VkEncoder::vkWaitSemaphoresKHR(VkDevice device, const VkSemaphoreWaitIn
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSemaphoreWaitInfo* local_pWaitInfo = nullptr;
-    if (pWaitInfo) {
-        local_pWaitInfo = (VkSemaphoreWaitInfo*)pool->alloc(sizeof(const VkSemaphoreWaitInfo));
-        deepcopy_VkSemaphoreWaitInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pWaitInfo,
-                                     (VkSemaphoreWaitInfo*)(local_pWaitInfo));
-    }
-    if (local_pWaitInfo) {
-        transform_tohost_VkSemaphoreWaitInfo(sResourceTracker,
-                                             (VkSemaphoreWaitInfo*)(local_pWaitInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSemaphoreWaitInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkSemaphoreWaitInfo*)(local_pWaitInfo), &count);
+                              (const VkSemaphoreWaitInfo*)(pWaitInfo), &count);
     count += sizeof(uint64_t);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkWaitSemaphoresKHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSemaphoreWaitInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkSemaphoreWaitInfo*)(local_pWaitInfo), &streamPtr);
+                                        (const VkSemaphoreWaitInfo*)(pWaitInfo), &streamPtr);
     writeStreamBytes(&streamPtr, &timeout, sizeof(uint64_t));
     VkResult vkWaitSemaphoresKHR_VkResult_return = (VkResult)0;
     stream->read(&vkWaitSemaphoresKHR_VkResult_return, sizeof(VkResult));
@@ -9891,27 +8781,15 @@ VkResult VkEncoder::vkSignalSemaphoreKHR(VkDevice device, const VkSemaphoreSigna
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSemaphoreSignalInfo* local_pSignalInfo = nullptr;
-    if (pSignalInfo) {
-        local_pSignalInfo =
-            (VkSemaphoreSignalInfo*)pool->alloc(sizeof(const VkSemaphoreSignalInfo));
-        deepcopy_VkSemaphoreSignalInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSignalInfo,
-                                       (VkSemaphoreSignalInfo*)(local_pSignalInfo));
-    }
-    if (local_pSignalInfo) {
-        transform_tohost_VkSemaphoreSignalInfo(sResourceTracker,
-                                               (VkSemaphoreSignalInfo*)(local_pSignalInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSemaphoreSignalInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkSemaphoreSignalInfo*)(local_pSignalInfo), &count);
+                                (const VkSemaphoreSignalInfo*)(pSignalInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkSignalSemaphoreKHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkSemaphoreSignalInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkSemaphoreSignalInfo*)(local_pSignalInfo), &streamPtr);
+                                          (const VkSemaphoreSignalInfo*)(pSignalInfo), &streamPtr);
     VkResult vkSignalSemaphoreKHR_VkResult_return = (VkResult)0;
     stream->read(&vkSignalSemaphoreKHR_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -9928,24 +8806,11 @@ void VkEncoder::vkCmdSetRenderingAttachmentLocationsKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingAttachmentLocationInfo* local_pLocationInfo = nullptr;
-    if (pLocationInfo) {
-        local_pLocationInfo = (VkRenderingAttachmentLocationInfo*)pool->alloc(
-            sizeof(const VkRenderingAttachmentLocationInfo));
-        deepcopy_VkRenderingAttachmentLocationInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pLocationInfo,
-            (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo));
-    }
-    if (local_pLocationInfo) {
-        transform_tohost_VkRenderingAttachmentLocationInfo(
-            sResourceTracker, (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingAttachmentLocationInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo), &count);
+        (const VkRenderingAttachmentLocationInfo*)(pLocationInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdSetRenderingAttachmentLocationsKHR, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -9953,7 +8818,7 @@ void VkEncoder::vkCmdSetRenderingAttachmentLocationsKHR(
     }
     reservedmarshal_VkRenderingAttachmentLocationInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingAttachmentLocationInfo*)(local_pLocationInfo), &streamPtr);
+        (const VkRenderingAttachmentLocationInfo*)(pLocationInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -9965,25 +8830,11 @@ void VkEncoder::vkCmdSetRenderingInputAttachmentIndicesKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingInputAttachmentIndexInfo* local_pInputAttachmentIndexInfo = nullptr;
-    if (pInputAttachmentIndexInfo) {
-        local_pInputAttachmentIndexInfo = (VkRenderingInputAttachmentIndexInfo*)pool->alloc(
-            sizeof(const VkRenderingInputAttachmentIndexInfo));
-        deepcopy_VkRenderingInputAttachmentIndexInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInputAttachmentIndexInfo,
-            (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo));
-    }
-    if (local_pInputAttachmentIndexInfo) {
-        transform_tohost_VkRenderingInputAttachmentIndexInfo(
-            sResourceTracker,
-            (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingInputAttachmentIndexInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo), &count);
+        (const VkRenderingInputAttachmentIndexInfo*)(pInputAttachmentIndexInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdSetRenderingInputAttachmentIndicesKHR,
                                           count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -9991,7 +8842,7 @@ void VkEncoder::vkCmdSetRenderingInputAttachmentIndicesKHR(
     }
     reservedmarshal_VkRenderingInputAttachmentIndexInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkRenderingInputAttachmentIndexInfo*)(local_pInputAttachmentIndexInfo), &streamPtr);
+        (const VkRenderingInputAttachmentIndexInfo*)(pInputAttachmentIndexInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10005,27 +8856,15 @@ VkDeviceAddress VkEncoder::vkGetBufferDeviceAddressKHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferDeviceAddressInfo* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo =
-            (VkBufferDeviceAddressInfo*)pool->alloc(sizeof(const VkBufferDeviceAddressInfo));
-        deepcopy_VkBufferDeviceAddressInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                           (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkBufferDeviceAddressInfo(sResourceTracker,
-                                                   (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferDeviceAddressInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkBufferDeviceAddressInfo*)(local_pInfo), &count);
+                                    (const VkBufferDeviceAddressInfo*)(pInfo), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetBufferDeviceAddressKHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferDeviceAddressInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkBufferDeviceAddressInfo*)(local_pInfo), &streamPtr);
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkBufferDeviceAddressInfo*)(pInfo), &streamPtr);
     VkDeviceAddress vkGetBufferDeviceAddressKHR_VkDeviceAddress_return = (VkDeviceAddress)0;
     stream->read(&vkGetBufferDeviceAddressKHR_VkDeviceAddress_return, sizeof(VkDeviceAddress));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -10040,27 +8879,15 @@ uint64_t VkEncoder::vkGetBufferOpaqueCaptureAddressKHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBufferDeviceAddressInfo* local_pInfo = nullptr;
-    if (pInfo) {
-        local_pInfo =
-            (VkBufferDeviceAddressInfo*)pool->alloc(sizeof(const VkBufferDeviceAddressInfo));
-        deepcopy_VkBufferDeviceAddressInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pInfo,
-                                           (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
-    if (local_pInfo) {
-        transform_tohost_VkBufferDeviceAddressInfo(sResourceTracker,
-                                                   (VkBufferDeviceAddressInfo*)(local_pInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBufferDeviceAddressInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkBufferDeviceAddressInfo*)(local_pInfo), &count);
+                                    (const VkBufferDeviceAddressInfo*)(pInfo), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetBufferOpaqueCaptureAddressKHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkBufferDeviceAddressInfo(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkBufferDeviceAddressInfo*)(local_pInfo), &streamPtr);
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkBufferDeviceAddressInfo*)(pInfo), &streamPtr);
     uint64_t vkGetBufferOpaqueCaptureAddressKHR_uint64_t_return = (uint64_t)0;
     stream->read(&vkGetBufferOpaqueCaptureAddressKHR_uint64_t_return, sizeof(uint64_t));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -10114,21 +8941,10 @@ VkResult VkEncoder::vkGetPipelineExecutablePropertiesKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPipelineInfoKHR* local_pPipelineInfo = nullptr;
-    if (pPipelineInfo) {
-        local_pPipelineInfo = (VkPipelineInfoKHR*)pool->alloc(sizeof(const VkPipelineInfoKHR));
-        deepcopy_VkPipelineInfoKHR(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPipelineInfo,
-                                   (VkPipelineInfoKHR*)(local_pPipelineInfo));
-    }
-    if (local_pPipelineInfo) {
-        transform_tohost_VkPipelineInfoKHR(sResourceTracker,
-                                           (VkPipelineInfoKHR*)(local_pPipelineInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPipelineInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkPipelineInfoKHR*)(local_pPipelineInfo), &count);
+                            (const VkPipelineInfoKHR*)(pPipelineInfo), &count);
     count += 8;
     if (pExecutableCount) {
         count += sizeof(uint32_t);
@@ -10147,7 +8963,7 @@ VkResult VkEncoder::vkGetPipelineExecutablePropertiesKHR(
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPipelineInfoKHR(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkPipelineInfoKHR*)(local_pPipelineInfo), &streamPtr);
+                                      (const VkPipelineInfoKHR*)(pPipelineInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pExecutableCount);
     if (pExecutableCount) {
         writeStreamBytes(&streamPtr, pExecutableCount, sizeof(uint32_t));
@@ -10180,14 +8996,6 @@ VkResult VkEncoder::vkGetPipelineExecutablePropertiesKHR(
             }
         }
     }
-    if (pExecutableCount) {
-        if (pProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pExecutableCount); ++i) {
-                transform_fromhost_VkPipelineExecutablePropertiesKHR(
-                    sResourceTracker, (VkPipelineExecutablePropertiesKHR*)(pProperties + i));
-            }
-        }
-    }
     VkResult vkGetPipelineExecutablePropertiesKHR_VkResult_return = (VkResult)0;
     stream->read(&vkGetPipelineExecutablePropertiesKHR_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -10202,22 +9010,10 @@ VkResult VkEncoder::vkGetPipelineExecutableStatisticsKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPipelineExecutableInfoKHR* local_pExecutableInfo = nullptr;
-    if (pExecutableInfo) {
-        local_pExecutableInfo =
-            (VkPipelineExecutableInfoKHR*)pool->alloc(sizeof(const VkPipelineExecutableInfoKHR));
-        deepcopy_VkPipelineExecutableInfoKHR(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pExecutableInfo,
-                                             (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo));
-    }
-    if (local_pExecutableInfo) {
-        transform_tohost_VkPipelineExecutableInfoKHR(
-            sResourceTracker, (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPipelineExecutableInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo),
+                                      (const VkPipelineExecutableInfoKHR*)(pExecutableInfo),
                                       &count);
     count += 8;
     if (pStatisticCount) {
@@ -10237,7 +9033,7 @@ VkResult VkEncoder::vkGetPipelineExecutableStatisticsKHR(
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPipelineExecutableInfoKHR(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkPipelineExecutableInfoKHR*)(pExecutableInfo),
         &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pStatisticCount);
     if (pStatisticCount) {
@@ -10271,14 +9067,6 @@ VkResult VkEncoder::vkGetPipelineExecutableStatisticsKHR(
             }
         }
     }
-    if (pStatisticCount) {
-        if (pStatistics) {
-            for (uint32_t i = 0; i < (uint32_t)(*pStatisticCount); ++i) {
-                transform_fromhost_VkPipelineExecutableStatisticKHR(
-                    sResourceTracker, (VkPipelineExecutableStatisticKHR*)(pStatistics + i));
-            }
-        }
-    }
     VkResult vkGetPipelineExecutableStatisticsKHR_VkResult_return = (VkResult)0;
     stream->read(&vkGetPipelineExecutableStatisticsKHR_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -10294,22 +9082,10 @@ VkResult VkEncoder::vkGetPipelineExecutableInternalRepresentationsKHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPipelineExecutableInfoKHR* local_pExecutableInfo = nullptr;
-    if (pExecutableInfo) {
-        local_pExecutableInfo =
-            (VkPipelineExecutableInfoKHR*)pool->alloc(sizeof(const VkPipelineExecutableInfoKHR));
-        deepcopy_VkPipelineExecutableInfoKHR(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pExecutableInfo,
-                                             (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo));
-    }
-    if (local_pExecutableInfo) {
-        transform_tohost_VkPipelineExecutableInfoKHR(
-            sResourceTracker, (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPipelineExecutableInfoKHR(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo),
+                                      (const VkPipelineExecutableInfoKHR*)(pExecutableInfo),
                                       &count);
     count += 8;
     if (pInternalRepresentationCount) {
@@ -10330,7 +9106,7 @@ VkResult VkEncoder::vkGetPipelineExecutableInternalRepresentationsKHR(
                                        count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPipelineExecutableInfoKHR(
-        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkPipelineExecutableInfoKHR*)(local_pExecutableInfo),
+        stream, VK_STRUCTURE_TYPE_MAX_ENUM, (const VkPipelineExecutableInfoKHR*)(pExecutableInfo),
         &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)pInternalRepresentationCount);
     if (pInternalRepresentationCount) {
@@ -10366,15 +9142,6 @@ VkResult VkEncoder::vkGetPipelineExecutableInternalRepresentationsKHR(
             }
         }
     }
-    if (pInternalRepresentationCount) {
-        if (pInternalRepresentations) {
-            for (uint32_t i = 0; i < (uint32_t)(*pInternalRepresentationCount); ++i) {
-                transform_fromhost_VkPipelineExecutableInternalRepresentationKHR(
-                    sResourceTracker,
-                    (VkPipelineExecutableInternalRepresentationKHR*)(pInternalRepresentations + i));
-            }
-        }
-    }
     VkResult vkGetPipelineExecutableInternalRepresentationsKHR_VkResult_return = (VkResult)0;
     stream->read(&vkGetPipelineExecutableInternalRepresentationsKHR_VkResult_return,
                  sizeof(VkResult));
@@ -10391,21 +9158,10 @@ VkResult VkEncoder::vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfo* pMem
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkMemoryMapInfo* local_pMemoryMapInfo = nullptr;
-    if (pMemoryMapInfo) {
-        local_pMemoryMapInfo = (VkMemoryMapInfo*)pool->alloc(sizeof(const VkMemoryMapInfo));
-        deepcopy_VkMemoryMapInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pMemoryMapInfo,
-                                 (VkMemoryMapInfo*)(local_pMemoryMapInfo));
-    }
-    if (local_pMemoryMapInfo) {
-        transform_tohost_VkMemoryMapInfo(sResourceTracker,
-                                         (VkMemoryMapInfo*)(local_pMemoryMapInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkMemoryMapInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                          (VkMemoryMapInfo*)(local_pMemoryMapInfo), &count);
+                          (const VkMemoryMapInfo*)(pMemoryMapInfo), &count);
     count += 8;
     if (ppData) {
         count += sizeof(void*);
@@ -10414,7 +9170,7 @@ VkResult VkEncoder::vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfo* pMem
         reservePacket(stream, OP_vkMapMemory2KHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkMemoryMapInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                    (VkMemoryMapInfo*)(local_pMemoryMapInfo), &streamPtr);
+                                    (const VkMemoryMapInfo*)(pMemoryMapInfo), &streamPtr);
     putBe64WithStreamPtr(&streamPtr, (uint64_t)(uintptr_t)ppData);
     if (ppData) {
         writeStreamBytes(&streamPtr, ppData, sizeof(void*));
@@ -10439,26 +9195,15 @@ VkResult VkEncoder::vkUnmapMemory2KHR(VkDevice device, const VkMemoryUnmapInfo* 
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkMemoryUnmapInfo* local_pMemoryUnmapInfo = nullptr;
-    if (pMemoryUnmapInfo) {
-        local_pMemoryUnmapInfo = (VkMemoryUnmapInfo*)pool->alloc(sizeof(const VkMemoryUnmapInfo));
-        deepcopy_VkMemoryUnmapInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pMemoryUnmapInfo,
-                                   (VkMemoryUnmapInfo*)(local_pMemoryUnmapInfo));
-    }
-    if (local_pMemoryUnmapInfo) {
-        transform_tohost_VkMemoryUnmapInfo(sResourceTracker,
-                                           (VkMemoryUnmapInfo*)(local_pMemoryUnmapInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkMemoryUnmapInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkMemoryUnmapInfo*)(local_pMemoryUnmapInfo), &count);
+                            (const VkMemoryUnmapInfo*)(pMemoryUnmapInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkUnmapMemory2KHR, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkMemoryUnmapInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkMemoryUnmapInfo*)(local_pMemoryUnmapInfo), &streamPtr);
+                                      (const VkMemoryUnmapInfo*)(pMemoryUnmapInfo), &streamPtr);
     VkResult vkUnmapMemory2KHR_VkResult_return = (VkResult)0;
     stream->read(&vkUnmapMemory2KHR_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -10474,21 +9219,10 @@ void VkEncoder::vkCmdSetEvent2KHR(VkCommandBuffer commandBuffer, VkEvent event,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDependencyInfo* local_pDependencyInfo = nullptr;
-    if (pDependencyInfo) {
-        local_pDependencyInfo = (VkDependencyInfo*)pool->alloc(sizeof(const VkDependencyInfo));
-        deepcopy_VkDependencyInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDependencyInfo,
-                                  (VkDependencyInfo*)(local_pDependencyInfo));
-    }
-    if (local_pDependencyInfo) {
-        transform_tohost_VkDependencyInfo(sResourceTracker,
-                                          (VkDependencyInfo*)(local_pDependencyInfo));
-    }
     size_t count = 0;
     count += 2 * 8;
     count_VkDependencyInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkDependencyInfo*)(local_pDependencyInfo), &count);
+                           (const VkDependencyInfo*)(pDependencyInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdSetEvent2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -10496,7 +9230,7 @@ void VkEncoder::vkCmdSetEvent2KHR(VkCommandBuffer commandBuffer, VkEvent event,
     }
     writeStreamVal(&streamPtr, gfxstream_vk_event_to_host_u64(event));
     reservedmarshal_VkDependencyInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkDependencyInfo*)(local_pDependencyInfo), &streamPtr);
+                                     (const VkDependencyInfo*)(pDependencyInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10528,22 +9262,6 @@ void VkEncoder::vkCmdWaitEvents2KHR(VkCommandBuffer commandBuffer, uint32_t even
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDependencyInfo* local_pDependencyInfos = nullptr;
-    if (pDependencyInfos) {
-        local_pDependencyInfos =
-            (VkDependencyInfo*)pool->alloc(eventCount * sizeof(const VkDependencyInfo));
-        for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
-            deepcopy_VkDependencyInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDependencyInfos + i,
-                                      (VkDependencyInfo*)(local_pDependencyInfos + i));
-        }
-    }
-    if (local_pDependencyInfos) {
-        for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
-            transform_tohost_VkDependencyInfo(sResourceTracker,
-                                              (VkDependencyInfo*)(local_pDependencyInfos + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
@@ -10552,7 +9270,7 @@ void VkEncoder::vkCmdWaitEvents2KHR(VkCommandBuffer commandBuffer, uint32_t even
     }
     for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
         count_VkDependencyInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                               (VkDependencyInfo*)(local_pDependencyInfos + i), &count);
+                               (const VkDependencyInfo*)(pDependencyInfos + i), &count);
     }
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdWaitEvents2KHR, count, queueSubmitWithCommandsEnabled);
@@ -10567,7 +9285,7 @@ void VkEncoder::vkCmdWaitEvents2KHR(VkCommandBuffer commandBuffer, uint32_t even
     }
     for (uint32_t i = 0; i < (uint32_t)eventCount; ++i) {
         reservedmarshal_VkDependencyInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                         (VkDependencyInfo*)(local_pDependencyInfos + i),
+                                         (const VkDependencyInfo*)(pDependencyInfos + i),
                                          &streamPtr);
     }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -10580,28 +9298,17 @@ void VkEncoder::vkCmdPipelineBarrier2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDependencyInfo* local_pDependencyInfo = nullptr;
-    if (pDependencyInfo) {
-        local_pDependencyInfo = (VkDependencyInfo*)pool->alloc(sizeof(const VkDependencyInfo));
-        deepcopy_VkDependencyInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDependencyInfo,
-                                  (VkDependencyInfo*)(local_pDependencyInfo));
-    }
-    if (local_pDependencyInfo) {
-        transform_tohost_VkDependencyInfo(sResourceTracker,
-                                          (VkDependencyInfo*)(local_pDependencyInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkDependencyInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkDependencyInfo*)(local_pDependencyInfo), &count);
+                           (const VkDependencyInfo*)(pDependencyInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdPipelineBarrier2KHR, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkDependencyInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkDependencyInfo*)(local_pDependencyInfo), &streamPtr);
+                                     (const VkDependencyInfo*)(pDependencyInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10636,26 +9343,12 @@ VkResult VkEncoder::vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubmitInfo2* local_pSubmits = nullptr;
-    if (pSubmits) {
-        local_pSubmits = (VkSubmitInfo2*)pool->alloc(submitCount * sizeof(const VkSubmitInfo2));
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            deepcopy_VkSubmitInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubmits + i,
-                                   (VkSubmitInfo2*)(local_pSubmits + i));
-        }
-    }
-    if (local_pSubmits) {
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            transform_tohost_VkSubmitInfo2(sResourceTracker, (VkSubmitInfo2*)(local_pSubmits + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         count_VkSubmitInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkSubmitInfo2*)(local_pSubmits + i), &count);
+                            (const VkSubmitInfo2*)(pSubmits + i), &count);
     }
     count += 8;
     uint8_t* streamPtr =
@@ -10664,7 +9357,7 @@ VkResult VkEncoder::vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount,
     writeStreamBytes(&streamPtr, &submitCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         reservedmarshal_VkSubmitInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkSubmitInfo2*)(local_pSubmits + i), &streamPtr);
+                                      (const VkSubmitInfo2*)(pSubmits + i), &streamPtr);
     }
     writeStreamVal(&streamPtr, gfxstream_vk_fence_to_host_u64(fence));
     VkResult vkQueueSubmit2KHR_VkResult_return = (VkResult)0;
@@ -10682,28 +9375,17 @@ void VkEncoder::vkCmdCopyBuffer2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyBufferInfo2* local_pCopyBufferInfo = nullptr;
-    if (pCopyBufferInfo) {
-        local_pCopyBufferInfo = (VkCopyBufferInfo2*)pool->alloc(sizeof(const VkCopyBufferInfo2));
-        deepcopy_VkCopyBufferInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyBufferInfo,
-                                   (VkCopyBufferInfo2*)(local_pCopyBufferInfo));
-    }
-    if (local_pCopyBufferInfo) {
-        transform_tohost_VkCopyBufferInfo2(sResourceTracker,
-                                           (VkCopyBufferInfo2*)(local_pCopyBufferInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyBufferInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkCopyBufferInfo2*)(local_pCopyBufferInfo), &count);
+                            (const VkCopyBufferInfo2*)(pCopyBufferInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdCopyBuffer2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkCopyBufferInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkCopyBufferInfo2*)(local_pCopyBufferInfo), &streamPtr);
+                                      (const VkCopyBufferInfo2*)(pCopyBufferInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10714,28 +9396,17 @@ void VkEncoder::vkCmdCopyImage2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyImageInfo2* local_pCopyImageInfo = nullptr;
-    if (pCopyImageInfo) {
-        local_pCopyImageInfo = (VkCopyImageInfo2*)pool->alloc(sizeof(const VkCopyImageInfo2));
-        deepcopy_VkCopyImageInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyImageInfo,
-                                  (VkCopyImageInfo2*)(local_pCopyImageInfo));
-    }
-    if (local_pCopyImageInfo) {
-        transform_tohost_VkCopyImageInfo2(sResourceTracker,
-                                          (VkCopyImageInfo2*)(local_pCopyImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkCopyImageInfo2*)(local_pCopyImageInfo), &count);
+                           (const VkCopyImageInfo2*)(pCopyImageInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdCopyImage2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkCopyImageInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkCopyImageInfo2*)(local_pCopyImageInfo), &streamPtr);
+                                     (const VkCopyImageInfo2*)(pCopyImageInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10747,23 +9418,10 @@ void VkEncoder::vkCmdCopyBufferToImage2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyBufferToImageInfo2* local_pCopyBufferToImageInfo = nullptr;
-    if (pCopyBufferToImageInfo) {
-        local_pCopyBufferToImageInfo =
-            (VkCopyBufferToImageInfo2*)pool->alloc(sizeof(const VkCopyBufferToImageInfo2));
-        deepcopy_VkCopyBufferToImageInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyBufferToImageInfo,
-            (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo));
-    }
-    if (local_pCopyBufferToImageInfo) {
-        transform_tohost_VkCopyBufferToImageInfo2(
-            sResourceTracker, (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyBufferToImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo),
+                                   (const VkCopyBufferToImageInfo2*)(pCopyBufferToImageInfo),
                                    &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdCopyBufferToImage2KHR, count,
                                           queueSubmitWithCommandsEnabled);
@@ -10772,7 +9430,7 @@ void VkEncoder::vkCmdCopyBufferToImage2KHR(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkCopyBufferToImageInfo2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkCopyBufferToImageInfo2*)(local_pCopyBufferToImageInfo), &streamPtr);
+        (const VkCopyBufferToImageInfo2*)(pCopyBufferToImageInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10784,23 +9442,10 @@ void VkEncoder::vkCmdCopyImageToBuffer2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyImageToBufferInfo2* local_pCopyImageToBufferInfo = nullptr;
-    if (pCopyImageToBufferInfo) {
-        local_pCopyImageToBufferInfo =
-            (VkCopyImageToBufferInfo2*)pool->alloc(sizeof(const VkCopyImageToBufferInfo2));
-        deepcopy_VkCopyImageToBufferInfo2(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyImageToBufferInfo,
-            (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo));
-    }
-    if (local_pCopyImageToBufferInfo) {
-        transform_tohost_VkCopyImageToBufferInfo2(
-            sResourceTracker, (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyImageToBufferInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo),
+                                   (const VkCopyImageToBufferInfo2*)(pCopyImageToBufferInfo),
                                    &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdCopyImageToBuffer2KHR, count,
                                           queueSubmitWithCommandsEnabled);
@@ -10809,7 +9454,7 @@ void VkEncoder::vkCmdCopyImageToBuffer2KHR(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkCopyImageToBufferInfo2(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkCopyImageToBufferInfo2*)(local_pCopyImageToBufferInfo), &streamPtr);
+        (const VkCopyImageToBufferInfo2*)(pCopyImageToBufferInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10820,28 +9465,17 @@ void VkEncoder::vkCmdBlitImage2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBlitImageInfo2* local_pBlitImageInfo = nullptr;
-    if (pBlitImageInfo) {
-        local_pBlitImageInfo = (VkBlitImageInfo2*)pool->alloc(sizeof(const VkBlitImageInfo2));
-        deepcopy_VkBlitImageInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBlitImageInfo,
-                                  (VkBlitImageInfo2*)(local_pBlitImageInfo));
-    }
-    if (local_pBlitImageInfo) {
-        transform_tohost_VkBlitImageInfo2(sResourceTracker,
-                                          (VkBlitImageInfo2*)(local_pBlitImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBlitImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkBlitImageInfo2*)(local_pBlitImageInfo), &count);
+                           (const VkBlitImageInfo2*)(pBlitImageInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdBlitImage2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkBlitImageInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkBlitImageInfo2*)(local_pBlitImageInfo), &streamPtr);
+                                     (const VkBlitImageInfo2*)(pBlitImageInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -10853,29 +9487,17 @@ void VkEncoder::vkCmdResolveImage2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkResolveImageInfo2* local_pResolveImageInfo = nullptr;
-    if (pResolveImageInfo) {
-        local_pResolveImageInfo =
-            (VkResolveImageInfo2*)pool->alloc(sizeof(const VkResolveImageInfo2));
-        deepcopy_VkResolveImageInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pResolveImageInfo,
-                                     (VkResolveImageInfo2*)(local_pResolveImageInfo));
-    }
-    if (local_pResolveImageInfo) {
-        transform_tohost_VkResolveImageInfo2(sResourceTracker,
-                                             (VkResolveImageInfo2*)(local_pResolveImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkResolveImageInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkResolveImageInfo2*)(local_pResolveImageInfo), &count);
+                              (const VkResolveImageInfo2*)(pResolveImageInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdResolveImage2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkResolveImageInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkResolveImageInfo2*)(local_pResolveImageInfo),
+                                        (const VkResolveImageInfo2*)(pResolveImageInfo),
                                         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -11050,15 +9672,6 @@ void VkEncoder::vkGetDeviceImageSparseMemoryRequirementsKHR(
             }
         }
     }
-    if (pSparseMemoryRequirementCount) {
-        if (pSparseMemoryRequirements) {
-            for (uint32_t i = 0; i < (uint32_t)(*pSparseMemoryRequirementCount); ++i) {
-                transform_fromhost_VkSparseImageMemoryRequirements2(
-                    sResourceTracker,
-                    (VkSparseImageMemoryRequirements2*)(pSparseMemoryRequirements + i));
-            }
-        }
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -11096,28 +9709,16 @@ void VkEncoder::vkGetRenderingAreaGranularityKHR(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkRenderingAreaInfo* local_pRenderingAreaInfo = nullptr;
-    if (pRenderingAreaInfo) {
-        local_pRenderingAreaInfo =
-            (VkRenderingAreaInfo*)pool->alloc(sizeof(const VkRenderingAreaInfo));
-        deepcopy_VkRenderingAreaInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pRenderingAreaInfo,
-                                     (VkRenderingAreaInfo*)(local_pRenderingAreaInfo));
-    }
-    if (local_pRenderingAreaInfo) {
-        transform_tohost_VkRenderingAreaInfo(sResourceTracker,
-                                             (VkRenderingAreaInfo*)(local_pRenderingAreaInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkRenderingAreaInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkRenderingAreaInfo*)(local_pRenderingAreaInfo), &count);
+                              (const VkRenderingAreaInfo*)(pRenderingAreaInfo), &count);
     count_VkExtent2D(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM, (VkExtent2D*)(pGranularity), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetRenderingAreaGranularityKHR, count,
                                        queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkRenderingAreaInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkRenderingAreaInfo*)(local_pRenderingAreaInfo),
+                                        (const VkRenderingAreaInfo*)(pRenderingAreaInfo),
                                         &streamPtr);
     reservedmarshal_VkExtent2D(stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkExtent2D*)(pGranularity),
                                &streamPtr);
@@ -11162,9 +9763,6 @@ void VkEncoder::vkGetDeviceImageSubresourceLayoutKHR(VkDevice device,
                                          (VkSubresourceLayout2*)(pLayout), &streamPtr);
     unmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkSubresourceLayout2*)(pLayout));
-    if (pLayout) {
-        transform_fromhost_VkSubresourceLayout2(sResourceTracker, (VkSubresourceLayout2*)(pLayout));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -11176,21 +9774,10 @@ void VkEncoder::vkGetImageSubresourceLayout2KHR(VkDevice device, VkImage image,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageSubresource2* local_pSubresource = nullptr;
-    if (pSubresource) {
-        local_pSubresource = (VkImageSubresource2*)pool->alloc(sizeof(const VkImageSubresource2));
-        deepcopy_VkImageSubresource2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubresource,
-                                     (VkImageSubresource2*)(local_pSubresource));
-    }
-    if (local_pSubresource) {
-        transform_tohost_VkImageSubresource2(sResourceTracker,
-                                             (VkImageSubresource2*)(local_pSubresource));
-    }
     size_t count = 0;
     count += 2 * 8;
     count_VkImageSubresource2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkImageSubresource2*)(local_pSubresource), &count);
+                              (const VkImageSubresource2*)(pSubresource), &count);
     count_VkSubresourceLayout2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                (VkSubresourceLayout2*)(pLayout), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetImageSubresourceLayout2KHR, count,
@@ -11198,14 +9785,11 @@ void VkEncoder::vkGetImageSubresourceLayout2KHR(VkDevice device, VkImage image,
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     writeStreamVal(&streamPtr, gfxstream_vk_image_to_host_u64(image));
     reservedmarshal_VkImageSubresource2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkImageSubresource2*)(local_pSubresource), &streamPtr);
+                                        (const VkImageSubresource2*)(pSubresource), &streamPtr);
     reservedmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                          (VkSubresourceLayout2*)(pLayout), &streamPtr);
     unmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkSubresourceLayout2*)(pLayout));
-    if (pLayout) {
-        transform_fromhost_VkSubresourceLayout2(sResourceTracker, (VkSubresourceLayout2*)(pLayout));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -11242,23 +9826,10 @@ void VkEncoder::vkCmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBindDescriptorSetsInfo* local_pBindDescriptorSetsInfo = nullptr;
-    if (pBindDescriptorSetsInfo) {
-        local_pBindDescriptorSetsInfo =
-            (VkBindDescriptorSetsInfo*)pool->alloc(sizeof(const VkBindDescriptorSetsInfo));
-        deepcopy_VkBindDescriptorSetsInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBindDescriptorSetsInfo,
-            (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo));
-    }
-    if (local_pBindDescriptorSetsInfo) {
-        transform_tohost_VkBindDescriptorSetsInfo(
-            sResourceTracker, (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBindDescriptorSetsInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo),
+                                   (const VkBindDescriptorSetsInfo*)(pBindDescriptorSetsInfo),
                                    &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdBindDescriptorSets2KHR, count,
                                           queueSubmitWithCommandsEnabled);
@@ -11267,7 +9838,7 @@ void VkEncoder::vkCmdBindDescriptorSets2KHR(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkBindDescriptorSetsInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkBindDescriptorSetsInfo*)(local_pBindDescriptorSetsInfo), &streamPtr);
+        (const VkBindDescriptorSetsInfo*)(pBindDescriptorSetsInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -11279,29 +9850,17 @@ void VkEncoder::vkCmdPushConstants2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPushConstantsInfo* local_pPushConstantsInfo = nullptr;
-    if (pPushConstantsInfo) {
-        local_pPushConstantsInfo =
-            (VkPushConstantsInfo*)pool->alloc(sizeof(const VkPushConstantsInfo));
-        deepcopy_VkPushConstantsInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPushConstantsInfo,
-                                     (VkPushConstantsInfo*)(local_pPushConstantsInfo));
-    }
-    if (local_pPushConstantsInfo) {
-        transform_tohost_VkPushConstantsInfo(sResourceTracker,
-                                             (VkPushConstantsInfo*)(local_pPushConstantsInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPushConstantsInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkPushConstantsInfo*)(local_pPushConstantsInfo), &count);
+                              (const VkPushConstantsInfo*)(pPushConstantsInfo), &count);
     uint8_t* streamPtr =
         reserveCmdPacket(stream, OP_vkCmdPushConstants2KHR, count, queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkPushConstantsInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkPushConstantsInfo*)(local_pPushConstantsInfo),
+                                        (const VkPushConstantsInfo*)(pPushConstantsInfo),
                                         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -11314,22 +9873,10 @@ void VkEncoder::vkCmdPushDescriptorSet2KHR(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPushDescriptorSetInfo* local_pPushDescriptorSetInfo = nullptr;
-    if (pPushDescriptorSetInfo) {
-        local_pPushDescriptorSetInfo =
-            (VkPushDescriptorSetInfo*)pool->alloc(sizeof(const VkPushDescriptorSetInfo));
-        deepcopy_VkPushDescriptorSetInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPushDescriptorSetInfo,
-                                         (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo));
-    }
-    if (local_pPushDescriptorSetInfo) {
-        transform_tohost_VkPushDescriptorSetInfo(
-            sResourceTracker, (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPushDescriptorSetInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                  (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo), &count);
+                                  (const VkPushDescriptorSetInfo*)(pPushDescriptorSetInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdPushDescriptorSet2KHR, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -11337,7 +9884,7 @@ void VkEncoder::vkCmdPushDescriptorSet2KHR(VkCommandBuffer commandBuffer,
     }
     reservedmarshal_VkPushDescriptorSetInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPushDescriptorSetInfo*)(local_pPushDescriptorSetInfo), &streamPtr);
+        (const VkPushDescriptorSetInfo*)(pPushDescriptorSetInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -11350,26 +9897,11 @@ void VkEncoder::vkCmdPushDescriptorSetWithTemplate2KHR(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPushDescriptorSetWithTemplateInfo* local_pPushDescriptorSetWithTemplateInfo = nullptr;
-    if (pPushDescriptorSetWithTemplateInfo) {
-        local_pPushDescriptorSetWithTemplateInfo =
-            (VkPushDescriptorSetWithTemplateInfo*)pool->alloc(
-                sizeof(const VkPushDescriptorSetWithTemplateInfo));
-        deepcopy_VkPushDescriptorSetWithTemplateInfo(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPushDescriptorSetWithTemplateInfo,
-            (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo));
-    }
-    if (local_pPushDescriptorSetWithTemplateInfo) {
-        transform_tohost_VkPushDescriptorSetWithTemplateInfo(
-            sResourceTracker,
-            (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPushDescriptorSetWithTemplateInfo(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo), &count);
+        (const VkPushDescriptorSetWithTemplateInfo*)(pPushDescriptorSetWithTemplateInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdPushDescriptorSetWithTemplate2KHR, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -11377,7 +9909,7 @@ void VkEncoder::vkCmdPushDescriptorSetWithTemplate2KHR(
     }
     reservedmarshal_VkPushDescriptorSetWithTemplateInfo(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkPushDescriptorSetWithTemplateInfo*)(local_pPushDescriptorSetWithTemplateInfo),
+        (const VkPushDescriptorSetWithTemplateInfo*)(pPushDescriptorSetWithTemplateInfo),
         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -11390,25 +9922,11 @@ void VkEncoder::vkCmdSetDescriptorBufferOffsets2EXT(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSetDescriptorBufferOffsetsInfoEXT* local_pSetDescriptorBufferOffsetsInfo = nullptr;
-    if (pSetDescriptorBufferOffsetsInfo) {
-        local_pSetDescriptorBufferOffsetsInfo = (VkSetDescriptorBufferOffsetsInfoEXT*)pool->alloc(
-            sizeof(const VkSetDescriptorBufferOffsetsInfoEXT));
-        deepcopy_VkSetDescriptorBufferOffsetsInfoEXT(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSetDescriptorBufferOffsetsInfo,
-            (VkSetDescriptorBufferOffsetsInfoEXT*)(local_pSetDescriptorBufferOffsetsInfo));
-    }
-    if (local_pSetDescriptorBufferOffsetsInfo) {
-        transform_tohost_VkSetDescriptorBufferOffsetsInfoEXT(
-            sResourceTracker,
-            (VkSetDescriptorBufferOffsetsInfoEXT*)(local_pSetDescriptorBufferOffsetsInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkSetDescriptorBufferOffsetsInfoEXT(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkSetDescriptorBufferOffsetsInfoEXT*)(local_pSetDescriptorBufferOffsetsInfo), &count);
+        (const VkSetDescriptorBufferOffsetsInfoEXT*)(pSetDescriptorBufferOffsetsInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdSetDescriptorBufferOffsets2EXT, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
@@ -11416,7 +9934,7 @@ void VkEncoder::vkCmdSetDescriptorBufferOffsets2EXT(
     }
     reservedmarshal_VkSetDescriptorBufferOffsetsInfoEXT(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkSetDescriptorBufferOffsetsInfoEXT*)(local_pSetDescriptorBufferOffsetsInfo), &streamPtr);
+        (const VkSetDescriptorBufferOffsetsInfoEXT*)(pSetDescriptorBufferOffsetsInfo), &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -11429,27 +9947,11 @@ void VkEncoder::vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkBindDescriptorBufferEmbeddedSamplersInfoEXT* local_pBindDescriptorBufferEmbeddedSamplersInfo =
-        nullptr;
-    if (pBindDescriptorBufferEmbeddedSamplersInfo) {
-        local_pBindDescriptorBufferEmbeddedSamplersInfo =
-            (VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)pool->alloc(
-                sizeof(const VkBindDescriptorBufferEmbeddedSamplersInfoEXT));
-        deepcopy_VkBindDescriptorBufferEmbeddedSamplersInfoEXT(
-            pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBindDescriptorBufferEmbeddedSamplersInfo,
-            (VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)(local_pBindDescriptorBufferEmbeddedSamplersInfo));
-    }
-    if (local_pBindDescriptorBufferEmbeddedSamplersInfo) {
-        transform_tohost_VkBindDescriptorBufferEmbeddedSamplersInfoEXT(
-            sResourceTracker,
-            (VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)(local_pBindDescriptorBufferEmbeddedSamplersInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkBindDescriptorBufferEmbeddedSamplersInfoEXT(
         sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)(local_pBindDescriptorBufferEmbeddedSamplersInfo),
+        (const VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)(pBindDescriptorBufferEmbeddedSamplersInfo),
         &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkCmdBindDescriptorBufferEmbeddedSamplers2EXT,
                                           count, queueSubmitWithCommandsEnabled);
@@ -11458,7 +9960,7 @@ void VkEncoder::vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(
     }
     reservedmarshal_VkBindDescriptorBufferEmbeddedSamplersInfoEXT(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-        (VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)(local_pBindDescriptorBufferEmbeddedSamplersInfo),
+        (const VkBindDescriptorBufferEmbeddedSamplersInfoEXT*)(pBindDescriptorBufferEmbeddedSamplersInfo),
         &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -11830,10 +10332,6 @@ VkResult VkEncoder::vkGetImageDrmFormatModifierPropertiesEXT(
         &streamPtr);
     unmarshal_VkImageDrmFormatModifierPropertiesEXT(
         stream, VK_STRUCTURE_TYPE_MAX_ENUM, (VkImageDrmFormatModifierPropertiesEXT*)(pProperties));
-    if (pProperties) {
-        transform_fromhost_VkImageDrmFormatModifierPropertiesEXT(
-            sResourceTracker, (VkImageDrmFormatModifierPropertiesEXT*)(pProperties));
-    }
     VkResult vkGetImageDrmFormatModifierPropertiesEXT_VkResult_return = (VkResult)0;
     stream->read(&vkGetImageDrmFormatModifierPropertiesEXT_VkResult_return, sizeof(VkResult));
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -11897,14 +10395,6 @@ VkResult VkEncoder::vkGetPhysicalDeviceToolPropertiesEXT(
                 unmarshal_VkPhysicalDeviceToolProperties(
                     stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                     (VkPhysicalDeviceToolProperties*)(pToolProperties + i));
-            }
-        }
-    }
-    if (pToolCount) {
-        if (pToolProperties) {
-            for (uint32_t i = 0; i < (uint32_t)(*pToolCount); ++i) {
-                transform_fromhost_VkPhysicalDeviceToolProperties(
-                    sResourceTracker, (VkPhysicalDeviceToolProperties*)(pToolProperties + i));
             }
         }
     }
@@ -12331,27 +10821,15 @@ VkResult VkEncoder::vkCopyImageToImageEXT(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCopyImageToImageInfo* local_pCopyImageToImageInfo = nullptr;
-    if (pCopyImageToImageInfo) {
-        local_pCopyImageToImageInfo =
-            (VkCopyImageToImageInfo*)pool->alloc(sizeof(const VkCopyImageToImageInfo));
-        deepcopy_VkCopyImageToImageInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCopyImageToImageInfo,
-                                        (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo));
-    }
-    if (local_pCopyImageToImageInfo) {
-        transform_tohost_VkCopyImageToImageInfo(
-            sResourceTracker, (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCopyImageToImageInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                 (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo), &count);
+                                 (const VkCopyImageToImageInfo*)(pCopyImageToImageInfo), &count);
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCopyImageToImageEXT, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkCopyImageToImageInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                           (VkCopyImageToImageInfo*)(local_pCopyImageToImageInfo),
+                                           (const VkCopyImageToImageInfo*)(pCopyImageToImageInfo),
                                            &streamPtr);
     VkResult vkCopyImageToImageEXT_VkResult_return = (VkResult)0;
     stream->read(&vkCopyImageToImageEXT_VkResult_return, sizeof(VkResult));
@@ -12367,30 +10845,13 @@ VkResult VkEncoder::vkTransitionImageLayoutEXT(VkDevice device, uint32_t transit
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkHostImageLayoutTransitionInfo* local_pTransitions = nullptr;
-    if (pTransitions) {
-        local_pTransitions = (VkHostImageLayoutTransitionInfo*)pool->alloc(
-            transitionCount * sizeof(const VkHostImageLayoutTransitionInfo));
-        for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
-            deepcopy_VkHostImageLayoutTransitionInfo(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pTransitions + i,
-                (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i));
-        }
-    }
-    if (local_pTransitions) {
-        for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
-            transform_tohost_VkHostImageLayoutTransitionInfo(
-                sResourceTracker, (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
         count_VkHostImageLayoutTransitionInfo(
             sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i), &count);
+            (const VkHostImageLayoutTransitionInfo*)(pTransitions + i), &count);
     }
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkTransitionImageLayoutEXT, count, queueSubmitWithCommandsEnabled);
@@ -12399,7 +10860,7 @@ VkResult VkEncoder::vkTransitionImageLayoutEXT(VkDevice device, uint32_t transit
     for (uint32_t i = 0; i < (uint32_t)transitionCount; ++i) {
         reservedmarshal_VkHostImageLayoutTransitionInfo(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkHostImageLayoutTransitionInfo*)(local_pTransitions + i), &streamPtr);
+            (const VkHostImageLayoutTransitionInfo*)(pTransitions + i), &streamPtr);
     }
     VkResult vkTransitionImageLayoutEXT_VkResult_return = (VkResult)0;
     stream->read(&vkTransitionImageLayoutEXT_VkResult_return, sizeof(VkResult));
@@ -12415,21 +10876,10 @@ void VkEncoder::vkGetImageSubresourceLayout2EXT(VkDevice device, VkImage image,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkImageSubresource2* local_pSubresource = nullptr;
-    if (pSubresource) {
-        local_pSubresource = (VkImageSubresource2*)pool->alloc(sizeof(const VkImageSubresource2));
-        deepcopy_VkImageSubresource2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubresource,
-                                     (VkImageSubresource2*)(local_pSubresource));
-    }
-    if (local_pSubresource) {
-        transform_tohost_VkImageSubresource2(sResourceTracker,
-                                             (VkImageSubresource2*)(local_pSubresource));
-    }
     size_t count = 0;
     count += 2 * 8;
     count_VkImageSubresource2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                              (VkImageSubresource2*)(local_pSubresource), &count);
+                              (const VkImageSubresource2*)(pSubresource), &count);
     count_VkSubresourceLayout2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
                                (VkSubresourceLayout2*)(pLayout), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkGetImageSubresourceLayout2EXT, count,
@@ -12437,14 +10887,11 @@ void VkEncoder::vkGetImageSubresourceLayout2EXT(VkDevice device, VkImage image,
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     writeStreamVal(&streamPtr, gfxstream_vk_image_to_host_u64(image));
     reservedmarshal_VkImageSubresource2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                        (VkImageSubresource2*)(local_pSubresource), &streamPtr);
+                                        (const VkImageSubresource2*)(pSubresource), &streamPtr);
     reservedmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                          (VkSubresourceLayout2*)(pLayout), &streamPtr);
     unmarshal_VkSubresourceLayout2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkSubresourceLayout2*)(pLayout));
-    if (pLayout) {
-        transform_fromhost_VkSubresourceLayout2(sResourceTracker, (VkSubresourceLayout2*)(pLayout));
-    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -12460,37 +10907,33 @@ VkResult VkEncoder::vkCreatePrivateDataSlotEXT(VkDevice device,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkPrivateDataSlotCreateInfo* local_pCreateInfo = nullptr;
-    if (pCreateInfo) {
-        local_pCreateInfo =
-            (VkPrivateDataSlotCreateInfo*)pool->alloc(sizeof(const VkPrivateDataSlotCreateInfo));
-        deepcopy_VkPrivateDataSlotCreateInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pCreateInfo,
-                                             (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo));
-    }
-    if (local_pCreateInfo) {
-        transform_tohost_VkPrivateDataSlotCreateInfo(
-            sResourceTracker, (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkPrivateDataSlotCreateInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo), &count);
+                                      (const VkPrivateDataSlotCreateInfo*)(pCreateInfo), &count);
     count += 2 * 8;
     uint8_t* streamPtr =
         reservePacket(stream, OP_vkCreatePrivateDataSlotEXT, count, queueSubmitWithCommandsEnabled);
     writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
     reservedmarshal_VkPrivateDataSlotCreateInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                                (VkPrivateDataSlotCreateInfo*)(local_pCreateInfo),
+                                                (const VkPrivateDataSlotCreateInfo*)(pCreateInfo),
                                                 &streamPtr);
     putBe64WithStreamPtr(&streamPtr, 0);
     writeStreamVal(&streamPtr, (uint64_t)(*pPrivateDataSlot));
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pPrivateDataSlot = create_gfxstream_vk_private_data_slot(cgen_var_0);
-    sResourceTracker->register_VkPrivateDataSlot(*pPrivateDataSlot);
+    *pPrivateDataSlot = cgen_var_0
+                            ? create_gfxstream_vk_private_data_slot(device, pAllocator, cgen_var_0)
+                            : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pPrivateDataSlot)) {
+        guestCreateAllocFailed = true;
+    }
     VkResult vkCreatePrivateDataSlotEXT_VkResult_return = (VkResult)0;
     stream->read(&vkCreatePrivateDataSlotEXT_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed && vkCreatePrivateDataSlotEXT_VkResult_return >= VK_SUCCESS) {
+        vkCreatePrivateDataSlotEXT_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreatePrivateDataSlotEXT_VkResult_return;
@@ -12511,8 +10954,7 @@ void VkEncoder::vkDestroyPrivateDataSlotEXT(VkDevice device, VkPrivateDataSlot p
     writeStreamVal(&streamPtr, gfxstream_vk_private_data_slot_to_host_u64(privateDataSlot));
     putBe64WithStreamPtr(&streamPtr, 0);
     stream->flush();
-    sResourceTracker->unregister_VkPrivateDataSlot(privateDataSlot);
-    delete_gfxstream_vk_private_data_slot(privateDataSlot);
+    delete_gfxstream_vk_private_data_slot(device, privateDataSlot, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
 }
@@ -12849,29 +11291,17 @@ void VkEncoder::vkBeginCommandBufferAsyncGOOGLE(VkCommandBuffer commandBuffer,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkCommandBufferBeginInfo* local_pBeginInfo = nullptr;
-    if (pBeginInfo) {
-        local_pBeginInfo =
-            (VkCommandBufferBeginInfo*)pool->alloc(sizeof(const VkCommandBufferBeginInfo));
-        deepcopy_VkCommandBufferBeginInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pBeginInfo,
-                                          (VkCommandBufferBeginInfo*)(local_pBeginInfo));
-    }
-    if (local_pBeginInfo) {
-        transform_tohost_VkCommandBufferBeginInfo(sResourceTracker,
-                                                  (VkCommandBufferBeginInfo*)(local_pBeginInfo));
-    }
     size_t count = 0;
     count += 8;
     count_VkCommandBufferBeginInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkCommandBufferBeginInfo*)(local_pBeginInfo), &count);
+                                   (const VkCommandBufferBeginInfo*)(pBeginInfo), &count);
     uint8_t* streamPtr = reserveCmdPacket(stream, OP_vkBeginCommandBufferAsyncGOOGLE, count,
                                           queueSubmitWithCommandsEnabled);
     if (!queueSubmitWithCommandsEnabled) {
         writeStreamVal(&streamPtr, gfxstream_vk_command_buffer_to_host_u64(commandBuffer));
     }
     reservedmarshal_VkCommandBufferBeginInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                             (VkCommandBufferBeginInfo*)(local_pBeginInfo),
+                                             (const VkCommandBufferBeginInfo*)(pBeginInfo),
                                              &streamPtr);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
@@ -12969,10 +11399,14 @@ VkResult VkEncoder::vkCreateImageWithRequirementsGOOGLE(
     writeStreamVal(&streamPtr, (uint64_t)(*pImage));
     reservedmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                          (VkMemoryRequirements*)(pMemoryRequirements), &streamPtr);
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pImage = create_gfxstream_vk_image(cgen_var_0);
-    sResourceTracker->register_VkImage(*pImage);
+    *pImage =
+        cgen_var_0 ? create_gfxstream_vk_image(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pImage)) {
+        guestCreateAllocFailed = true;
+    }
     unmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkMemoryRequirements*)(pMemoryRequirements));
     if (pMemoryRequirements) {
@@ -12981,6 +11415,10 @@ VkResult VkEncoder::vkCreateImageWithRequirementsGOOGLE(
     }
     VkResult vkCreateImageWithRequirementsGOOGLE_VkResult_return = (VkResult)0;
     stream->read(&vkCreateImageWithRequirementsGOOGLE_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed &&
+        vkCreateImageWithRequirementsGOOGLE_VkResult_return >= VK_SUCCESS) {
+        vkCreateImageWithRequirementsGOOGLE_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateImageWithRequirementsGOOGLE_VkResult_return;
@@ -13020,10 +11458,14 @@ VkResult VkEncoder::vkCreateBufferWithRequirementsGOOGLE(
     writeStreamVal(&streamPtr, (uint64_t)(*pBuffer));
     reservedmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                          (VkMemoryRequirements*)(pMemoryRequirements), &streamPtr);
+    bool guestCreateAllocFailed = false;
     uint64_t cgen_var_0;
     stream->read(&cgen_var_0, 8);
-    *pBuffer = create_gfxstream_vk_buffer(cgen_var_0);
-    sResourceTracker->register_VkBuffer(*pBuffer);
+    *pBuffer =
+        cgen_var_0 ? create_gfxstream_vk_buffer(device, pAllocator, cgen_var_0) : VK_NULL_HANDLE;
+    if (cgen_var_0 && !(*pBuffer)) {
+        guestCreateAllocFailed = true;
+    }
     unmarshal_VkMemoryRequirements(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
                                    (VkMemoryRequirements*)(pMemoryRequirements));
     if (pMemoryRequirements) {
@@ -13032,6 +11474,10 @@ VkResult VkEncoder::vkCreateBufferWithRequirementsGOOGLE(
     }
     VkResult vkCreateBufferWithRequirementsGOOGLE_VkResult_return = (VkResult)0;
     stream->read(&vkCreateBufferWithRequirementsGOOGLE_VkResult_return, sizeof(VkResult));
+    if (guestCreateAllocFailed &&
+        vkCreateBufferWithRequirementsGOOGLE_VkResult_return >= VK_SUCCESS) {
+        vkCreateBufferWithRequirementsGOOGLE_VkResult_return = VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkCreateBufferWithRequirementsGOOGLE_VkResult_return;
@@ -13126,7 +11572,7 @@ VkResult VkEncoder::vkFreeMemorySyncGOOGLE(VkDevice device, VkDeviceMemory memor
     VkResult vkFreeMemorySyncGOOGLE_VkResult_return = (VkResult)0;
     stream->read(&vkFreeMemorySyncGOOGLE_VkResult_return, sizeof(VkResult));
     sResourceTracker->unregister_VkDeviceMemory(memory);
-    delete_gfxstream_vk_device_memory(memory);
+    delete_gfxstream_vk_device_memory(device, memory, pAllocator);
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
     return vkFreeMemorySyncGOOGLE_VkResult_return;
@@ -13158,26 +11604,12 @@ void VkEncoder::vkQueueSubmitAsyncGOOGLE(VkQueue queue, uint32_t submitCount,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubmitInfo* local_pSubmits = nullptr;
-    if (pSubmits) {
-        local_pSubmits = (VkSubmitInfo*)pool->alloc(submitCount * sizeof(const VkSubmitInfo));
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            deepcopy_VkSubmitInfo(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubmits + i,
-                                  (VkSubmitInfo*)(local_pSubmits + i));
-        }
-    }
-    if (local_pSubmits) {
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            transform_tohost_VkSubmitInfo(sResourceTracker, (VkSubmitInfo*)(local_pSubmits + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         count_VkSubmitInfo(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                           (VkSubmitInfo*)(local_pSubmits + i), &count);
+                           (const VkSubmitInfo*)(pSubmits + i), &count);
     }
     count += 8;
     uint8_t* streamPtr =
@@ -13186,7 +11618,7 @@ void VkEncoder::vkQueueSubmitAsyncGOOGLE(VkQueue queue, uint32_t submitCount,
     writeStreamBytes(&streamPtr, &submitCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         reservedmarshal_VkSubmitInfo(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                     (VkSubmitInfo*)(local_pSubmits + i), &streamPtr);
+                                     (const VkSubmitInfo*)(pSubmits + i), &streamPtr);
     }
     writeStreamVal(&streamPtr, gfxstream_vk_fence_to_host_u64(fence));
     stream->flush();
@@ -13331,23 +11763,6 @@ void VkEncoder::vkQueueCommitDescriptorSetUpdatesGOOGLE(
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkWriteDescriptorSet* local_pPendingDescriptorWrites = nullptr;
-    if (pPendingDescriptorWrites) {
-        local_pPendingDescriptorWrites = (VkWriteDescriptorSet*)pool->alloc(
-            pendingDescriptorWriteCount * sizeof(const VkWriteDescriptorSet));
-        for (uint32_t i = 0; i < (uint32_t)pendingDescriptorWriteCount; ++i) {
-            deepcopy_VkWriteDescriptorSet(
-                pool, VK_STRUCTURE_TYPE_MAX_ENUM, pPendingDescriptorWrites + i,
-                (VkWriteDescriptorSet*)(local_pPendingDescriptorWrites + i));
-        }
-    }
-    if (local_pPendingDescriptorWrites) {
-        for (uint32_t i = 0; i < (uint32_t)pendingDescriptorWriteCount; ++i) {
-            transform_tohost_VkWriteDescriptorSet(
-                sResourceTracker, (VkWriteDescriptorSet*)(local_pPendingDescriptorWrites + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
@@ -13365,7 +11780,7 @@ void VkEncoder::vkQueueCommitDescriptorSetUpdatesGOOGLE(
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)pendingDescriptorWriteCount; ++i) {
         count_VkWriteDescriptorSet(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                   (VkWriteDescriptorSet*)(local_pPendingDescriptorWrites + i),
+                                   (const VkWriteDescriptorSet*)(pPendingDescriptorWrites + i),
                                    &count);
     }
     uint8_t* streamPtr = reservePacket(stream, OP_vkQueueCommitDescriptorSetUpdatesGOOGLE, count,
@@ -13405,7 +11820,7 @@ void VkEncoder::vkQueueCommitDescriptorSetUpdatesGOOGLE(
     for (uint32_t i = 0; i < (uint32_t)pendingDescriptorWriteCount; ++i) {
         reservedmarshal_VkWriteDescriptorSet(
             stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-            (VkWriteDescriptorSet*)(local_pPendingDescriptorWrites + i), &streamPtr);
+            (const VkWriteDescriptorSet*)(pPendingDescriptorWrites + i), &streamPtr);
     }
     stream->flush();
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
@@ -13658,26 +12073,12 @@ void VkEncoder::vkQueueSubmitAsync2GOOGLE(VkQueue queue, uint32_t submitCount,
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkSubmitInfo2* local_pSubmits = nullptr;
-    if (pSubmits) {
-        local_pSubmits = (VkSubmitInfo2*)pool->alloc(submitCount * sizeof(const VkSubmitInfo2));
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            deepcopy_VkSubmitInfo2(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pSubmits + i,
-                                   (VkSubmitInfo2*)(local_pSubmits + i));
-        }
-    }
-    if (local_pSubmits) {
-        for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
-            transform_tohost_VkSubmitInfo2(sResourceTracker, (VkSubmitInfo2*)(local_pSubmits + i));
-        }
-    }
     size_t count = 0;
     count += 8;
     count += sizeof(uint32_t);
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         count_VkSubmitInfo2(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                            (VkSubmitInfo2*)(local_pSubmits + i), &count);
+                            (const VkSubmitInfo2*)(pSubmits + i), &count);
     }
     count += 8;
     uint8_t* streamPtr =
@@ -13686,7 +12087,7 @@ void VkEncoder::vkQueueSubmitAsync2GOOGLE(VkQueue queue, uint32_t submitCount,
     writeStreamBytes(&streamPtr, &submitCount, sizeof(uint32_t));
     for (uint32_t i = 0; i < (uint32_t)submitCount; ++i) {
         reservedmarshal_VkSubmitInfo2(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                      (VkSubmitInfo2*)(local_pSubmits + i), &streamPtr);
+                                      (const VkSubmitInfo2*)(pSubmits + i), &streamPtr);
     }
     writeStreamVal(&streamPtr, gfxstream_vk_fence_to_host_u64(fence));
     stream->flush();
@@ -13736,26 +12137,95 @@ void VkEncoder::vkSetDebugMetadataAsyncGOOGLE(const VkDebugMetadataGOOGLE* pDebu
         sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
     if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
     auto stream = mImpl->stream();
-    auto pool = mImpl->pool();
-    VkDebugMetadataGOOGLE* local_pDebugMetadata = nullptr;
-    if (pDebugMetadata) {
-        local_pDebugMetadata =
-            (VkDebugMetadataGOOGLE*)pool->alloc(sizeof(const VkDebugMetadataGOOGLE));
-        deepcopy_VkDebugMetadataGOOGLE(pool, VK_STRUCTURE_TYPE_MAX_ENUM, pDebugMetadata,
-                                       (VkDebugMetadataGOOGLE*)(local_pDebugMetadata));
-    }
-    if (local_pDebugMetadata) {
-        transform_tohost_VkDebugMetadataGOOGLE(sResourceTracker,
-                                               (VkDebugMetadataGOOGLE*)(local_pDebugMetadata));
-    }
     size_t count = 0;
     count_VkDebugMetadataGOOGLE(sFeatureBits, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                (VkDebugMetadataGOOGLE*)(local_pDebugMetadata), &count);
+                                (const VkDebugMetadataGOOGLE*)(pDebugMetadata), &count);
     uint8_t* streamPtr = reservePacket(stream, OP_vkSetDebugMetadataAsyncGOOGLE, count,
                                        queueSubmitWithCommandsEnabled);
     reservedmarshal_VkDebugMetadataGOOGLE(stream, VK_STRUCTURE_TYPE_MAX_ENUM,
-                                          (VkDebugMetadataGOOGLE*)(local_pDebugMetadata),
+                                          (const VkDebugMetadataGOOGLE*)(pDebugMetadata),
                                           &streamPtr);
+    stream->flush();
+    clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
+    if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
+}
+
+void VkEncoder::vkResetFencesAsyncGOOGLE(VkDevice device, uint32_t fenceCount,
+                                         const VkFence* pFences, uint32_t doLock) {
+    bool queueSubmitWithCommandsEnabled =
+        sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
+    if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
+    auto stream = mImpl->stream();
+    size_t count = 0;
+    count += 8;
+    count += sizeof(uint32_t);
+    if (fenceCount) {
+        count += fenceCount * 8;
+    }
+    uint8_t* streamPtr =
+        reservePacket(stream, OP_vkResetFencesAsyncGOOGLE, count, queueSubmitWithCommandsEnabled);
+    writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
+    writeStreamBytes(&streamPtr, &fenceCount, sizeof(uint32_t));
+    if (fenceCount) {
+        for (uint32_t k = 0; k < fenceCount; ++k) {
+            writeStreamVal(&streamPtr, gfxstream_vk_fence_to_host_u64(pFences[k]));
+        }
+    }
+    stream->flush();
+    clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
+    if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
+}
+
+void VkEncoder::vkResetCommandPoolAsyncGOOGLE(VkDevice device, VkCommandPool commandPool,
+                                              VkCommandPoolResetFlags flags, uint32_t doLock) {
+    bool queueSubmitWithCommandsEnabled =
+        sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
+    if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
+    auto stream = mImpl->stream();
+    size_t count = 0;
+    count += 2 * 8;
+    count += sizeof(VkCommandPoolResetFlags);
+    uint8_t* streamPtr = reservePacket(stream, OP_vkResetCommandPoolAsyncGOOGLE, count,
+                                       queueSubmitWithCommandsEnabled);
+    writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
+    writeStreamVal(&streamPtr, gfxstream_vk_command_pool_to_host_u64(commandPool));
+    writeStreamBytes(&streamPtr, &flags, sizeof(VkCommandPoolResetFlags));
+    stream->flush();
+    clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
+    if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
+}
+
+void VkEncoder::vkResetDescriptorPoolAsyncGOOGLE(VkDevice device, VkDescriptorPool descriptorPool,
+                                                 VkDescriptorPoolResetFlags flags,
+                                                 uint32_t doLock) {
+    bool queueSubmitWithCommandsEnabled =
+        sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
+    if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
+    auto stream = mImpl->stream();
+    size_t count = 0;
+    count += 2 * 8;
+    count += sizeof(VkDescriptorPoolResetFlags);
+    uint8_t* streamPtr = reservePacket(stream, OP_vkResetDescriptorPoolAsyncGOOGLE, count,
+                                       queueSubmitWithCommandsEnabled);
+    writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
+    writeStreamVal(&streamPtr, gfxstream_vk_descriptor_pool_to_host_u64(descriptorPool));
+    writeStreamBytes(&streamPtr, &flags, sizeof(VkDescriptorPoolResetFlags));
+    stream->flush();
+    clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
+    if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();
+}
+
+void VkEncoder::vkResetEventAsyncGOOGLE(VkDevice device, VkEvent event, uint32_t doLock) {
+    bool queueSubmitWithCommandsEnabled =
+        sFeatureBits & VULKAN_STREAM_FEATURE_QUEUE_SUBMIT_WITH_COMMANDS_BIT;
+    if (!queueSubmitWithCommandsEnabled && doLock) this->lock();
+    auto stream = mImpl->stream();
+    size_t count = 0;
+    count += 2 * 8;
+    uint8_t* streamPtr =
+        reservePacket(stream, OP_vkResetEventAsyncGOOGLE, count, queueSubmitWithCommandsEnabled);
+    writeStreamVal(&streamPtr, gfxstream_vk_device_to_host_u64(device));
+    writeStreamVal(&streamPtr, gfxstream_vk_event_to_host_u64(event));
     stream->flush();
     clearPoolIfNeeded(&encodeCount, mImpl->pool(), stream);
     if (!queueSubmitWithCommandsEnabled && doLock) this->unlock();

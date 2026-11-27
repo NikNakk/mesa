@@ -162,6 +162,7 @@ iris_create_shader_variant(const struct iris_screen *screen,
    }
 
    shader->stage = stage;
+   shader->info.stage = MESA_SHADER_NONE;
 
    return shader;
 }
@@ -175,7 +176,8 @@ iris_upload_shader(struct iris_screen *screen,
                    enum iris_program_cache_id cache_id,
                    uint32_t key_size,
                    const void *key,
-                   const void *assembly)
+                   const void *assembly,
+                   const intel_shader_bin *bin)
 {
    iris_u_upload_alloc_ref_to_iris_state_ref(uploader, 0, shader->program_size,
                                              64, &shader->assembly, &shader->map);
@@ -225,7 +227,7 @@ iris_upload_shader(struct iris_screen *screen,
 
    if (screen->brw) {
       brw_write_shader_relocs(&screen->brw->isa, shader->map,
-                              shader->brw_prog_data, reloc_values,
+                              bin, reloc_values,
                               rv_count);
    } else {
 #ifdef INTEL_USE_ELK
@@ -252,12 +254,12 @@ iris_upload_shader(struct iris_screen *screen,
           (intel_shader_dump_filter && ish && intel_shader_dump_filter == ish->source_hash)) {
          int start = 0;
          /* dump each simd variant of shader */
-         while (start < shader->brw_prog_data->program_size) {
+         while (start < shader->program_size) {
             const uint8_t *variant = (const uint8_t *)assembly + start;
             const int size = gen_dump_shader_with_lineno(
                stderr, screen->brw->isa.devinfo, shader->stage,
                ish ? ish->source_hash : 0, variant,
-               (int)(shader->brw_prog_data->program_size - start),
+               (int)(shader->program_size - start),
                res->bo->address + shader->assembly.offset + start);
             if (size <= 0)
                break;
@@ -270,7 +272,8 @@ iris_upload_shader(struct iris_screen *screen,
 bool
 iris_blorp_lookup_shader(struct blorp_batch *blorp_batch,
                          const void *key, uint32_t key_size,
-                         uint64_t *kernel_out, void *prog_data_out)
+                         uint64_t *kernel_out, void *prog_data_out,
+                         const struct intel_shader_info **info_out)
 {
    struct blorp_context *blorp = blorp_batch->blorp;
    struct iris_context *ice = blorp->driver_ctx;
@@ -290,7 +293,10 @@ iris_blorp_lookup_shader(struct blorp_batch *blorp_batch,
 #ifdef INTEL_USE_ELK
       batch->screen->elk ? (void *)shader->elk_prog_data :
 #endif
-      (void *)shader->brw_prog_data;
+      NULL;
+
+   if (info_out)
+      *info_out = shader->elk_prog_data ? NULL : &shader->info;
 
    iris_use_pinned_bo(batch, bo, false, IRIS_DOMAIN_NONE);
 
@@ -300,10 +306,12 @@ iris_blorp_lookup_shader(struct blorp_batch *blorp_batch,
 bool
 iris_blorp_upload_shader(struct blorp_batch *blorp_batch, uint32_t stage,
                          const void *key, uint32_t key_size,
-                         const void *kernel, UNUSED uint32_t kernel_size,
+                         const void *kernel, uint32_t kernel_size,
                          const void *prog_data_templ,
                          UNUSED uint32_t prog_data_size,
-                         uint64_t *kernel_out, void *prog_data_out)
+                         const intel_shader_bin *src_bin,
+                         uint64_t *kernel_out, void *prog_data_out,
+                         const struct intel_shader_info **info_out)
 {
    struct blorp_context *blorp = blorp_batch->blorp;
    struct iris_context *ice = blorp->driver_ctx;
@@ -317,14 +325,14 @@ iris_blorp_upload_shader(struct blorp_batch *blorp_batch, uint32_t stage,
       iris_create_shader_variant(screen, ice->shaders.cache, stage,
                                  IRIS_CACHE_BLORP, key_size, key);
 
-   void *prog_data = ralloc_size(NULL, prog_data_size);
-   memcpy(prog_data, prog_data_templ, prog_data_size);
-
    if (screen->brw) {
-      iris_apply_brw_prog_data(shader, prog_data, NULL);
+      assert(src_bin != NULL);
+      iris_apply_shader_bin(shader, src_bin, NULL);
    } else {
 #ifdef INTEL_USE_ELK
       assert(screen->elk);
+      void *prog_data = ralloc_size(NULL, prog_data_size);
+      memcpy(prog_data, prog_data_templ, prog_data_size);
       iris_apply_elk_prog_data(shader, prog_data);
 #else
       UNREACHABLE("no elk support");
@@ -335,7 +343,7 @@ iris_blorp_upload_shader(struct blorp_batch *blorp_batch, uint32_t stage,
 
    iris_upload_shader(screen, NULL, shader, ice->shaders.cache,
                       ice->shaders.uploader_driver,
-                      IRIS_CACHE_BLORP, key_size, key, kernel);
+                      IRIS_CACHE_BLORP, key_size, key, kernel, src_bin);
 
    struct iris_bo *bo = iris_resource_bo(shader->assembly.res);
    *kernel_out = iris_bufmgr_is_eff_64bit_enabled(bo->bufmgr) ?
@@ -345,7 +353,10 @@ iris_blorp_upload_shader(struct blorp_batch *blorp_batch, uint32_t stage,
 #ifdef INTEL_USE_ELK
       screen->elk ? (void *)shader->elk_prog_data :
 #endif
-      (void*)shader->brw_prog_data;
+      NULL;
+
+   if (info_out)
+      *info_out = shader->elk_prog_data ? NULL : &shader->info;
 
    iris_use_pinned_bo(batch, bo, false, IRIS_DOMAIN_NONE);
 
@@ -488,27 +499,28 @@ iris_ensure_indirect_generation_shader(struct iris_batch *batch)
                                  sizeof(key), &key);
 
    const unsigned *program;
+   intel_shader_bin *bin = NULL;
    if (screen->brw) {
       union brw_any_prog_key prog_key;
       memset(&prog_key, 0, sizeof(prog_key));
 
-      struct brw_fs_prog_data *prog_data = ralloc_size(NULL, sizeof(*prog_data));
-      memset(prog_data, 0, sizeof(*prog_data));
-      prog_data->base.push_sizes[0] = uniform_size;
+      struct intel_push_layout push_layout = {
+         .push_sizes[0] = uniform_size,
+      };
 
-      struct genisa_stats stats[3];
       struct brw_compile_params params = {
          .mem_ctx = nir,
          .nir = nir,
          .key = &prog_key.fs.base,
-         .prog_data = (struct brw_stage_prog_data *)prog_data,
-         .stats = stats,
+         .push_layout = push_layout,
+         .collect_register_pressure = true,
          .log_data = &ice->dbg,
          .debug_flag = DEBUG_WM,
       };
-      program = brw_compile(screen->brw, &params);
-      assert(program);
-      iris_apply_brw_prog_data(shader, &prog_data->base, NULL);
+      bin = brw_compile(screen->brw, &params);
+      assert(bin);
+      program = bin->code;
+      iris_apply_shader_bin(shader, bin, NULL);
    } else {
 #ifdef INTEL_USE_ELK
       union elk_any_prog_key prog_key;
@@ -547,7 +559,7 @@ iris_ensure_indirect_generation_shader(struct iris_batch *batch)
 
    iris_upload_shader(screen, NULL, shader, ice->shaders.cache,
                       ice->shaders.uploader_driver,
-                      IRIS_CACHE_BLORP, sizeof(key), &key, program);
+                      IRIS_CACHE_BLORP, sizeof(key), &key, program, bin);
 
    ralloc_free(nir);
 

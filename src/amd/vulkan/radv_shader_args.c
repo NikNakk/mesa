@@ -14,6 +14,10 @@
 
 #include "util/memstream.h"
 
+#if AMD_LLVM_AVAILABLE
+#include "ac_llvm_util.h"
+#endif
+
 struct user_sgpr_info {
    uint64_t inline_push_constant_mask;
    bool inlined_all_push_consts;
@@ -607,9 +611,13 @@ declare_shader_args(const struct radv_compiler_info *compiler_info, struct radv_
       return;
    }
 
-   /* LLVM always reserves s[0:1] for the ring offsets, even if they are unused. */
-   if (gfx_level < GFX11 || compiler_info->key.use_llvm ||
-       (stage != MESA_SHADER_COMPUTE && stage != MESA_SHADER_TASK)) {
+   /* LLVM may reserve s[0:1] for the ring offsets, even if they are unused. */
+   bool llvm_reserves_ring_offsets = false;
+#if AMD_LLVM_AVAILABLE
+   llvm_reserves_ring_offsets = compiler_info->key.use_llvm && ac_llvm_reserves_ring_offsets(gfx_level);
+#endif
+
+   if (gfx_level < GFX11 || llvm_reserves_ring_offsets || (stage != MESA_SHADER_COMPUTE && stage != MESA_SHADER_TASK)) {
       RADV_ADD_UD_ARG(state, 2, AC_ARG_CONST_ADDR, ac.ring_offsets, AC_UD_SCRATCH_RING_OFFSETS);
    }
    if (stage == MESA_SHADER_TASK) {
@@ -911,6 +919,9 @@ declare_shader_args(const struct radv_compiler_info *compiler_info, struct radv_
 
       if (radv_ps_needs_state_sgpr(info, gfx_state))
          RADV_ADD_UD_ARG(state, 1, AC_ARG_VALUE, ps_state, AC_UD_PS_STATE);
+
+      if (info->ps.reads_msrtss_inputs)
+         RADV_ADD_UD_ARG(state, 1, AC_ARG_CONST_ADDR, ps_msrtss_inputs, AC_UD_PS_MSRTSS_INPUTS);
 
       if (info->uses_view_index)
          RADV_ADD_UD_ARG(state, 1, AC_ARG_VALUE, ac.view_index, AC_UD_VIEW_INDEX);

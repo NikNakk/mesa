@@ -3,8 +3,8 @@
 
 use crate::from_nir::*;
 use crate::ir::{
-    max_warps_per_sm, ShaderInfo, ShaderIoInfo, ShaderModel, ShaderModelInfo,
-    ShaderStageInfo,
+    ShaderInfo, ShaderIoInfo, ShaderModel, ShaderModelInfo, ShaderStageInfo,
+    max_warps_per_sm,
 };
 use crate::sph;
 
@@ -545,6 +545,11 @@ fn nak_compile_shader_internal(
     s.remove_annotations();
 
     pass!(s, opt_instr_sched_postpass);
+
+    if s.info.uses_ttu {
+        pass!(s, add_ttu_macrofuse_instrs);
+    }
+
     pass!(s, calc_instr_deps);
 
     s.gather_info();

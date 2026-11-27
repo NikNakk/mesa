@@ -702,6 +702,21 @@ vk_image_type_to_nil_dim(VkImageType type)
    }
 }
 
+static enum VkResult
+nil_image_error_to_vk_result(nil_image_error e)
+{
+   switch (e) {
+   case NIL_IMAGE_ERROR_SUCCESS:
+      return VK_SUCCESS;
+   case NIL_IMAGE_ERROR_INVALID_STRIDE:
+      return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+   case NIL_IMAGE_ERROR_UNKNOWN:
+      return VK_ERROR_UNKNOWN;
+   default:
+      UNREACHABLE("Invalid nil_image_error");
+   }
+}
+
 static VkSparseImageFormatProperties
 nvk_fill_sparse_image_fmt_props(VkImageAspectFlags aspects,
                                 const enum pipe_format format,
@@ -1007,11 +1022,12 @@ nvk_image_init(struct nvk_device *dev,
                .usage = usage & ~NIL_IMAGE_USAGE_LINEAR_BIT,
             };
 
-            bool ok = nil_image_init(&pdev->info,
-                                     &image->linear_tiled_shadows[plane].nil,
-                                     &tiled_shadow_nil_info);
-            if (!ok)
-               return vk_errorf(dev, VK_ERROR_UNKNOWN,
+            nil_image_error err =
+               nil_image_init(&pdev->info,
+                              &image->linear_tiled_shadows[plane].nil,
+                              &tiled_shadow_nil_info);
+            if (err)
+               return vk_errorf(dev, nil_image_error_to_vk_result(err),
                                 "Invalid image creation parameters");
 
             /* These are always allocated by the driver so the offset
@@ -1069,21 +1085,21 @@ nvk_image_init(struct nvk_device *dev,
    if (usage & NIL_IMAGE_USAGE_VIDEO_BIT) {
       assert(!image->disjoint);
       for (uint8_t plane = 0; plane < image->plane_count; plane++) {
-         bool ok = nil_image_init_planar(&pdev->info,
-                                         &image->planes[plane].nil,
-                                         nil_info, plane,
-                                         image->plane_count);
-         if (!ok)
-            return vk_errorf(dev, VK_ERROR_UNKNOWN,
+         nil_image_error err = nil_image_init_planar(&pdev->info,
+                                                     &image->planes[plane].nil,
+                                                     nil_info, plane,
+                                                     image->plane_count);
+         if (err)
+            return vk_errorf(dev, nil_image_error_to_vk_result(err),
                              "Invalid image creation parameters");
       }
    } else {
       for (uint8_t plane = 0; plane < image->plane_count; plane++) {
-         bool ok = nil_image_init(&pdev->info,
-                                  &image->planes[plane].nil,
-                                  &nil_info[plane]);
-         if (!ok)
-            return vk_errorf(dev, VK_ERROR_UNKNOWN,
+         nil_image_error err = nil_image_init(&pdev->info,
+                                              &image->planes[plane].nil,
+                                              &nil_info[plane]);
+         if (err)
+            return vk_errorf(dev, nil_image_error_to_vk_result(err),
                              "Invalid image creation parameters");
       }
    }
@@ -1129,11 +1145,11 @@ nvk_image_init(struct nvk_device *dev,
          .usage = usage,
       };
 
-      bool ok = nil_image_init(&pdev->info,
-                               &image->stencil_copy_temp.nil,
-                               &stencil_nil_info);
-      if (!ok)
-         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+      nil_image_error nil_err = nil_image_init(&pdev->info,
+                                               &image->stencil_copy_temp.nil,
+                                               &stencil_nil_info);
+      if (nil_err)
+         return vk_errorf(dev, nil_image_error_to_vk_result(nil_err),
                           "Invalid image creation parameters");
 
       image->stencil_copy_temp.plane_align_B =
@@ -1153,7 +1169,10 @@ nvk_image_init(struct nvk_device *dev,
       image->image_align_B = MAX2(plane_align_B, image->image_align_B);
 
       if (explicit_offsets_B[plane] >= 0) {
-         assert(explicit_offsets_B[plane] % plane_align_B == 0);
+         if (explicit_offsets_B[plane] % plane_align_B != 0)
+            return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                             "Unaligned image offset");
+
          image->planes[plane].plane_offset_B = explicit_offsets_B[plane];
          image->image_size_B =
             MAX2((explicit_offsets_B[plane] + image->planes[plane].nil.size_B),

@@ -173,7 +173,7 @@ brw_nir_link_shaders(const struct brw_compiler *compiler,
 
 bool brw_nir_lower_cs_intrinsics(nir_shader *nir,
                                  const struct intel_device_info *devinfo,
-                                 struct brw_cs_prog_data *prog_data);
+                                 struct intel_cs_dispatch_params *dispatch);
 bool brw_nir_lower_cs_subgroup_id(nir_shader *nir,
                                   const struct intel_device_info *devinfo,
                                   unsigned subgroup_id_offset);
@@ -257,7 +257,8 @@ void brw_nir_opt_vectorize_urb(struct brw_pass_tracker *pt);
 void brw_nir_lower_vs_inputs(nir_shader *nir,
                              const struct intel_device_info *devinfo,
                              const struct brw_vs_prog_key *prog_key,
-                             struct brw_vs_prog_data *prog_data,
+                             const struct intel_push_layout *push_layout,
+                             uint32_t vf_component_packing[4],
                              unsigned *out_nr_packed_regs,
                              unsigned *out_urb_read_length);
 void brw_nir_lower_gs_inputs(nir_shader *nir,
@@ -287,7 +288,7 @@ bool brw_nir_lower_fs_load_output(nir_shader *shader,
                                   unsigned texture_base);
 bool brw_nir_lower_fs_config_intel(nir_shader *nir,
                                    const struct brw_fs_prog_key *key,
-                                   const struct brw_fs_prog_data *prog_data);
+                                   const struct intel_shader_info *info);
 
 bool brw_nir_lower_frag_coord_z(nir_shader *nir,
                                 const struct intel_device_info *devinfo);
@@ -407,7 +408,7 @@ brw_uniform_block_size(const struct intel_device_info *devinfo,
       : num_components;
 }
 
-void brw_nir_cleanup_pre_fs_prog_data(struct brw_pass_tracker *pt);
+void brw_nir_cleanup_pre_fs_info(struct brw_pass_tracker *pt);
 void brw_nir_optimize(struct brw_pass_tracker *pt, bool run_code_motion);
 
 bool brw_nir_move_interpolation_to_top(nir_shader *nir);

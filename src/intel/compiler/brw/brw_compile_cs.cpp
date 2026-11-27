@@ -26,31 +26,30 @@ fill_push_const_block_info(struct brw_push_const_block *block, unsigned dwords)
 
 extern "C" void
 brw_cs_fill_push_const_info(const struct intel_device_info *devinfo,
-                            struct brw_cs_prog_data *cs_prog_data,
-                            int subgroup_id_index)
+                            const struct intel_push_layout *push_layout,
+                            int subgroup_id_index,
+                            struct brw_cs_push_const_info *push)
 {
-   const struct brw_stage_prog_data *prog_data = &cs_prog_data->base;
-
    unsigned cross_thread_dwords, per_thread_dwords;
    if (devinfo->verx10 < 125 && subgroup_id_index >= 0) {
       /* Fill all but the last register with cross-thread payload */
       cross_thread_dwords = 8 * (subgroup_id_index / 8);
-      per_thread_dwords = prog_data->push_sizes[0] / 4 - cross_thread_dwords;
+      per_thread_dwords = push_layout->push_sizes[0] / 4 - cross_thread_dwords;
       assert(per_thread_dwords > 0 && per_thread_dwords <= 8);
    } else {
       /* Fill all data using cross-thread payload */
-      cross_thread_dwords = prog_data->push_sizes[0] / 4;
+      cross_thread_dwords = push_layout->push_sizes[0] / 4;
       per_thread_dwords = 0u;
    }
 
-   fill_push_const_block_info(&cs_prog_data->push.cross_thread, cross_thread_dwords);
-   fill_push_const_block_info(&cs_prog_data->push.per_thread, per_thread_dwords);
+   fill_push_const_block_info(&push->cross_thread, cross_thread_dwords);
+   fill_push_const_block_info(&push->per_thread, per_thread_dwords);
 
-   assert(cs_prog_data->push.cross_thread.dwords % 8 == 0 ||
-          cs_prog_data->push.per_thread.size == 0);
-   assert(cs_prog_data->push.cross_thread.dwords +
-          cs_prog_data->push.per_thread.dwords ==
-             prog_data->push_sizes[0] / 4);
+   assert(push->cross_thread.dwords % 8 == 0 ||
+          push->per_thread.size == 0);
+   assert(push->cross_thread.dwords +
+          push->per_thread.dwords ==
+             push_layout->push_sizes[0] / 4);
 }
 
 static bool
@@ -115,7 +114,7 @@ brw_nir_uses_sampler(nir_shader *shader)
                                        NULL);
 }
 
-const unsigned *
+intel_shader_bin *
 brw_compile_cs(const struct brw_compiler *compiler,
                struct brw_compile_params *params)
 {
@@ -123,20 +122,19 @@ brw_compile_cs(const struct brw_compiler *compiler,
    struct nir_shader *nir = params->nir;
    const struct brw_cs_prog_key *key =
       (const struct brw_cs_prog_key *)params->key;
-   struct brw_cs_prog_data *prog_data =
-      (struct brw_cs_prog_data *)params->prog_data;
 
    const bool debug_enabled =
       brw_should_print_shader(nir, params->debug_flag ?
                                    params->debug_flag : DEBUG_CS,
-                                   prog_data->base.source_hash);
+                                   params->source_hash);
 
-   brw_prog_data_init(&prog_data->base, params);
+   const unsigned ray_queries = nir->info.ray_queries;
 
+   uint32_t local_size[3] = {};
    if (!nir->info.workgroup_size_variable) {
-      prog_data->local_size[0] = nir->info.workgroup_size[0];
-      prog_data->local_size[1] = nir->info.workgroup_size[1];
-      prog_data->local_size[2] = nir->info.workgroup_size[2];
+      local_size[0] = nir->info.workgroup_size[0];
+      local_size[1] = nir->info.workgroup_size[1];
+      local_size[2] = nir->info.workgroup_size[2];
    }
 
    brw_nir_select_divergence_options(compiler, nir, false);
@@ -154,8 +152,10 @@ brw_compile_cs(const struct brw_compiler *compiler,
 
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
-      .prog_data = prog_data,
+      .stage = nir->info.stage,
+      .cs_local_size = local_size,
       .required_width = brw_required_dispatch_width(&nir->info),
+      .uses_btd_stack_ids = params->cs.uses_btd_stack_ids,
    };
 
    unsigned pressure[SIMD_COUNT];
@@ -166,7 +166,7 @@ brw_compile_cs(const struct brw_compiler *compiler,
          pressure[i] > compiler->register_pressure_threshold;
    }
 
-   prog_data->uses_sampler = brw_nir_uses_sampler(params->nir);
+   const bool uses_sampler = brw_nir_uses_sampler(params->nir);
 
    std::unique_ptr<brw_shader> v[3];
 
@@ -200,8 +200,23 @@ brw_compile_cs(const struct brw_compiler *compiler,
          .compiler                = compiler,
          .compile_params          = params,
          .nir                     = shader,
+         .info = {
+            .source_hash = params->source_hash,
+            .ray_queries = ray_queries,
+            .wg = {
+               .local_size = { local_size[0], local_size[1], local_size[2] },
+            },
+            .cs = {
+               .walk_order = params->cs.dispatch.walk_order,
+               .push = params->cs.push,
+               .uses_btd_stack_ids = params->cs.uses_btd_stack_ids,
+               .uses_sampler = uses_sampler,
+               .force_simd32 = params->cs.force_simd32,
+               .generate_local_id = params->cs.dispatch.generate_local_id,
+            },
+         },
          .dispatch_width          = dispatch_width,
-         .needs_register_pressure = params->stats != NULL,
+         .needs_register_pressure = params->collect_register_pressure,
          .debug_enabled           = debug_enabled,
       };
       v[simd] = std::make_unique<brw_shader>(&shader_params);
@@ -246,38 +261,38 @@ brw_compile_cs(const struct brw_compiler *compiler,
 
    assert(selected_simd < 3);
 
+   uint8_t prog_mask = 0;
+   uint8_t prog_spilled = 0;
+   for (unsigned i = 0; i < SIMD_COUNT; i++) {
+      if (simd_state.compiled[i])
+         prog_mask |= 1u << i;
+      if (simd_state.spilled[i])
+         prog_spilled |= 1u << i;
+   }
    if (!nir->info.workgroup_size_variable)
-      prog_data->prog_mask = 1 << selected_simd;
+      prog_mask = 1 << selected_simd;
 
    brw_to_binary_params to_binary_params = {
       .compiler = compiler,
       .params = params,
-      .prog_data = &prog_data->base,
    };
 
-   unsigned num_variants = 0;
    for (unsigned simd = 0; simd < 3; simd++) {
-      if (prog_data->prog_mask & (1u << simd)) {
+      if (prog_mask & (1u << simd)) {
          assert(v[simd]);
+         v[simd]->info.wg.prog_mask = 1u << simd;
+         v[simd]->info.wg.prog_spilled = prog_spilled & (1u << simd);
          to_binary_params.shaders[simd] = v[simd].get();
-         num_variants++;
-         prog_data->base.grf_used = MAX2(prog_data->base.grf_used,
-                                         v[simd]->grf_used);
       }
    }
 
-   const unsigned *assembly = brw_to_binary(&to_binary_params);
-
-   for (unsigned simd = 0; simd < 3; simd++) {
-      if (prog_data->prog_mask & (1u << simd))
-         prog_data->prog_offset[simd] = v[simd]->start_offset;
-   }
+   intel_shader_bin *bin = brw_to_binary(&to_binary_params);
 
    /* Override per-variant max_dispatch_width to make reports more useful. */
    const uint32_t max_dispatch_width =
-      8u << (util_last_bit(prog_data->prog_mask) - 1);
-   for (unsigned i = 0; i < num_variants && params->stats; i++)
-      params->stats[i].max_dispatch_width = max_dispatch_width;
+      8u << (util_last_bit(prog_mask) - 1);
+   for (unsigned i = 0; i < bin->num_stats; i++)
+      bin->stats[i].max_dispatch_width = max_dispatch_width;
 
-   return assembly;
+   return bin;
 }

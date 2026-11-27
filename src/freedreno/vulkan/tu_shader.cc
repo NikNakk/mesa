@@ -1096,9 +1096,9 @@ lower_input_attachment(nir_builder *b, nir_tex_instr *tex,
                        bool dynamic_renderpass)
 {
    if (dynamic_renderpass &&
-       ((tex->input_attachment_depth || tex->input_attachment_stencil) ?
-        (read_only_input_attachments & 0x1) :
-        (read_only_input_attachments & (1u << (tex->texture_index + 1)))))
+       ((tex->input_attachment_depth || tex->input_attachment_stencil)
+           ? (read_only_input_attachments & 0x1)
+           : (read_only_input_attachments & (1u << (tex->texture_index + TU_DYN_INPUT_ATT_OFFSET)))))
       return false;
 
    if (TU_DEBUG(DYNAMIC))
@@ -1117,7 +1117,7 @@ lower_input_attachment(nir_builder *b, nir_tex_instr *tex,
       assert(dynamic_renderpass);
       idx = 1;
    } else if (dynamic_renderpass) {
-      idx = (tex->texture_index + 1) * 2;
+      idx = (tex->texture_index + TU_DYN_INPUT_ATT_OFFSET) * 2;
       /* D24S8 workaround: stencil of D24S8 will be sampled as uint */
       if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float)
          idx += 1;
@@ -1527,7 +1527,7 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
     */
    if (shader->info.stage == MESA_SHADER_VERTEX) {
       uint32_t num_driver_params =
-         ir3_nir_scan_driver_consts(dev->compiler, shader, ir3_key, nullptr);
+         ir3_nir_scan_driver_consts(dev->compiler, shader, ir3_key);
       ir3_alloc_driver_params(const_allocs, &num_driver_params, dev->compiler,
                               shader->info.stage);
    }
@@ -3181,6 +3181,8 @@ tu_setup_pvtmem(struct tu_device *dev,
          align(pvtmem_bo->per_fiber_size *
                   dev->physical_device->info->fibers_per_sp,
                1 << 12);
+      if (per_wave && FD_QUIRK(dev->physical_device->info, QCTDD10982019_double_pvtmem_size))
+         pvtmem_bo->per_sp_size *= 2;
       uint32_t total_size =
          dev->physical_device->info->num_sp_cores * pvtmem_bo->per_sp_size;
 
@@ -3430,6 +3432,9 @@ tu_shader_init(struct tu_device *dev, const void *key_data, size_t key_size)
    shader->const_state.inline_uniforms_ubo.idx = -1;
    shader->const_state.bindless_base_addrs_ubo.idx = -1;
 
+   for (unsigned i = 0; i < MAX_SETS; i++)
+      shader->dynamic_descriptor_sizes[i] = -1;
+
    return shader;
 }
 
@@ -3664,10 +3669,13 @@ tu_lower_nir(struct tu_device *dev,
       nir_shader_gather_xfb_info(nir);
 
    {
-      /* Lower 64b push constants before lowering IO. */
+      /* Lower push constant and UBO access sizes before lowering IO, because
+       * tu_lower_io() turns push constants and inline uniform blocks into
+       * const file loads, which can only load whole 32-bit components.
+       */
       nir_lower_mem_access_bit_sizes_options options = {
          .callback = ir3_mem_access_size_align,
-         .modes = nir_var_mem_push_const,
+         .modes = nir_var_mem_push_const | nir_var_mem_ubo,
       };
 
       NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &options);
@@ -3876,7 +3884,7 @@ tu_link_shaders(struct tu_device *dev,
    }
 
    nir_opt_varyings_bulk(link_shaders, link_shaders_count, true, UINT32_MAX,
-                         UINT32_MAX, link_opts, dev->compiler);
+                         UINT32_MAX, link_opts, dev->compiler, NULL);
 
    /* We have to make sure nir_recompute_io_bases is called at least once so
     * that num_inputs/num_outputs is correctly set for all shaders.
@@ -4198,9 +4206,6 @@ tu_empty_fs_create(struct tu_device *dev, struct tu_shader **shader,
    (*shader)->fs.has_fdm = fragment_density_map;
    if (fragment_density_map && dev->physical_device->info->chip < 7)
       (*shader)->fs.lrz.status = TU_LRZ_FORCE_DISABLE_LRZ;
-
-   for (unsigned i = 0; i < MAX_SETS; i++)
-      (*shader)->dynamic_descriptor_sizes[i] = -1;
 
    struct ir3_shader *ir3_shader =
       ir3_shader_from_nir(dev->compiler, fs_b.shader, &options);

@@ -124,21 +124,22 @@ class Opcode(object):
       return self.const_expr
 
 # helper variables for strings
-tfloat = "float"
-tint = "int"
 tbool = "bool"
+tuint = "uint"
+tint = "int"
+tfloat = "float"
 tbool1 = "bool1"
 tbool32 = "bool32"
-tuint = "uint"
 tuint8 = "uint8"
-tint16 = "int16"
 tuint16 = "uint16"
+tuint32 = "uint32"
+tuint64 = "uint64"
+tint8 = "int8"
+tint16 = "int16"
+tint32 = "int32"
+tint64 = "int64"
 tfloat16 = "float16"
 tfloat32 = "float32"
-tint32 = "int32"
-tuint32 = "uint32"
-tint64 = "int64"
-tuint64 = "uint64"
 tfloat64 = "float64"
 
 _TYPE_SPLIT_RE = re.compile(r'(?P<type>int|uint|float|bool)(?P<bits>\d+)?')
@@ -1668,10 +1669,20 @@ signed value for its bit size.  The result is undefined otherwise.
 """, needs_dest_type=True)
 
 # Intel multiply-adds
-triop("imad_32x16_intel", tint32, "", "(src0 * (int16_t) src1) + src2",
-      description = "Multiply 32-bits with low 16-bits, with sign extension, then add a 32-bit value")
-triop("umad_32x16_intel", tuint32, "", "(src0 * (uint16_t) src1) + src2",
-      description = "Multiply 32-bits with low 16-bits, with zero extension, then add a 32-bit value")
+opcode("imad_32x16_intel", 0, tint32, [0, 0, 0], [tint32, tint16, tint32],
+       False, "", "(src0 * src1) + src2",
+      description = "Multiply 32-bits with 16-bits, with sign extension, then add a 32-bit value")
+opcode("umad_32x16_intel", 0, tuint32, [0, 0, 0], [tuint32, tuint16, tuint32],
+       False, "", "(src0 * src1) + src2",
+      description = "Multiply 32-bits with 16-bits, with zero extension, then add a 32-bit value")
+
+# Intel shifts.
+opcode("ishl_intel", 0, tint, [0, 0], [tint, tuint16], False, "",
+       "(uint64_t)src0 << (src1 & (MAX2(sizeof(src0) * 8, 32) - 1))", description = "Left shift.")
+opcode("ishr_intel", 0, tint, [0, 0], [tint, tuint16], False, "",
+       "src0 >> (src1 & (MAX2(sizeof(src0) * 8, 32) - 1))", description = "Signed right-shift.")
+opcode("ushr_intel", 0, tuint, [0, 0], [tuint, tuint16], False, "",
+       "src0 >> (src1 & (MAX2(sizeof(src0) * 8, 32) - 1))", description = "Unsigned right-shift.")
 
 # NVIDIA PRMT
 opcode("prmt_nv", 0, tuint32, [0, 0, 0], [tuint32, tuint32, tuint32],

@@ -1007,16 +1007,7 @@ spec@ext_framebuffer_multisample@sample-coverage 4 inverted,Fail
 spec@ext_framebuffer_multisample@sample-coverage 4 non-inverted,Fail
 
 spec@ext_framebuffer_object@fbo-depth-sample-compare,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-export,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_p010,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_p012,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_p016,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_y210,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_y212,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_y216,Fail
 spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_y410,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_y412,Fail
-spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_y416,Fail
 spec@ext_packed_depth_stencil@depth_stencil texture,Fail
 spec@ext_packed_depth_stencil@fbo-depthstencil-gl_depth24_stencil8-clear,Fail
 spec@ext_packed_depth_stencil@texwrap formats,Fail
@@ -1274,6 +1265,11 @@ spec@arb_framebuffer_srgb@blit texture srgb_to_linear upsample disabled render,F
 spec@arb_framebuffer_srgb@blit texture srgb_to_linear upsample enabled clear,Fail
 spec@arb_framebuffer_srgb@blit texture srgb_to_linear upsample enabled render,Fail
 
+spec@!opengl 1.0@gl-1.0-front-back-interleave,Fail
+spec@!opengl 1.5@gl-1.5-gen-buffers-unique,Crash
+spec@glsl-1.10@execution@glsl-fs-texture2d-mipmap-const-bias-04,Fail
+spec@glsl-1.10@execution@glsl-fs-texture2d-mipmap-const-bias-05,Fail
+
 # SKQP failing tests
 DeferredProxyTest,Crash
 GrContext_colorTypeSupportedAsSurface,Fail
@@ -1420,5 +1416,3 @@ gles_wacky_yuv_formats,Fail
 gles_wacky_yuv_formats_cs,Fail
 gles_xfermodes2,Fail
 gles_xfermodes3,Fail
-spec@glsl-1.10@execution@glsl-fs-texture2d-mipmap-const-bias-04,Fail
-spec@glsl-1.10@execution@glsl-fs-texture2d-mipmap-const-bias-05,Fail

@@ -4127,16 +4127,6 @@ genX(BeginCommandBuffer)(
       }
    }
 
-   /* Emit the sample pattern at the beginning of the batch because the
-    * default locations emitted at the device initialization might have been
-    * changed by a previous command buffer.
-    *
-    * Do not change that when we're continuing a previous renderpass.
-    */
-   if (device->vk.enabled_extensions.EXT_sample_locations &&
-       !(cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT))
-      genX(emit_sample_pattern)(&cmd_buffer->batch, NULL);
-
    if (cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
       const VkCommandBufferInheritanceConditionalRenderingInfoEXT *conditional_rendering_info =
          vk_find_struct_const(pBeginInfo->pInheritanceInfo->pNext, COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT);
@@ -4337,6 +4327,11 @@ end_command_buffer(struct anv_cmd_buffer *cmd_buffer,
    if (cmd_buffer->state.gfx.dyn_state.autostrip_disabled)
       genX(setup_autostrip_state)(cmd_buffer, true);
 #endif
+
+   /* Reset sample pattern to avoid dummy programming. */
+   if (anv_cmd_buffer_is_render_queue(cmd_buffer) &&
+       cmd_buffer->state.gfx.dyn_state.non_standard_sample_pattern)
+      genX(emit_sample_pattern)(&cmd_buffer->batch, NULL);
 
    /* Wa_14015814527
     *
@@ -6958,6 +6953,37 @@ void genX(CmdBeginRendering)(
    /****** We can now start emitting code to begin the render pass ******/
 
    gfx->dirty |= ANV_CMD_DIRTY_RENDER_TARGETS;
+
+   /* The Vulkan spec says about vkCmdSetRenderingAttachmentLocations() that :
+    *
+    *   "Until this command is called, mappings in the command buffer state
+    *    are treated as each color attachment specified in vkCmdBeginRendering
+    *    having a location equal to its index in
+    *    VkRenderingInfo::pColorAttachments. This state is reset whenever
+    *    vkCmdBeginRendering is called."
+    *
+    * Similarly for vkCmdSetRenderingInputAttachmentIndicesKHR() :
+    *
+    *   "Until this command is called, mappings in the command buffer state
+    *    are treated as each color attachment specified in vkCmdBeginRendering
+    *    mapping to subpass inputs with a InputAttachmentIndex equal to its
+    *    index in VkRenderingInfo::pColorAttachments, and depth/stencil
+    *    attachments mapping to input attachments without these decorations.
+    *    This state is reset whenever vkCmdBeginRendering is called."
+    *
+    * Reset both here.
+    */
+   vk_cmd_set_rendering_attachment_locations(
+      &cmd_buffer->vk, &(VkRenderingAttachmentLocationInfoKHR) {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+         .colorAttachmentCount = MAX_RTS,
+      });
+   vk_common_CmdSetRenderingInputAttachmentIndicesKHR(
+      commandBuffer,
+      &(VkRenderingInputAttachmentIndexInfoKHR) {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR,
+         .colorAttachmentCount = pRenderingInfo->colorAttachmentCount,
+      });
 
    /* It is possible to start a render pass with an old pipeline.  Because the
     * render pass and subpass index are both baked into the pipeline, this is

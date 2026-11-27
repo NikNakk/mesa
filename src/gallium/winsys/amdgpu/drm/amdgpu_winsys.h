@@ -233,6 +233,8 @@ struct amdgpu_winsys {
 
    ac_drm_device *dev;
 
+   FILE *bo_history_logfile;
+
    simple_mtx_t bo_fence_lock;
    simple_mtx_t stats_lock;
 
@@ -263,14 +265,12 @@ struct amdgpu_winsys {
    bool noop_cs;
    bool reserve_vmid;
    bool ib_caches_flush;
-#if MESA_DEBUG
    bool debug_all_bos;
 
    /* List of all allocated buffers */
    simple_mtx_t global_bo_list_lock;
    struct list_head global_bo_list;
    unsigned num_buffers;
-#endif
 
    /* Single-linked list of all structs amdgpu_screen_winsys referencing this
     * struct amdgpu_winsys

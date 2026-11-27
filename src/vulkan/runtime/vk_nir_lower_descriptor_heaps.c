@@ -796,6 +796,20 @@ lower_heaps_image(nir_builder *b, nir_intrinsic_instr *intrin,
    return true;
 }
 
+static void
+get_heap_data_align(nir_deref_instr *deref,
+                    uint32_t *align_mul, uint32_t *align_offset)
+{
+   if (!nir_get_explicit_deref_align(deref, true, align_mul, align_offset)) {
+      /* If we don't have an alignment from the deref, assume scalar */
+      assert(glsl_type_is_vector_or_scalar(deref->type) ||
+             glsl_type_is_matrix(deref->type));
+      *align_mul = glsl_type_is_boolean(deref->type) ?
+                   4 : glsl_get_bit_size(deref->type) / 8;
+      *align_offset = 0;
+   }
+}
+
 static bool
 try_lower_heaps_deref_access(nir_builder *b, nir_intrinsic_instr *intrin,
                              struct heap_mapping_ctx *ctx)
@@ -836,8 +850,19 @@ try_lower_heaps_deref_access(nir_builder *b, nir_intrinsic_instr *intrin,
       offset = build_buffer_addr_for_deref(b, offset, deref,
                                            nir_address_format_32bit_offset);
 
-      const uint32_t range = mapping->sourceData.pushDataOffset +
-                             glsl_get_explicit_size(root_cast->type, false);
+      const struct glsl_type *type = root_cast->type;
+      uint32_t range;
+
+      /* Use the maximum push data size range for unsized arrays. */
+      if (glsl_type_is_unsized_array(type) ||
+          (glsl_type_is_struct_or_ifc(type) &&
+           glsl_type_is_unsized_array(glsl_get_struct_field(type, glsl_get_length(type) - 1)))) {
+         range = ctx->options ? ctx->options->max_push_data_size : 0;
+         assert(range > 0);
+      } else {
+         range = mapping->sourceData.pushDataOffset +
+                 glsl_get_explicit_size(type, false);
+      }
 
       b->cursor = nir_before_instr(&intrin->instr);
       nir_def *val = nir_load_push_constant(b, intrin->def.num_components,
@@ -864,15 +889,7 @@ try_lower_heaps_deref_access(nir_builder *b, nir_intrinsic_instr *intrin,
                                                 nir_address_format_32bit_offset);
 
       uint32_t align_mul, align_offset;
-      if (!nir_get_explicit_deref_align(deref, true, &align_mul,
-                                        &align_offset)) {
-         /* If we don't have an alignment from the deref, assume scalar */
-         assert(glsl_type_is_vector_or_scalar(deref->type) ||
-                glsl_type_is_matrix(deref->type));
-         align_mul = glsl_type_is_boolean(deref->type) ?
-                     4 : glsl_get_bit_size(deref->type) / 8;
-         align_offset = 0;
-      }
+      get_heap_data_align(deref, &align_mul, &align_offset);
 
       b->cursor = nir_before_instr(&intrin->instr);
       nir_def *val = nir_load_resource_heap_data(b, intrin->def.num_components,
@@ -914,7 +931,7 @@ try_lower_heaps_deref_access(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 static bool
-try_lower_heaps_load_accel_struct(nir_builder *b, nir_intrinsic_instr *load)
+try_lower_heaps_load_data(nir_builder *b, nir_intrinsic_instr *load)
 {
    assert(load->intrinsic == nir_intrinsic_load_deref);
    nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
@@ -924,8 +941,9 @@ try_lower_heaps_load_accel_struct(nir_builder *b, nir_intrinsic_instr *load)
       return false;
 
    /* The root cast must come from a resource-heap variable, not a descriptor
-    * load. This is the "untyped" path where the shader loads a raw uint64_t
-    * AS handle directly from the heap array.
+    * load. This is the "untyped" path where the shader loads raw data
+    * directly from the heap. Descriptors are loaded with
+    * load_heap_descriptor_deref.
     */
    nir_deref_instr *root_parent = nir_src_as_deref(root_cast->parent);
    if (!root_parent ||
@@ -938,20 +956,23 @@ try_lower_heaps_load_accel_struct(nir_builder *b, nir_intrinsic_instr *load)
    heap_offset = build_buffer_addr_for_deref(b, heap_offset, deref,
                                              nir_address_format_32bit_offset);
 
+   uint32_t align_mul, align_offset;
+   get_heap_data_align(deref, &align_mul, &align_offset);
+
    b->cursor = nir_before_instr(&load->instr);
-   nir_def *desc = nir_load_heap_descriptor(b, load->def.num_components,
-                                            load->def.bit_size,
-                                            heap_offset,
-                                            .resource_type = nir_resource_type_acceleration_structure);
-   nir_def_replace(&load->def, desc);
+   nir_def *val = nir_load_resource_heap_data(b, load->def.num_components,
+                                              load->def.bit_size, heap_offset,
+                                              .align_mul = align_mul,
+                                              .align_offset = align_offset);
+   nir_def_replace(&load->def, val);
    return true;
 }
 
 static bool
-lower_heaps_load_buffer_ptr(nir_builder *b, nir_intrinsic_instr *ptr_load,
-                            struct heap_mapping_ctx *ctx)
+lower_load_heap_descriptor_deref(nir_builder *b, nir_intrinsic_instr *ptr_load,
+                                 struct heap_mapping_ctx *ctx)
 {
-   assert(ptr_load->intrinsic == nir_intrinsic_load_buffer_ptr_deref);
+   assert(ptr_load->intrinsic == nir_intrinsic_load_heap_descriptor_deref);
    nir_deref_instr *deref = nir_src_as_deref(ptr_load->src[0]);
 
    nir_deref_instr *root_cast = deref_get_root_cast(deref);
@@ -1072,7 +1093,7 @@ lower_heaps_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       return lower_heaps_image(b, intrin, ctx, false);
 
    case nir_intrinsic_load_deref:
-      if (try_lower_heaps_load_accel_struct(b, intrin))
+      if (try_lower_heaps_load_data(b, intrin))
          return true;
       FALLTHROUGH;
    case nir_intrinsic_store_deref:
@@ -1083,8 +1104,8 @@ lower_heaps_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_deref_buffer_address:
       return try_lower_heaps_deref_access(b, intrin, ctx);
 
-   case nir_intrinsic_load_buffer_ptr_deref:
-      return lower_heaps_load_buffer_ptr(b, intrin, ctx);
+   case nir_intrinsic_load_heap_descriptor_deref:
+      return lower_load_heap_descriptor_deref(b, intrin, ctx);
 
    case nir_intrinsic_load_vulkan_descriptor:
       return lower_heaps_load_descriptor(b, intrin, ctx);

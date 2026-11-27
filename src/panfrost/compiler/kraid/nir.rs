@@ -119,7 +119,7 @@ impl<'a> ShaderFromNir<'a> {
     fn new(
         model: &'a dyn Model,
         nir: &'a nir_shader,
-        inputs: &pan_compile_inputs,
+        stage: ShaderStage,
     ) -> Self {
         let fc = nir.info.float_controls_execution_mode;
         let rtz_fp16 = (fc & FLOAT_CONTROLS_ROUNDING_MODE_RTZ_FP16) != 0;
@@ -136,7 +136,7 @@ impl<'a> ShaderFromNir<'a> {
             ftz_fp32,
             info: ShaderInfo {
                 tls_size: nir.scratch_size,
-                is_blend: inputs.is_blend,
+                stage,
                 ..ShaderInfo::default()
             },
             constant_pool_label: None,
@@ -2715,6 +2715,8 @@ impl<'a> ShaderFromNir<'a> {
                 });
             }
             nir_intrinsic_zs_emit_pan => {
+                self.info.has_zs_emit = true;
+
                 let coverage = self.get_src(&srcs[0]);
                 let flags = intrin.flags();
                 let use_depth = (flags & (1 << FRAG_RESULT_DEPTH)) != 0;
@@ -2795,7 +2797,7 @@ impl<'a> ShaderFromNir<'a> {
                     );
                 }
 
-                if self.info.is_blend {
+                if self.info.stage == ShaderStage::Blend {
                     assert!(second_color.is_zero());
                     b.push_op(OpBlend {
                         color_type,
@@ -2806,6 +2808,7 @@ impl<'a> ShaderFromNir<'a> {
                         offset: 0,
                     });
                 } else {
+                    assert_eq!(self.info.stage, ShaderStage::Fragment);
                     let sample_id =
                         self.preload(b, PreloadReg::SampleCentroidId);
                     b.push_op(OpBlendCall {
@@ -3058,18 +3061,22 @@ impl<'a> ShaderFromNir<'a> {
             .collect()
     }
 
-    fn parse_shader(mut self) -> Shader<'a> {
-        let nfi = self.nir.get_entrypoint().unwrap();
-        let mut ssa_alloc = Default::default();
+    fn parse_func(
+        &mut self,
+        label_alloc: &mut LabelAllocator,
+        nf: &nir_function,
+    ) -> Function {
+        // All function calls should have been inlined, and functions
+        // eliminated in the process. This won't stand once we introduce
+        // function call support, which we intend to do.
+        assert!(nf.is_entrypoint);
 
+        let nfi = nf.get_impl().unwrap();
+        let mut ssa_alloc = Default::default();
         let mut phi_alloc = Default::default();
         let mut phi_map = PhiAllocMap::new(&mut phi_alloc);
 
-        // Pre-populate the block table so we have the same numbering as NIR
-        let mut label_alloc: LabelAllocator = Default::default();
-        if self.nir.constant_data_size > 0 {
-            self.constant_pool_label = Some(label_alloc.alloc());
-        }
+        // Pre-populate the block table to allow forward block referencing.
         let mut block_map: BlockLabelMap = Default::default();
         for nb in nfi.iter_blocks() {
             block_map.add(nb, label_alloc.alloc());
@@ -3088,9 +3095,30 @@ impl<'a> ShaderFromNir<'a> {
         let mut blocks = cfg.as_cfg(false);
 
         // If there are any preload registers, splice them before the
-        // starting block
-        if !self.preload_map.is_empty() {
+        // starting block. Only applicable to the entrypoint.
+        if nf.is_entrypoint && !self.preload_map.is_empty() {
             blocks[0].instrs.splice(..0, self.create_preload_instrs());
+        }
+
+        Function {
+            is_entrypoint: nf.is_entrypoint,
+            name: nf.name().unwrap_or_else(|| "noname").to_string(),
+            blocks,
+            ssa_alloc,
+            phi_alloc,
+        }
+    }
+
+    fn parse_shader(mut self) -> Shader<'a> {
+        let mut funcs = Vec::new();
+
+        let mut label_alloc: LabelAllocator = Default::default();
+        if self.nir.constant_data_size > 0 {
+            self.constant_pool_label = Some(label_alloc.alloc());
+        }
+
+        for nf in self.nir.iter_functions() {
+            funcs.push(self.parse_func(&mut label_alloc, nf));
         }
 
         let constant_pool = self.constant_pool_used.then(|| ConstantPool {
@@ -3110,9 +3138,7 @@ impl<'a> ShaderFromNir<'a> {
 
         Shader {
             model: self.model,
-            ssa_alloc,
-            phi_alloc,
-            blocks,
+            functions: funcs,
             info: self.info,
             constant_pool,
         }
@@ -3123,8 +3149,8 @@ impl<'a> Shader<'a> {
     pub fn from_nir(
         model: &'a dyn Model,
         nir: &'a nir_shader,
-        inputs: &pan_compile_inputs,
+        stage: ShaderStage,
     ) -> Self {
-        ShaderFromNir::new(model, nir, inputs).parse_shader()
+        ShaderFromNir::new(model, nir, stage).parse_shader()
     }
 }

@@ -178,6 +178,25 @@ static void amdgpu_bo_get_syncobjs(struct amdgpu_winsys *aws, struct amdgpu_wins
    simple_mtx_unlock(&aws->bo_fence_lock);
 }
 
+static long long amdgpu_canonicalize_va(uint64_t va)
+{
+   /* Would be less hardcoded to use addr32_hi (0xffff8000) to generate a mask,
+    * but there are confusing differences between page fault reports from kernel where
+    * it seems to report the top 48 bits, where addr32_hi has 47-bits. */
+   return (long long) (va & ((1ull << 48) - 1));
+}
+
+static const char *amdgpu_va_op_name(uint32_t op)
+{
+   switch (op) {
+      case AMDGPU_VA_OP_MAP: return "map";
+      case AMDGPU_VA_OP_UNMAP: return "unmap";
+      case AMDGPU_VA_OP_CLEAR: return "clear";
+      case AMDGPU_VA_OP_REPLACE: return "replace";
+      default: return "??";
+   }
+}
+
 static int amdgpu_bo_va_op_common(struct amdgpu_winsys *aws, struct amdgpu_winsys_bo *bo,
                                   uint32_t bo_handle, bool send_input_fence,
                                   uint64_t *vm_timeline_point, uint64_t offset, uint64_t size,
@@ -209,6 +228,17 @@ static int amdgpu_bo_va_op_common(struct amdgpu_winsys *aws, struct amdgpu_winsy
       simple_mtx_unlock(&aws->vm_ioctl_lock);
    } else {
       r = ac_drm_bo_va_op_raw(aws->dev, bo_handle, offset, size, addr, flags, ops);
+   }
+
+   if (aws->bo_history_logfile) {
+      const uint64_t timestamp = os_time_get_nano();
+
+      fprintf(aws->bo_history_logfile, "ts=%llu, bo=%18p, h=%5u, VA=%.16llx-%.16llx, op=%6s, flags=0x%" PRIx64 "\n",
+              (long long)timestamp,
+              bo, bo_handle,
+              amdgpu_canonicalize_va(addr), amdgpu_canonicalize_va(addr + size),
+              amdgpu_va_op_name(ops), flags);
+      fflush(aws->bo_history_logfile);
    }
 
    return r;
@@ -276,14 +306,12 @@ void amdgpu_bo_destroy(struct amdgpu_winsys *aws, struct pb_buffer_lean *_buf)
 
    ac_drm_bo_free(aws->dev, bo->bo);
 
-#if MESA_DEBUG
    if (aws->debug_all_bos) {
       simple_mtx_lock(&aws->global_bo_list_lock);
       list_del(&bo->global_list_item);
       aws->num_buffers--;
       simple_mtx_unlock(&aws->global_bo_list_lock);
    }
-#endif
 
    /* Close all KMS handles retrieved for other DRM file descriptions */
    simple_mtx_lock(&aws->sws_list_lock);
@@ -536,14 +564,12 @@ void amdgpu_bo_unmap(struct radeon_winsys *rws, struct pb_buffer_lean *buf)
 
 static void amdgpu_add_buffer_to_global_list(struct amdgpu_winsys *aws, struct amdgpu_bo_real *bo)
 {
-#if MESA_DEBUG
    if (aws->debug_all_bos) {
       simple_mtx_lock(&aws->global_bo_list_lock);
       list_addtail(&bo->global_list_item, &aws->global_bo_list);
       aws->num_buffers++;
       simple_mtx_unlock(&aws->global_bo_list_lock);
    }
-#endif
 }
 
 static unsigned amdgpu_get_optimal_alignment(struct amdgpu_winsys *aws,

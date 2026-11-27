@@ -88,7 +88,7 @@ def declare_options(android_version):
         # Workaround various driver
         B("always_flush_cache", False,
           "Enable flushing GPU caches with each draw call", c_name="always_flush_cache"),
-        B("anv_enable_efficient_64bit", False,
+        B("anv_enable_efficient_64bit", True,
           "Enable efficient 64bit mode on Gfx35+",
           c_name="enable_efficient_64bit"),
         B("anv_force_filter_addr_rounding", False,
@@ -133,6 +133,10 @@ def declare_options(android_version):
         B("anv_disable_xe_engine_cycles", False,
           "Disable use of DRM_XE_DEVICE_QUERY_ENGINE_CYCLES on Xe",
           c_name="disable_xe_engine_cycles"),
+        B("anv_enable_push_pointer_promotion", False,
+          "Promote 64bit pointers in push constants to pushed buffers (3DSTATE_CONSTANT*)",
+          c_name="enable_push_pointer_promotion"),
+
         # Workaround command emission
         B("anv_barrier_post_untyped_clear_shader", False,
           "Insert pipeline barriers post clearing shader on untyped data",

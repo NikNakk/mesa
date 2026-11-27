@@ -201,9 +201,16 @@ typedef enum {
  * Descriptor types.
  */
 typedef enum {
-   nir_descriptor_type_uniform_buffer = 0,
-   nir_descriptor_type_storage_buffer = 1,
-   nir_descriptor_type_acceleration_structure = 2,
+   nir_descriptor_type_invalid = 0,
+   nir_descriptor_type_uniform_buffer = 1,
+   nir_descriptor_type_storage_buffer = 2,
+   nir_descriptor_type_acceleration_structure = 3,
+   nir_descriptor_type_sampler = 4,
+   nir_descriptor_type_storage_texel_buffer = 5,
+   nir_descriptor_type_uniform_texel_buffer = 6,
+   nir_descriptor_type_input_attachment = 7,
+   nir_descriptor_type_storage_image = 8,
+   nir_descriptor_type_sampled_image = 9,
 } nir_descriptor_type;
 
 /**
@@ -1267,12 +1274,12 @@ nir_src_num_components(nir_src src)
    return src.ssa->num_components;
 }
 
-nir_block *nir_src_get_block(nir_src *src);
+nir_block *nir_src_get_block(const nir_src *src);
 
-bool nir_def_is_divergent_at_use_block(nir_def *def, nir_block *block);
+bool nir_def_is_divergent_at_use_block(const nir_def *def, const nir_block *block);
 
 static inline bool
-nir_src_is_divergent(nir_src *src)
+nir_src_is_divergent(const nir_src *src)
 {
    return nir_def_is_divergent_at_use_block(src->ssa, nir_src_get_block(src));
 }
@@ -3246,7 +3253,7 @@ nir_def_instr(const nir_def *def)
 #endif
 
 static inline nir_block *
-nir_def_block(nir_def *def)
+nir_def_block(const nir_def *def)
 {
    return nir_def_instr(def)->block;
 }
@@ -5818,6 +5825,13 @@ typedef enum {
     */
    nir_progress_producer = BITFIELD_BIT(0),
    nir_progress_consumer = BITFIELD_BIT(1),
+
+   /* Whether compaction moved a producer output that isn't a generic
+    * varying (VARn or PATCHn) to a different slot or component. This is for
+    * callers that also execute the producer without the consumer, where
+    * those outputs keep their meaning.
+    */
+   nir_progress_producer_builtin_outputs_moved = BITFIELD_BIT(2),
 } nir_opt_varyings_progress;
 
 nir_opt_varyings_progress
@@ -5832,7 +5846,8 @@ void
 nir_opt_varyings_bulk(nir_shader **shaders, uint32_t num_shaders, bool spirv,
                       unsigned max_uniform_comps, unsigned max_ubos,
                       void (*optimize)(nir_shader *, void *),
-                      void *optimize_data);
+                      void *optimize_data,
+                      nir_opt_varyings_progress *pair_progress);
 
 unsigned nir_slot_num_components(gl_varying_slot slot, mesa_shader_stage stage);
 bool nir_slot_is_sysval_output(gl_varying_slot slot,
@@ -6499,6 +6514,7 @@ typedef struct nir_lower_tex_options {
    unsigned lower_y41x_external;
    unsigned lower_sx10_external;
    unsigned lower_sx12_external;
+   unsigned yuv_msb_aligned_external;
    unsigned bt709_external;
    unsigned bt2020_external;
    unsigned yuv_full_range_external;
@@ -7148,8 +7164,6 @@ bool nir_opt_fragdepth(nir_shader *shader);
 
 bool nir_opt_gcm(nir_shader *shader, bool value_number);
 
-bool nir_opt_generate_bfi(nir_shader *shader);
-
 bool nir_opt_idiv_const(nir_shader *shader, unsigned min_bit_size);
 
 bool nir_opt_mqsad(nir_shader *shader);
@@ -7206,8 +7220,8 @@ typedef enum {
    nir_move_load_frag_coord =          BITFIELD_BIT(22),
 
    /* The following options only impact load_global/ubo/ssbo. */
-   nir_move_only_convergent =          BITFIELD_BIT(30),
-   nir_move_only_divergent =           BITFIELD_BIT(31),
+   nir_move_only_convergent =          BITFIELD_BIT(23),
+   nir_move_only_divergent =           BITFIELD_BIT(24),
 
    nir_move_all =
       nir_move_const_undef | nir_move_alu | nir_move_copies |

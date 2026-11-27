@@ -177,6 +177,8 @@ setup_border_colors(struct fd_texture_stateobj *tex,
       struct pipe_sampler_state *sampler = tex->samplers[i];
       union pipe_color_union *bc;
 
+      memset(e, 0, sizeof(*e));
+
       if (!sampler)
          continue;
 
@@ -185,12 +187,6 @@ setup_border_colors(struct fd_texture_stateobj *tex,
       enum pipe_format format = sampler->border_color_format;
       const struct util_format_description *desc =
          util_format_description(format);
-
-      e->rgb565 = 0;
-      e->rgb5a1 = 0;
-      e->rgba4 = 0;
-      e->rgb10a2 = 0;
-      e->z24 = 0;
 
       for (j = 0; j < 4; j++) {
          int c = desc->swizzle[j];
@@ -276,16 +272,12 @@ setup_border_colors(struct fd_texture_stateobj *tex,
                e->z24 = f_u * 0xffffff;
          }
       }
-
-#if MESA_DEBUG
-      memset(&e->__pad0, 0, sizeof(e->__pad0));
-      memset(&e->__pad1, 0, sizeof(e->__pad1));
-#endif
    }
 }
 
 static void
-emit_border_color(struct fd_context *ctx, struct fd_ringbuffer *ring) assert_dt
+emit_border_color(struct fd_context *ctx, struct fd_ringbuffer *ring,
+                  bool is_compute) assert_dt
 {
    struct fd5_context *fd5_ctx = fd5_context(ctx);
    struct bcolor_entry *entries;
@@ -302,11 +294,18 @@ emit_border_color(struct fd_context *ctx, struct fd_ringbuffer *ring) assert_dt
 
    entries = ptr;
 
-   setup_border_colors(&ctx->tex[MESA_SHADER_VERTEX], &entries[0]);
-   setup_border_colors(&ctx->tex[MESA_SHADER_FRAGMENT],
-                       &entries[ctx->tex[MESA_SHADER_VERTEX].num_samplers]);
+   if (is_compute) {
+      setup_border_colors(&ctx->tex[MESA_SHADER_COMPUTE], &entries[0]);
+   } else {
+      setup_border_colors(&ctx->tex[MESA_SHADER_VERTEX], &entries[0]);
+      setup_border_colors(&ctx->tex[MESA_SHADER_FRAGMENT],
+                          &entries[ctx->tex[MESA_SHADER_VERTEX].num_samplers]);
+   }
 
-   OUT_PKT4(ring, REG_A5XX_TPL1_TP_BORDER_COLOR_BASE_ADDR, 2);
+   OUT_PKT4(ring,
+            is_compute ? REG_A5XX_TPL1_CS_BORDER_COLOR_BASE
+                       : REG_A5XX_TPL1_GFX_BORDER_COLOR_BASE,
+            2);
    OUT_RELOC(ring, fd_resource(fd5_ctx->border_color_buf)->bo, off, 0, 0);
 
    u_upload_unmap(fd5_ctx->border_color_uploader);
@@ -569,6 +568,98 @@ emit_ssbos(struct fd_context *ctx, struct fd_ringbuffer *ring,
    }
 }
 
+/* The graphics stages share SB4_UBO's UBO state.  These are the a5xx blob's
+ * DST_OFFs for the VS and FS base addresses (in UBOs) and sizes (in units of
+ * 4 UBOs).
+ */
+#define FD5_VS_UBO_ADDR_DST_OFF 0
+#define FD5_VS_UBO_SIZE_DST_OFF 0
+#define FD5_FS_UBO_ADDR_DST_OFF 80
+#define FD5_FS_UBO_SIZE_DST_OFF 16
+
+/* Uploads the base addresses and sizes of the UBOs that the shader's ldc
+ * instructions read (the UBO loads that weren't pushed to constants by
+ * ir3_emit_user_consts()).
+ */
+static void
+emit_ubos(struct fd_context *ctx, struct fd_ringbuffer *ring,
+          enum a4xx_state_block sb, uint32_t addr_dst_off,
+          uint32_t size_dst_off, struct fd_constbuf_stateobj *constbuf,
+          const struct ir3_shader_variant *v)
+{
+   const struct ir3_const_state *const_state = ir3_const_state(v);
+   unsigned count = const_state->num_ubos;
+
+   if (count == 0)
+      return;
+
+   struct fd_bo *bos[count];
+   uint32_t offsets[count];
+   uint32_t sizes[count];
+
+   for (unsigned i = 0; i < count; i++) {
+      if (i == const_state->consts_ubo.idx) {
+         bos[i] = v->bo;
+         offsets[i] = v->info.constant_data_offset;
+         sizes[i] = v->constant_data_size;
+         continue;
+      }
+
+      struct pipe_constant_buffer *cb = &constbuf->cb[i];
+
+      ir3_upload_user_constbuf(ctx, cb);
+
+      if ((constbuf->enabled_mask & (1 << i)) && cb->buffer) {
+         bos[i] = fd_resource(cb->buffer)->bo;
+         offsets[i] = cb->buffer_offset;
+         sizes[i] = cb->buffer_size;
+      } else {
+         bos[i] = NULL;
+         offsets[i] = 0;
+         sizes[i] = 0;
+      }
+   }
+
+   OUT_PKT7(ring, CP_LOAD_STATE4, 3 + 2 * count);
+   OUT_RING(ring, CP_LOAD_STATE4_0_DST_OFF(addr_dst_off) |
+                     CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                     CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                     CP_LOAD_STATE4_0_NUM_UNIT(count));
+   OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_UBO) |
+                     CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   OUT_RING(ring, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   for (unsigned i = 0; i < count; i++) {
+      if (bos[i]) {
+         OUT_RELOC(ring, bos[i], offsets[i], 0, 0);
+      } else {
+         OUT_RING(ring, 0x00000000);
+         OUT_RING(ring, 0x00000000);
+      }
+   }
+
+   /* The sizes are 16-bit counts of vec4s, 4 UBOs per unit.  ldc loads at
+    * or past the size return 0, so a size of 0 makes unbound UBOs read 0.
+    */
+   unsigned size_units = DIV_ROUND_UP(count, 4);
+   OUT_PKT7(ring, CP_LOAD_STATE4, 3 + 2 * size_units);
+   OUT_RING(ring, CP_LOAD_STATE4_0_DST_OFF(size_dst_off) |
+                     CP_LOAD_STATE4_0_STATE_SRC(SS4_DIRECT) |
+                     CP_LOAD_STATE4_0_STATE_BLOCK(sb) |
+                     CP_LOAD_STATE4_0_NUM_UNIT(size_units));
+   OUT_RING(ring, CP_LOAD_STATE4_1_STATE_TYPE(ST4_CONSTANTS) |
+                     CP_LOAD_STATE4_1_EXT_SRC_ADDR(0));
+   OUT_RING(ring, CP_LOAD_STATE4_2_EXT_SRC_ADDR_HI(0));
+   for (unsigned i = 0; i < size_units * 2; i++) {
+      uint32_t dword = 0;
+      for (unsigned j = 0; j < 2; j++) {
+         unsigned ubo = i * 2 + j;
+         if (ubo < count)
+            dword |= MIN2(DIV_ROUND_UP(sizes[ubo], 16), 0xffff) << (16 * j);
+      }
+      OUT_RING(ring, dword);
+   }
+}
+
 void
 fd5_emit_vertex_bufs(struct fd_ringbuffer *ring, struct fd5_emit *emit)
 {
@@ -707,8 +798,9 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
 
    if (dirty & (FD_DIRTY_ZSA | FD_DIRTY_RASTERIZER | FD_DIRTY_PROG)) {
       struct fd5_zsa_stateobj *zsa = fd5_zsa_stateobj(ctx->zsa);
-      bool fragz = fp->no_earlyz || fp->has_kill || zsa->base.alpha_enabled ||
-                   fp->writes_pos;
+      bool fragz = !fp->fs.early_fragment_tests &&
+                   (fp->no_earlyz || fp->has_kill ||
+                    zsa->base.alpha_enabled || fp->writes_pos);
 
       OUT_PKT4(ring, REG_A5XX_RB_DEPTH_CNTL, 1);
       OUT_RING(ring, zsa->rb_depth_cntl |
@@ -907,6 +999,9 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
          if (!target)
             continue;
 
+         /* for glDrawTransformFeedback(), see fd5_draw_emit(): */
+         target->stride = info->stride[i];
+
          OUT_PKT4(ring, REG_A5XX_VPC_SO_BUFFER_BASE(i), 3);
          /* VPC_SO[i].BUFFER_BASE_LO: */
          OUT_RELOC(ring, fd_resource(target->base.buffer)->bo, 0, 0, 0);
@@ -950,12 +1045,8 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
       OUT_RING(ring, REG_A5XX_VPC_SO_BUF_CNTL);
       OUT_RING(ring, 0);
    } else if (emit->streamout_mask && !(dirty & FD_DIRTY_PROG)) {
-      /* reemit the program (if we haven't already) to re-enable streamout.  We
-       * really should switch to setting up program state at compile time so we
-       * can separate the SO state from the rest, and not recompute all the
-       * time.
-       */
-      fd5_program_emit(ctx, ring, emit);
+      /* re-enable streamout, if the program has not done it already */
+      fd5_program_emit_streamout(ring, emit);
    }
 
    if (dirty & FD_DIRTY_BLEND) {
@@ -1051,9 +1142,23 @@ fd5_emit_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
    OUT_RING(ring, 0);
 
    if (needs_border)
-      emit_border_color(ctx, ring);
+      emit_border_color(ctx, ring, false);
+
+   if (reload || (ctx->dirty_shader[MESA_SHADER_VERTEX] &
+                  (FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_CONST))) {
+      emit_ubos(ctx, ring, SB4_UBO, FD5_VS_UBO_ADDR_DST_OFF,
+                FD5_VS_UBO_SIZE_DST_OFF, &ctx->constbuf[MESA_SHADER_VERTEX],
+                vp);
+   }
 
    if (!emit->binning_pass) {
+      if (reload || (ctx->dirty_shader[MESA_SHADER_FRAGMENT] &
+                     (FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_CONST))) {
+         emit_ubos(ctx, ring, SB4_UBO, FD5_FS_UBO_ADDR_DST_OFF,
+                   FD5_FS_UBO_SIZE_DST_OFF,
+                   &ctx->constbuf[MESA_SHADER_FRAGMENT], fp);
+      }
+
       if (reload || (ctx->dirty_shader[MESA_SHADER_FRAGMENT] & FD_DIRTY_SHADER_SSBO))
          emit_ssbos(ctx, ring, SB4_SSBO, &ctx->shaderbuf[MESA_SHADER_FRAGMENT],
                   fp);
@@ -1076,7 +1181,7 @@ fd5_emit_cs_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
                        -1);
 
       if (needs_border)
-         emit_border_color(ctx, ring);
+         emit_border_color(ctx, ring, true);
 
       OUT_PKT4(ring, REG_A5XX_TPL1_VS_TEX_COUNT, 1);
       OUT_RING(ring, 0);
@@ -1099,11 +1204,15 @@ fd5_emit_cs_state(struct fd_context *ctx, struct fd_ringbuffer *ring,
                      ? ~0
                      : ctx->tex[MESA_SHADER_COMPUTE].num_textures);
 
+   if (dirty & (FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_CONST))
+      emit_ubos(ctx, ring, SB4_CS_UBO, 0, 0, &ctx->constbuf[MESA_SHADER_COMPUTE],
+                cp);
+
    if (dirty & FD_DIRTY_SHADER_SSBO)
       emit_ssbos(ctx, ring, SB4_CS_SSBO, &ctx->shaderbuf[MESA_SHADER_COMPUTE],
                  cp);
 
-   if (dirty & FD_DIRTY_SHADER_IMAGE)
+   if (dirty & (FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_IMAGE))
       fd5_emit_images(ctx, ring, MESA_SHADER_COMPUTE, cp);
 }
 
@@ -1217,7 +1326,11 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
    OUT_RING(ring, 0x0000001f); /* PC_MODE_CNTL */
 
    OUT_PKT4(ring, REG_A5XX_SP_MODE_CNTL, 1);
-   OUT_RING(ring, 0x0000001c); /* SP_MODE_CNTL */
+   /* SSBO_CONSTS_ENABLE makes the image descriptors visible to the shader's
+    * offset math at c448.
+    */
+   OUT_RING(ring, A5XX_SP_MODE_CNTL_SSBO_CONSTS_ENABLE |
+                     A5XX_SP_MODE_CNTL_CONSTANT_DEMOTION_ENABLE | 0x8);
 
    OUT_PKT4(ring, REG_A5XX_SP_DBG_ECO_CNTL, 1);
    OUT_RING(ring, fd5_sp_dbg_eco_cntl(ctx->screen));
@@ -1240,7 +1353,7 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
             COND(fd5_lm_load_kill_disabled(ctx->screen), BIT(23)));
 
    OUT_PKT4(ring, REG_A5XX_HLSQ_MODE_CNTL, 1);
-   OUT_RING(ring, 0x00000001); /* HLSQ_MODE_CNTL */
+   OUT_RING(ring, A5XX_HLSQ_MODE_CNTL_SSBO_CONSTS_ENABLE);
 
    OUT_PKT4(ring, REG_A5XX_VPC_MODE_CNTL, 1);
    OUT_RING(ring, 0x00000000); /* VPC_MODE_CNTL */
@@ -1286,8 +1399,8 @@ fd5_emit_restore(struct fd_batch *batch, struct fd_ringbuffer *ring)
    OUT_PKT4(ring, REG_A5XX_TPL1_TP_FS_ROTATION_CNTL, 1);
    OUT_RING(ring, 0x00000000); /* TPL1_TP_FS_ROTATION_CNTL */
 
-   OUT_PKT4(ring, REG_A5XX_UNKNOWN_E004, 1);
-   OUT_RING(ring, 0x00000000); /* UNKNOWN_E004 */
+   OUT_PKT4(ring, REG_A5XX_GRAS_CL_ARRAY_SIZE, 1);
+   OUT_RING(ring, 0x00000000); /* GRAS_CL_ARRAY_SIZE */
 
    OUT_PKT4(ring, REG_A5XX_GRAS_SU_LAYERED, 1);
    OUT_RING(ring, 0x00000000); /* GRAS_SU_LAYERED */

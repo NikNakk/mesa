@@ -1546,8 +1546,8 @@ system_value("provoking_last", 1)
 #
 # Length takes a type not a value, that's encoded as a MATRIX_DESC.
 intrinsic("cmat_construct", src_comp=[-1, 1])
-intrinsic("cmat_load", src_comp=[-1, -1, 1], indices=[MATRIX_LAYOUT])
-intrinsic("cmat_store", src_comp=[-1, -1, 1], indices=[MATRIX_LAYOUT])
+intrinsic("cmat_load", src_comp=[-1, -1, 1], indices=[MATRIX_LAYOUT, ACCESS])
+intrinsic("cmat_store", src_comp=[-1, -1, 1], indices=[MATRIX_LAYOUT, ACCESS])
 intrinsic("cmat_length", src_comp=[], dest_comp=1, indices=[CMAT_DESC], bit_sizes=[32])
 intrinsic("cmat_muladd", src_comp=[-1, -1, -1, -1], indices=[SATURATE, CMAT_SIGNED_MASK])
 intrinsic("cmat_convert", src_comp=[-1, -1], indices=[SATURATE, CMAT_SIGNED_MASK, FP_MATH_CTRL])
@@ -1562,7 +1562,7 @@ intrinsic("cmat_transpose", src_comp=[-1, -1], indices=[SATURATE, CMAT_SIGNED_MA
 intrinsic("cmat_get_coordinate", src_comp=[1], dest_comp=2, indices=[CMAT_DESC], bit_sizes=[32])
 
 # src[] = { deref }.
-load("buffer_ptr_deref", [-1], [ACCESS, RESOURCE_TYPE],
+load("heap_descriptor_deref", [-1], [ACCESS, RESOURCE_TYPE],
      flags=[CAN_ELIMINATE, CAN_REORDER])
 # src[] = { offset }.
 load("heap_descriptor", [1], [RESOURCE_TYPE], [CAN_ELIMINATE, CAN_REORDER])
@@ -2819,6 +2819,8 @@ intrinsic("load_reloc_const_intel", dest_comp=1, bit_sizes=[32],
 
 # Write a render target
 # src[] = { surface, color, dual_color, src0_alpha, omask, depth, stencil }
+# In efficient 64bit addressing mode, surface is a 64bit surface state address
+# whose low 3 bits select the blend-state entry.
 intrinsic("store_render_target_intel", [1, 4, 4, 1, 1, 1, 1], indices=[TARGET], bit_sizes=[64, 32, 32, 32, 32, 32, 32])
 
 # Shuffle with an offset in bytes instead of a lane index.
@@ -3168,6 +3170,31 @@ intrinsic("cmat_load_shared_nv", src_comp=[1, 1], dest_comp=0, indices=[NUM_MATR
 
 # Moves a 8x8 16bit matrix with transposition within a subgroup
 intrinsic("cmat_mov_transpose_nv", src_comp=[2], dest_comp=2, bit_sizes=[16], flags=[CAN_ELIMINATE, CAN_REORDER, SUBGROUP])
+
+# NVIDIA-specific ray traversal intrinsics.
+# Most of the ray traversal is handled by the TTU (Tree Traversal Unit) coprocessor.
+# A typical interaction with it involves the following:
+# - Opening a session with the TTU via ttuopen
+# - Writing TTU configuration via ttust
+# - Starting coprocessor work via ttugo
+# - Reading the result via ttuld and closing the session on the last read
+
+# Open a session with the TTU coprocessor
+# FLAGS is 1 if opening the session in dual mode, otherwise 0
+intrinsic("ttuopen_nv", indices=[FLAGS])
+
+# Store 128-bit in the TTU shared space
+# src[] = { data_low, data_high }.
+# BASE is the offset
+intrinsic("ttust_nv", src_comp=[2, 2], bit_sizes=[32], indices=[BASE, ACCESS], flags=[])
+
+# Load 128-bit from the TTU shared space
+# BASE is the offset
+# FLAGS is 1 if closing the session with this read, otherwise 0
+intrinsic("ttuld_nv", dest_comp=4, bit_sizes=[32], indices=[BASE, ACCESS, FLAGS], flags=[])
+
+# Instruct the TTU coprocessor to start its works
+intrinsic("ttugo_nv")
 
 # NVIDIA-specific system values
 system_value("warps_per_sm_nv", 1, bit_sizes=[32])

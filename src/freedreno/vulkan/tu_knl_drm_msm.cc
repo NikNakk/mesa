@@ -1390,6 +1390,7 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
       goto fail;
    }
    device->gmem_size = val;
+   fd_dev_check_gmem_size(&device->dev_id, device->gmem_size);
    device->gmem_size = debug_get_num_option("TU_GMEM", device->gmem_size);
 
    if (tu_drm_get_param(fd, MSM_PARAM_GMEM_BASE, &val)) {
@@ -1439,7 +1440,6 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
    device->sync_types[2] = NULL;
 
    device->heap.size = tu_get_system_heap_size(device);
-   device->heap.used = 0u;
    device->heap.flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    instance->knl = &msm_knl_funcs;

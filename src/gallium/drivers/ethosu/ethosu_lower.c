@@ -5,9 +5,10 @@
 
 #include "util/u_inlines.h"
 
+#include "ethosu_alloc.h"
+#include "ethosu_coefs.h"
 #include "ethosu_device.h"
 #include "ethosu_lower.h"
-#include "ethosu_coefs.h"
 #include "ethosu_ml.h"
 #include "ethosu_sched.h"
 
@@ -271,8 +272,7 @@ ethosu_fc_batch_rows(const struct pipe_ml_operation *poperation)
 }
 
 static bool
-ethosu_fc_uses_batched_shape(const struct ethosu_subgraph *subgraph,
-                             const struct pipe_ml_operation *poperation)
+ethosu_fc_uses_batched_shape(const struct pipe_ml_operation *poperation)
 {
    return poperation->type == PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED &&
           ethosu_fc_batch_rows(poperation) > 1;
@@ -284,9 +284,8 @@ ethosu_fc_uses_batched_shape(const struct ethosu_subgraph *subgraph,
  * spatial size, and a batched fully connected then folds the rows into a
  * near-square plane, overriding the width either set.  The layout
  * decision mirrors the lowering by reading the shapes from here. */
-static void
-ethosu_fc_lowered_dims(const struct ethosu_subgraph *subgraph,
-                       const struct pipe_ml_operation *poperation,
+void
+ethosu_fc_lowered_dims(const struct pipe_ml_operation *poperation,
                        unsigned in[4], unsigned out[4])
 {
    const struct pipe_tensor *input = poperation->input_tensors[0];
@@ -316,7 +315,7 @@ ethosu_fc_lowered_dims(const struct ethosu_subgraph *subgraph,
       out[3] = weight->dims[2];
    }
 
-   if (ethosu_fc_uses_batched_shape(subgraph, poperation)) {
+   if (ethosu_fc_uses_batched_shape(poperation)) {
       unsigned rows = ethosu_fc_batch_rows(poperation);
       unsigned width = ethosu_fc_batch_width(rows);
 
@@ -341,7 +340,7 @@ ethosu_written_wd(const struct ethosu_subgraph *subgraph,
    if (producer->type == PIPE_ML_OPERATION_TYPE_FULLY_CONNECTED) {
       unsigned in[4], out[4];
 
-      ethosu_fc_lowered_dims(subgraph, producer, in, out);
+      ethosu_fc_lowered_dims(producer, in, out);
       *width = out[2];
       *depth = out[3];
       return;
@@ -369,7 +368,7 @@ ethosu_read_wd(const struct ethosu_subgraph *subgraph,
        consumer->input_tensors[0]->index == ptensor->index) {
       unsigned in[4], out[4];
 
-      ethosu_fc_lowered_dims(subgraph, consumer, in, out);
+      ethosu_fc_lowered_dims(consumer, in, out);
       *width = in[2];
       *depth = in[3];
       return;
@@ -544,30 +543,6 @@ ethosu_tensor_position(const struct ethosu_subgraph *subgraph,
 {
    return tensor - util_dynarray_element(&subgraph->tensors,
                                          const struct ethosu_tensor, 0);
-}
-
-static unsigned
-ethosu_allocate_feature_map(struct ethosu_subgraph *subgraph,
-                            const unsigned *required_sizes,
-                            struct ethosu_feature_map *fm)
-{
-   struct ethosu_tensor *tensor = fm->tensor;
-   uint64_t size;
-
-   assert(tensor);
-
-   if (tensor->size > 0)
-      return tensor->offset;
-
-   size = (uint64_t)required_sizes[ethosu_tensor_position(subgraph, tensor)] *
-          tensor->batches;
-   assert(size <= UINT_MAX);
-
-   tensor->offset = subgraph->io_used;
-   tensor->size = size;
-   subgraph->io_used += ALIGN_POT(size, 16);
-
-   return tensor->offset;
 }
 
 static void
@@ -1029,7 +1004,7 @@ ethosu_lower_fully_connected(struct ethosu_subgraph *subgraph,
    struct pipe_tensor *weight = poperation->fcon.weight_tensor;
    unsigned in[4], out[4];
 
-   ethosu_fc_lowered_dims(subgraph, poperation, in, out);
+   ethosu_fc_lowered_dims(poperation, in, out);
    for (unsigned i = 0; i < 4; i++) {
       flat_input.dims[i] = in[i];
       spatial_output.dims[i] = out[i];
@@ -1216,7 +1191,7 @@ ethosu_lower_argmax_u85(struct ethosu_subgraph *subgraph,
    const unsigned channels = input->dims[3];
    const unsigned elements = input->dims[1] * input->dims[2];
    /* IFM and OFM height fields are 16 bits. */
-   const unsigned max_elements = 1 << 16;
+   const unsigned max_elements = FEATURE_MAP_MAX_DIM;
    struct ethosu_operation operation;
    struct ethosu_feature_map input_fm;
    struct ethosu_feature_map output_fm;
@@ -1256,7 +1231,7 @@ ethosu_lower_argmax_u65(struct ethosu_subgraph *subgraph,
    struct pipe_tensor *output = poperation->output_tensors[0];
    const unsigned channels = input->dims[3];
    const unsigned elements = input->dims[1] * input->dims[2];
-   const unsigned max_elements = 1 << 16;
+   const unsigned max_elements = FEATURE_MAP_MAX_DIM;
    const unsigned rows_per_chunk = max_elements / input->dims[2];
    const unsigned max_chunk_elements = MIN2(elements,
                                             rows_per_chunk * input->dims[2]);
@@ -3288,17 +3263,12 @@ static void
 ethosu_lower_dma(struct ethosu_operation *conv_operation,
                  struct ethosu_operation *operation)
 {
+   unsigned size = conv_operation->conv.scales.size + conv_operation->conv.weights.size;
    operation->type = ETHOSU_OPERATION_TYPE_DMA;
 
    operation->dma.address = conv_operation->conv.scales.address;
-   operation->dma.size = conv_operation->conv.scales.size + conv_operation->conv.weights.size;
+   operation->dma.size = size;
    operation->dma.dst_region = SCRATCH_REGION;
-
-   conv_operation->conv.scales.region = SCRATCH_REGION;
-   conv_operation->conv.scales.address = 0;
-
-   conv_operation->conv.weights.region = SCRATCH_REGION;
-   conv_operation->conv.weights.address = conv_operation->conv.scales.size;
 }
 
 static void
@@ -3516,34 +3486,6 @@ ethosu_set_feature_map_tiles(struct ethosu_feature_map *fm)
    fm->tiles.width_0 = fm->shape.width;
 }
 
-static bool
-ethosu_is_feature_map_in_io(const struct ethosu_feature_map *fm)
-{
-   if (fm->region != IO_REGION || !fm->tensor || fm->has_scalar)
-      return false;
-
-   if (fm->activation_storage == ETHOSU_ACTIVATION_STORAGE_CHAINED)
-      return false;
-
-   return true;
-}
-
-static void
-ethosu_add_feature_map_base(struct ethosu_subgraph *subgraph,
-                            const unsigned *required_sizes,
-                            struct ethosu_feature_map *fm)
-{
-   if (!ethosu_is_feature_map_in_io(fm))
-      return;
-
-   fm->tiles.addresses[0] +=
-      ethosu_allocate_feature_map(subgraph, required_sizes, fm);
-   assert(fm->tiles.addresses[0] + ethosu_feature_map_span(fm) <=
-          fm->tensor->offset +
-             required_sizes[ethosu_tensor_position(subgraph, fm->tensor)]);
-   ethosu_set_feature_map_tiles(fm);
-}
-
 static void
 ethosu_require_feature_map_size(const struct ethosu_subgraph *subgraph,
                                 unsigned *required_sizes,
@@ -3608,12 +3550,9 @@ ethosu_require_tensor_sizes(struct ethosu_subgraph *subgraph,
    }
 }
 
-static void
-ethosu_allocate_feature_maps(struct ethosu_subgraph *subgraph)
+static unsigned *
+ethosu_prepare_feature_maps(struct ethosu_subgraph *subgraph)
 {
-   unsigned operation_count =
-      util_dynarray_num_elements(&subgraph->operations,
-                                 struct ethosu_operation);
    unsigned *required_sizes =
       calloc(util_dynarray_num_elements(&subgraph->tensors,
                                         struct ethosu_tensor),
@@ -3622,37 +3561,25 @@ ethosu_allocate_feature_maps(struct ethosu_subgraph *subgraph)
    if (!required_sizes) {
       mesa_loge("ethosu: failed to allocate tensor sizes");
       subgraph->failed = true;
-      return;
+      return NULL;
    }
 
    ethosu_require_tensor_sizes(subgraph, required_sizes);
 
-   for (unsigned i = 0; i < operation_count; i++) {
-      struct ethosu_operation *operation =
-         util_dynarray_element(&subgraph->operations,
-                               struct ethosu_operation, i);
-
+   util_dynarray_foreach (&subgraph->operations, struct ethosu_operation,
+                          operation) {
       if (operation->type == ETHOSU_OPERATION_TYPE_DMA)
          continue;
 
-      ethosu_add_feature_map_base(subgraph, required_sizes, &operation->ifm);
-
-      if (operation->type == ETHOSU_OPERATION_TYPE_NONE) {
-         struct ethosu_tensor *input = operation->ifm.tensor;
-         struct ethosu_tensor *output = operation->ofm.tensor;
-
-         output->offset = input->offset;
-         output->size = input->size;
-         operation->ofm.tiles.addresses[0] += output->offset;
-         continue;
-      }
-
-      ethosu_add_feature_map_base(subgraph, required_sizes,
-                                  &operation->ifm2);
-      ethosu_add_feature_map_base(subgraph, required_sizes, &operation->ofm);
+      if (ethosu_is_feature_map_in_io(&operation->ifm))
+         ethosu_set_feature_map_tiles(&operation->ifm);
+      if (ethosu_is_feature_map_in_io(&operation->ifm2))
+         ethosu_set_feature_map_tiles(&operation->ifm2);
+      if (ethosu_is_feature_map_in_io(&operation->ofm))
+         ethosu_set_feature_map_tiles(&operation->ofm);
    }
 
-   free(required_sizes);
+   return required_sizes;
 }
 
 static enum ethosu_transpose_type
@@ -3819,7 +3746,7 @@ ethosu_weights_in_sram(struct ethosu_subgraph *subgraph,
 {
    return operation->type == ETHOSU_OPERATION_TYPE_CONVOLUTION &&
           operation->conv.weights_in_sram &&
-          operation->conv.scales.size + operation->conv.weights.size <=
+          ethosu_coefficient_size(operation) <=
              ethosu_ml_device(subgraph->base.device)->sram_size;
 }
 
@@ -4328,10 +4255,12 @@ ethosu_lower_graph(struct ethosu_subgraph *subgraph,
    if (DBG_ENABLED(ETHOSU_DBG_DUMP_LOWERING))
       ethosu_dump_operations(subgraph, "ethosu_lower_from_gallium");
 
-   ethosu_allocate_feature_maps(subgraph);
+   unsigned *required_sizes = ethosu_prepare_feature_maps(subgraph);
+   if (subgraph->failed)
+      return;
 
    if (DBG_ENABLED(ETHOSU_DBG_DUMP_LOWERING))
-      ethosu_dump_operations(subgraph, "ethosu_allocate_feature_maps");
+      ethosu_dump_operations(subgraph, "ethosu_prepare_feature_maps");
 
    ethosu_split_transposes(subgraph);
 
@@ -4352,6 +4281,12 @@ ethosu_lower_graph(struct ethosu_subgraph *subgraph,
 
    if (DBG_ENABLED(ETHOSU_DBG_DUMP_LOWERING))
       ethosu_dump_operations(subgraph, "ethosu_insert_dma_operations");
+
+   ethosu_allocate_tensors(subgraph, required_sizes);
+   free(required_sizes);
+
+   if (DBG_ENABLED(ETHOSU_DBG_DUMP_LOWERING))
+      ethosu_dump_operations(subgraph, "ethosu_allocate_tensors");
 
    ethosu_duplicate_batch_operations(subgraph);
 

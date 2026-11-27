@@ -324,6 +324,10 @@ impl nir_intrinsic_instr {
         self.get_const_index(NIR_INTRINSIC_STREAM_ID)
     }
 
+    pub fn binding(&self) -> u32 {
+        self.get_const_index(NIR_INTRINSIC_BINDING)
+    }
+
     pub fn component(&self) -> u32 {
         self.get_const_index(NIR_INTRINSIC_COMPONENT)
     }
@@ -375,6 +379,10 @@ impl nir_intrinsic_instr {
 
     pub fn align_offset(&self) -> u32 {
         self.get_const_index(NIR_INTRINSIC_ALIGN_OFFSET)
+    }
+
+    pub fn offset_shift(&self) -> u32 {
+        self.get_const_index(NIR_INTRINSIC_OFFSET_SHIFT)
     }
 
     pub fn execution_scope(&self) -> mesa_scope {
@@ -717,6 +725,13 @@ impl nir_function_impl {
 }
 
 impl nir_function {
+    pub fn name(&self) -> Option<&str> {
+        if self.name.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(self.name).to_str().ok() }
+    }
+
     pub fn get_impl(&self) -> Option<&nir_function_impl> {
         unsafe { self.impl_.as_ref() }
     }

@@ -439,11 +439,16 @@ st_prepare_vertex_program(struct gl_program *prog)
    stvp->num_inputs = util_bitcount64(prog->info.inputs_read);
    stvp->vert_attrib_mask = prog->info.inputs_read;
 
-   /* Compute mapping of vertex program outputs to slots. */
+   /* Compute mapping of vertex program outputs to slots. This is only used
+    * by the draw module, which uses the raster position copy if there is one.
+    */
+   uint64_t outputs_written = prog->raster_pos_serialized_nir ?
+      stvp->raster_pos_outputs_written : prog->info.outputs_written;
+
    memset(stvp->result_to_output, ~0, sizeof(stvp->result_to_output));
    unsigned num_outputs = 0;
    for (unsigned attr = 0; attr < VARYING_SLOT_MAX; attr++) {
-      if (prog->info.outputs_written & BITFIELD64_BIT(attr))
+      if (outputs_written & BITFIELD64_BIT(attr))
          stvp->result_to_output[attr] = num_outputs++;
    }
    /* pre-setup potentially unused edgeflag output */
@@ -675,7 +680,8 @@ static const struct nir_shader_compiler_options draw_nir_options = {
 static struct nir_shader *
 get_nir_shader(struct st_context *st, struct gl_program *prog, bool is_draw)
 {
-   if ((!is_draw || !st->ctx->Const.PackedDriverUniformStorage) && prog->nir) {
+   if ((!is_draw || (!st->ctx->Const.PackedDriverUniformStorage &&
+                     !prog->raster_pos_serialized_nir)) && prog->nir) {
       nir_shader *nir = prog->nir;
 
       if (nir->info.stage == MESA_SHADER_VERTEX)
@@ -694,7 +700,10 @@ get_nir_shader(struct st_context *st, struct gl_program *prog, bool is_draw)
    const struct nir_shader_compiler_options *options =
       is_draw ? &draw_nir_options : st->screen->nir_options[prog->info.stage];
 
-   if (is_draw && st->ctx->Const.PackedDriverUniformStorage) {
+   if (is_draw && prog->raster_pos_serialized_nir) {
+      blob_reader_init(&blob_reader, prog->raster_pos_serialized_nir,
+                       prog->raster_pos_serialized_nir_size);
+   } else if (is_draw && st->ctx->Const.PackedDriverUniformStorage) {
       assert(prog->base_serialized_nir);
       blob_reader_init(&blob_reader, prog->base_serialized_nir, prog->base_serialized_nir_size);
    } else {
@@ -1025,9 +1034,12 @@ st_get_common_variant(struct st_context *st,
 
          if (prog->info.stage == MESA_SHADER_VERTEX) {
             struct gl_vertex_program *vp = (struct gl_vertex_program *)prog;
+            uint32_t attrib_mask =
+               key->is_draw_shader && prog->raster_pos_serialized_nir ?
+                  vp->raster_pos_attrib_mask : vp->vert_attrib_mask;
 
             v->vert_attrib_mask =
-               vp->vert_attrib_mask |
+               attrib_mask |
                (key->passthrough_edgeflags ? VERT_BIT_EDGEFLAG : 0);
          }
 
@@ -1112,9 +1124,9 @@ st_nir_lower_external_samplers(nir_shader *nir,
                                const struct st_external_sampler_key *key)
 {
    nir_lower_tex_options options = {0};
-   options.lower_y_uv_external = key->lower_nv12;
-   options.lower_y_vu_external = key->lower_nv21;
-   options.lower_y_u_v_external = key->lower_iyuv;
+   options.lower_y_uv_external = key->lower_semi_planar;
+   options.lower_y_vu_external = key->lower_semi_planar_vu;
+   options.lower_y_u_v_external = key->lower_planar;
    options.lower_xy_uxvx_external = key->lower_xy_uxvx;
    options.lower_xy_vxux_external = key->lower_xy_vxux;
    options.lower_yx_xuxv_external = key->lower_yx_xuxv;
@@ -1127,6 +1139,7 @@ st_nir_lower_external_samplers(nir_shader *nir,
    options.lower_y41x_external = key->lower_y41x;
    options.lower_sx10_external = key->lower_sx10;
    options.lower_sx12_external = key->lower_sx12;
+   options.yuv_msb_aligned_external = key->yuv_msb_aligned;
    options.bt709_external = key->bt709;
    options.bt2020_external = key->bt2020;
    options.yuv_full_range_external = key->yuv_full_range;
@@ -1146,10 +1159,10 @@ st_nir_lower_external_sampler_planes(nir_shader *nir,
                                      unsigned free_slots)
 {
    NIR_PASS(_, nir, st_nir_lower_tex_src_plane, free_slots,
-            key->lower_nv12 | key->lower_nv21 |
+            key->lower_semi_planar | key->lower_semi_planar_vu |
                key->lower_xy_uxvx | key->lower_xy_vxux |
                key->lower_yx_xuxv | key->lower_yx_xvxu,
-            key->lower_iyuv);
+            key->lower_planar);
 }
 
 static struct st_fp_variant *
@@ -1306,8 +1319,9 @@ st_create_fp_variant(struct st_context *st,
 
    bool need_lower_tex_src_plane = false;
 
-   if (unlikely(key->external.lower_nv12 || key->external.lower_nv21 ||
-                  key->external.lower_iyuv ||
+   if (unlikely(key->external.lower_semi_planar ||
+                  key->external.lower_semi_planar_vu ||
+                  key->external.lower_planar ||
                   key->external.lower_xy_uxvx || key->external.lower_yx_xuxv ||
                   key->external.lower_yx_xvxu || key->external.lower_xy_vxux ||
                   key->external.lower_ayuv || key->external.lower_xyuv ||
@@ -1618,6 +1632,20 @@ st_serialize_nir(struct gl_program *prog)
       nir_serialize(&blob, prog->nir, false);
       blob_finish_get_buffer(&blob, &prog->serialized_nir, &size);
       prog->serialized_nir_size = size;
+   }
+}
+
+void
+st_serialize_raster_pos_nir(struct gl_program *prog, nir_shader *nir)
+{
+   if (!prog->raster_pos_serialized_nir) {
+      struct blob blob;
+      size_t size;
+
+      blob_init(&blob);
+      nir_serialize(&blob, nir, false);
+      blob_finish_get_buffer(&blob, &prog->raster_pos_serialized_nir, &size);
+      prog->raster_pos_serialized_nir_size = size;
    }
 }
 

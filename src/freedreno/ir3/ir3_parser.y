@@ -31,7 +31,7 @@ struct ir3 * ir3_parse(struct ir3_shader_variant *v,
 
 %{
 #define YYDEBUG 0
-#include "ir3/ir3_parser_support.c"
+#include "ir3/ir3_parser_support.h"
 %}
 
 %union {
@@ -1186,6 +1186,12 @@ cat6_bindless_ldc: cat6_bindless_ldc_opc '.' cat6_bindless_ldc_middle ',' cat6_r
                       instr->cat6.type = TYPE_U32;
                       /* TODO cleanup ir3 src order: */
                       swap(instr->srcs[0], instr->srcs[1]);
+                   }
+                   /* a4xx, with the UBO address in a register: */
+|                  cat6_bindless_ldc_opc '.' cat6_bindless_ldc_middle ',' 'g' '[' src ']' ',' cat6_reg_or_immed ',' cat6_reg_or_immed {
+                      instr->cat6.type = TYPE_U32;
+                      /* srcs are (UBO, offset, address), as in ir3-cat6.xml: */
+                      swap(instr->srcs[0], instr->srcs[2]);
                    }
 
 const_dst:        integer { new_src(0, IR3_REG_IMMED)->iim_val = $1; }

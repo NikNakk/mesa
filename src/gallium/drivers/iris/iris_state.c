@@ -1556,6 +1556,19 @@ iris_init_render_context(struct iris_batch *batch)
    init_aux_map_state(batch);
 #endif
 
+#if GFX_VERx10 >= 350
+   const uint32_t memory_urb_size_per_slice = intel_device_info_memory_urb_size_per_slice(devinfo);
+   struct iris_address urb_memory_addr = { .bo = iris_bufmgr_get_urb_memory_bo(batch->screen->bufmgr) };
+
+   iris_emit_cmd(batch, GENX(3DSTATE_URB_MEMORY), urb_memory) {
+      urb_memory.body.VertexMemoryURBmodeEnable = true;
+      urb_memory.body.MemoryinStolenMemoryDisable = !intel_device_info_memory_urb_is_allocated_in_stolen(devinfo);
+      urb_memory.body.VertexMemoryURBsizeperslice = (memory_urb_size_per_slice / (256 * 1024)) - 1;
+      urb_memory.body.MemoryURBStartingAddress = urb_memory_addr;
+      urb_memory.body.MOCS = iris_mocs(urb_memory_addr.bo, &batch->screen->isl_dev, 0);
+   }
+#endif
+
    iris_batch_sync_region_end(batch);
 }
 
@@ -1694,7 +1707,7 @@ iris_init_compute_context(struct iris_batch *batch)
 #endif
 
 #if GFX_VERx10 >= 125
-   if (GFX_VERx10 >= 350 && iris_bufmgr_is_eff_64bit_enabled(batch->screen->bufmgr)) {
+   if (!(GFX_VERx10 >= 350 && iris_bufmgr_is_eff_64bit_enabled(batch->screen->bufmgr))) {
       iris_emit_cmd(batch, GENX(CFE_STATE), cfe) {
          cfe.MaximumNumberofThreads =
             devinfo->max_cs_threads * devinfo->subslice_total;
@@ -4927,7 +4940,7 @@ iris_compute_sbe_urb_read_interval(struct iris_compiled_shader *fs_shader,
    brw_compute_sbe_per_vertex_urb_read(last_vue_map,
                                        false /* mesh */,
                                        false /* per_primitive_remapping */,
-                                       brw_fs_prog_data(fs_shader->brw_prog_data),
+                                       &fs_shader->info,
                                        out_offset, out_length, &num_varyings,
                                        &primid_offset, &flat_inputs);
 #else
@@ -5276,7 +5289,7 @@ iris_store_vs_state(const struct iris_screen *screen,
          vue_data->cull_distance_mask;
 #if GFX_VER >= 30
       vs.RegistersPerThread =
-         intel_register_blocks(devinfo, shader->brw_prog_data->grf_used);
+         intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
    }
 }
@@ -5327,7 +5340,7 @@ iris_store_tcs_state(const struct iris_screen *screen,
 
 #if GFX_VER >= 30
       hs.RegistersPerThread =
-         intel_register_blocks(devinfo, shader->brw_prog_data->grf_used);
+         intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
    }
 }
@@ -5362,7 +5375,7 @@ iris_store_tes_state(const struct iris_screen *screen,
 
 #if GFX_VER >= 30
       ds.RegistersPerThread =
-         intel_register_blocks(devinfo, shader->brw_prog_data->grf_used);
+         intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
    }
 
@@ -5446,7 +5459,7 @@ iris_store_gs_state(const struct iris_screen *screen,
 
 #if GFX_VER >= 30
       gs.RegistersPerThread =
-         intel_register_blocks(devinfo, shader->brw_prog_data->grf_used);
+         intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
    }
 }
@@ -5479,7 +5492,7 @@ iris_store_fs_state(const struct iris_screen *screen,
 
 #if GFX_VER >= 30
       ps.RegistersPerThread =
-         intel_register_blocks(devinfo, shader->brw_prog_data->grf_used);
+         intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
 
       /* From the documentation for this packet:
@@ -5583,8 +5596,7 @@ iris_store_cs_state(const struct iris_screen *screen,
 #endif
 #if GFX_VER >= 30
       desc.RegistersPerThread =
-         intel_register_blocks(screen->devinfo,
-                               shader->brw_prog_data->grf_used);
+         intel_register_blocks(screen->devinfo, shader->info.grf_used);
 #endif
    }
 }
@@ -7950,13 +7962,16 @@ iris_upload_dirty_render_state(struct iris_context *ice,
             uint32_t ps_state[GENX(3DSTATE_PS_length)] = {0};
             _iris_pack_command(batch, GENX(3DSTATE_PS), ps_state, ps) {
 #if GFX_VER >= 9
-               struct brw_fs_prog_data *fs_prog_data = brw_fs_prog_data(shader->brw_prog_data);
+               intel_set_ps_dispatch_state(&ps, batch->screen->devinfo,
+                                           &shader->info,
+                                           util_framebuffer_get_num_samples(cso_fb),
+                                           0 /* fs_config */);
 #else
                struct elk_fs_prog_data *fs_prog_data = elk_fs_prog_data(shader->elk_prog_data);
-#endif
                intel_set_ps_dispatch_state(&ps, batch->screen->devinfo,
                                            fs_prog_data, util_framebuffer_get_num_samples(cso_fb),
                                            0 /* fs_config */);
+#endif
 
 #if GFX_VER == 12
                assert(fs_data->dispatch_multi == 0 ||
@@ -7972,21 +7987,24 @@ iris_upload_dirty_render_state(struct iris_context *ice,
 
 #if GFX_VER >= 9
                ps.DispatchGRFStartRegisterForConstantSetupData0 =
-                  brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 0);
+                  intel_shader_info_fs_dispatch_grf_start_reg(
+                     &shader->info, ps, 0);
                ps.DispatchGRFStartRegisterForConstantSetupData1 =
-                  brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 1);
+                  intel_shader_info_fs_dispatch_grf_start_reg(
+                     &shader->info, ps, 1);
 #if GFX_VER < 20
                ps.DispatchGRFStartRegisterForConstantSetupData2 =
-                  brw_fs_prog_data_dispatch_grf_start_reg(fs_prog_data, ps, 2);
+                  intel_shader_info_fs_dispatch_grf_start_reg(
+                     &shader->info, ps, 2);
 #endif
 
                ps.KernelStartPointer0 = KSP(shader) +
-                  brw_fs_prog_data_prog_offset(fs_prog_data, ps, 0);
+                  intel_shader_info_fs_prog_offset(&shader->info, ps, 0);
                ps.KernelStartPointer1 = KSP(shader) +
-                  brw_fs_prog_data_prog_offset(fs_prog_data, ps, 1);
+                  intel_shader_info_fs_prog_offset(&shader->info, ps, 1);
 #if GFX_VER < 20
                ps.KernelStartPointer2 = KSP(shader) +
-                  brw_fs_prog_data_prog_offset(fs_prog_data, ps, 2);
+                  intel_shader_info_fs_prog_offset(&shader->info, ps, 2);
 #endif
 #else
                ps.DispatchGRFStartRegisterForConstantSetupData0 =
@@ -9675,7 +9693,7 @@ iris_emit_compute_walker2(struct iris_context *ice,
 
    struct GENX(INTERFACE_DESCRIPTOR_DATA_2) idd = {
       .KernelStartPointer = KSP(shader) + iris_cs_data_prog_offset(cs_data, dispatch.simd_size),
-      .RegistersPerThread = intel_register_blocks(devinfo, shader->brw_prog_data->grf_used),
+      .RegistersPerThread = intel_register_blocks(devinfo, shader->info.grf_used),
       .NumberofThreadsinGPGPUThreadGroup = dispatch.threads,
       .ThreadGroupDispatchSize = intel_compute_threads_group_dispatch_size_walker_2(dispatch.threads),
       .SharedLocalMemorySize = intel_compute_slm_encode_size(GFX_VER, total_shared),
@@ -9808,7 +9826,7 @@ iris_emit_compute_walker(struct iris_context *ice,
    idd.NumberOfBarriers = cs_data->uses_barrier;
 #if GFX_VER >= 30
    idd.RegistersPerThread =
-      intel_register_blocks(devinfo, shader->brw_prog_data->grf_used);
+      intel_register_blocks(devinfo, shader->info.grf_used);
 #endif
 
 struct GENX(COMPUTE_WALKER_BODY) body = {

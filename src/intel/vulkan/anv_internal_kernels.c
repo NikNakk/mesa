@@ -226,7 +226,8 @@ anv_call_internal_shader(nir_builder *b,
          load_param(b, devinfo, 64, struct anv_dgc_gfx_params, seq_count_addr),
          load_param(b, devinfo, 32, struct anv_dgc_gfx_params, max_seq_count),
          load_param(b, devinfo, 32, struct anv_dgc_gfx_params, data_prolog_size),
-         load_param(b, devinfo, 32, struct anv_dgc_gfx_params, flags),
+         load_param(b, devinfo, 32, struct anv_dgc_gfx_params, fs_color_offset),
+         load_param(b, devinfo, 32, struct anv_dgc_gfx_params, fs_color_map),
          load_fragment_index(b));
       return sizeof(struct anv_dgc_gfx_params);
 
@@ -284,7 +285,7 @@ lower_base_workgroup_id(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 static void
-check_sends(struct genisa_stats *stats, unsigned send_count)
+check_sends(const struct genisa_stats *stats, unsigned send_count)
 {
    assert(send_count == 0 || stats->spills == 0);
    assert(send_count == 0 || stats->fills == 0);
@@ -370,8 +371,8 @@ compile_shader(struct anv_device *device,
 
    key.base.use_efficient_64bit = device->physical->uses_efficient_64bit;
 
-   union brw_any_prog_data prog_data;
-   memset(&prog_data, 0, sizeof(prog_data));
+   struct intel_cs_dispatch_params dispatch = {};
+   struct brw_cs_push_const_info cs_push = {};
 
    if (stage == MESA_SHADER_COMPUTE) {
       /* Pick SIMD16, it shouldn't spill prior Xe2 and it's the native size
@@ -380,7 +381,7 @@ compile_shader(struct anv_device *device,
       nir->info.min_subgroup_size = nir->info.max_subgroup_size = 16;
 
       NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics,
-                 device->info, &prog_data.cs);
+                 device->info, &dispatch);
    }
 
    /* Do vectorizing here. For some reason when trying to do it in the back
@@ -397,70 +398,76 @@ compile_shader(struct anv_device *device,
    };
    NIR_PASS(_, nir, nir_opt_load_store_vectorize, &options);
 
-   prog_data.base.push_sizes[0] = uniform_size;
+   struct intel_push_layout push_layout = {
+      .push_sizes[0] = uniform_size,
+   };
 
    void *temp_ctx = ralloc_context(NULL);
 
-   const unsigned *program;
+   const intel_shader_bin *bin;
+   struct anv_shader_internal *kernel = NULL;
    if (stage == MESA_SHADER_FRAGMENT) {
-      struct genisa_stats stats[3] = {};
+      push_layout.push_sizes[0] = align(push_layout.push_sizes[0], REG_SIZE);
+
       struct brw_compile_params params = {
          .mem_ctx = temp_ctx,
          .nir = nir,
          .key = &key.fs.base,
-         .prog_data = (struct brw_stage_prog_data *)&prog_data.fs,
-         .stats = stats,
+         .push_layout = push_layout,
+         .collect_register_pressure = true,
          .log_data = device,
          .debug_flag = DEBUG_WM,
       };
-      prog_data.base.push_sizes[0] = align(prog_data.base.push_sizes[0], REG_SIZE);
-      program = brw_compile(compiler, &params);
-
-      if (!ANV_DEBUG(SHADER_PRINT)) {
-         unsigned stat_idx = 0;
-         if (prog_data.fs.dispatch_8) {
-            check_sends(&stats[stat_idx++], sends_count_expectation);
-         }
-         if (prog_data.fs.dispatch_16) {
-            check_sends(&stats[stat_idx++], sends_count_expectation);
-         }
-         if (prog_data.fs.dispatch_32) {
-            check_sends(&stats[stat_idx++], sends_count_expectation *
-                                            (device->info->ver < 20 ? 2 : 1));
-         }
-      } else {
-         for (uint32_t i = 0; i < ARRAY_SIZE(stats); i++) {
-            assert(stats[i].spills == 0);
-            assert(stats[i].fills == 0);
-         }
-      }
+      bin = brw_compile(compiler, &params);
    } else {
-      brw_cs_fill_push_const_info(device->info, &prog_data.cs, -1);
-      prog_data.base.push_sizes[0] = align(prog_data.base.push_sizes[0], REG_SIZE);
+      brw_cs_fill_push_const_info(device->info, &push_layout, -1, &cs_push);
+      push_layout.push_sizes[0] = align(push_layout.push_sizes[0], REG_SIZE);
 
-      struct genisa_stats stats;
       struct brw_compile_params params = {
          .mem_ctx = temp_ctx,
          .nir = nir,
          .key = &key.cs.base,
-         .prog_data = (struct brw_stage_prog_data *)&prog_data.cs,
-         .stats = &stats,
+         .push_layout = push_layout,
+         .collect_register_pressure = true,
          .log_data = device,
          .debug_flag = DEBUG_CS,
+         .cs = {
+            .dispatch = dispatch,
+            .push = cs_push,
+         },
       };
-      program = brw_compile(compiler, &params);
+      bin = brw_compile(compiler, &params);
+   }
 
+   assert(bin != NULL);
+   if (bin == NULL)
+      goto exit;
+
+   if (stage == MESA_SHADER_FRAGMENT) {
       if (!ANV_DEBUG(SHADER_PRINT)) {
-         check_sends(&stats, sends_count_expectation);
+         unsigned stat_idx = 0;
+         if (bin->info.fs.dispatch_8) {
+            check_sends(&bin->stats[stat_idx++], sends_count_expectation);
+         }
+         if (bin->info.fs.dispatch_16) {
+            check_sends(&bin->stats[stat_idx++], sends_count_expectation);
+         }
+         if (bin->info.fs.dispatch_32) {
+            check_sends(&bin->stats[stat_idx++], sends_count_expectation *
+                                            (device->info->ver < 20 ? 2 : 1));
+         }
+      } else {
+         for (uint32_t i = 0; i < bin->num_stats; i++) {
+            assert(bin->stats[i].spills == 0);
+            assert(bin->stats[i].fills == 0);
+         }
       }
+   } else if (!ANV_DEBUG(SHADER_PRINT)) {
+      check_sends(&bin->stats[0], sends_count_expectation);
    }
 
    /* Complex shaders are allowed to spill */
-   assert(sends_count_expectation == 0 || prog_data.base.total_scratch == 0);
-   assert(program != NULL);
-   struct anv_shader_internal *kernel = NULL;
-   if (program == NULL)
-      goto exit;
+   assert(sends_count_expectation == 0 || bin->info.total_scratch == 0);
 
    struct anv_pipeline_bind_map empty_bind_map = {};
    struct anv_push_descriptor_info empty_push_desc_info = {};
@@ -468,10 +475,7 @@ compile_shader(struct anv_device *device,
       .stage               = nir->info.stage,
       .key_data            = hash_key,
       .key_size            = hash_key_size,
-      .kernel_data         = program,
-      .kernel_size         = prog_data.base.program_size,
-      .prog_data           = &prog_data.base,
-      .prog_data_size      = sizeof(prog_data),
+      .bin                 = bin,
       .bind_map            = &empty_bind_map,
       .push_desc_info      = &empty_push_desc_info,
    };

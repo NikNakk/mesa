@@ -13,20 +13,13 @@
 
 #include "util/u_math.h"
 
-static const uint32_t ac_sdma_t2t_alignment_2d_and_planar[][3] = {
-   {16, 16, 1}, /* 1 bpp */
-   {16, 8, 1},  /* 2 bpp */
-   {8, 8, 1},   /* 4 bpp */
-   {8, 4, 1},   /* 8 bpp */
-   {4, 4, 1},   /* 16 bpp */
-};
-
-static const uint32_t ac_sdma_t2t_alignment_3d[][3] = {
-   {8, 4, 8}, /* 1 bpp */
-   {4, 4, 8}, /* 2 bpp */
-   {4, 4, 4}, /* 4 bpp */
-   {4, 2, 4}, /* 8 bpp */
-   {2, 2, 4}, /* 16 bpp */
+/* SDMA 4.x only. (1KB blocks) */
+static const uint32_t ac_sdma4_t2t_alignment_3d[][3] = {
+   {16, 8, 8}, /* 1 bpp */
+   {8, 8, 8},  /* 2 bpp */
+   {8, 8, 4},  /* 4 bpp */
+   {8, 4, 4},  /* 8 bpp */
+   {4, 4, 4},  /* 16 bpp */
 };
 
 static const uint32_t ac_sdma_t2t_thick_z_alignment_sdma2[] = {
@@ -747,22 +740,27 @@ ac_sdma_check_t2t_alignment(const struct radeon_info *const info,
    uint32_t z_alignment = 1;
 
    if (ver >= SDMA_4_0) {
-      bool needs_3d_alignment = src->surf->u.gfx9.resource_type == RADEON_RESOURCE_3D;
+      const ac_block_extent *blk = src->is_stencil ? &src->surf->stencil_block256B_extent
+                                                   : &src->surf->block256B_extent;
 
-      /* Only for 3D standard/displayable swizzle modes. */
-      if (ver < SDMA_7_0)
-         needs_3d_alignment &= (src->surf->micro_tile_mode == RADEON_MICRO_MODE_DISPLAY ||
-                                src->surf->micro_tile_mode == RADEON_MICRO_MODE_STANDARD);
+      if (ver < SDMA_5_0 && blk->depth > 1) {
+         const uint32_t *alignment = ac_sdma4_t2t_alignment_3d[log2bpp];
 
-      x_alignment = needs_3d_alignment
-                    ? ac_sdma_t2t_alignment_3d[log2bpp][0]
-                    : ac_sdma_t2t_alignment_2d_and_planar[log2bpp][0];
-      y_alignment = needs_3d_alignment
-                    ? ac_sdma_t2t_alignment_3d[log2bpp][1]
-                    : ac_sdma_t2t_alignment_2d_and_planar[log2bpp][1];
-      z_alignment = needs_3d_alignment
-                    ? ac_sdma_t2t_alignment_3d[log2bpp][2]
-                    : ac_sdma_t2t_alignment_2d_and_planar[log2bpp][2];
+         x_alignment = alignment[0];
+         y_alignment = alignment[1];
+         z_alignment = alignment[2];
+      } else if (ver == SDMA_5_0 && blk->depth == 1 && log2bpp <= 1) {
+         /* On SDMA5, block256B_extent is a larger block for 1-2 bpe, but only
+          * 256B alignment is needed.
+          */
+         x_alignment = 16;
+         y_alignment = log2bpp == 0 ? 16 : 8;
+         z_alignment = 1;
+      } else {
+         x_alignment = blk->width;
+         y_alignment = blk->height;
+         z_alignment = blk->depth;
+      }
    } else {
       const uint32_t src_tile_index = ac_surface_get_legacy_tiling_index(src->surf, src->first_level, src->is_stencil);
       const uint32_t src_tile_mode = info->si_tile_mode_array[src_tile_index];

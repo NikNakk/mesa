@@ -111,12 +111,10 @@ impl SPIRVBin {
         features: clc_optional_features,
         spirv_extensions: &[&CStr],
         address_bits: u32,
+        use_llvm_spirv_target: bool,
     ) -> (Option<Self>, CString) {
         let mut hash_key = None;
         let has_includes = args.iter().any(|a| a.as_bytes()[0..2] == *b"-I");
-
-        let mut spirv_extensions: Vec<_> = spirv_extensions.iter().map(|s| s.as_ptr()).collect();
-        spirv_extensions.push(ptr::null());
 
         if let Some(cache) = cache {
             if !has_includes {
@@ -129,6 +127,10 @@ impl SPIRVBin {
                     key.extend_from_slice(h.name.as_bytes());
                     key.extend_from_slice(h.source.as_bytes());
                 });
+                spirv_extensions.iter().for_each(|spv_ext| {
+                    key.extend_from_slice(spv_ext.to_bytes());
+                });
+                key.push(use_llvm_spirv_target.into());
 
                 // Safety: clc_optional_features is a struct of bools and contains no padding.
                 // Sadly we can't guarentee this.
@@ -142,6 +144,9 @@ impl SPIRVBin {
                 hash_key = Some(key);
             }
         }
+
+        let mut spirv_extensions: Vec<_> = spirv_extensions.iter().map(|s| s.as_ptr()).collect();
+        spirv_extensions.push(ptr::null());
 
         let c_headers: Vec<_> = headers
             .iter()
@@ -164,7 +169,7 @@ impl SPIRVBin {
             num_args: c_args.len() as u32,
             spirv_version: clc_spirv_version::CLC_SPIRV_VERSION_MAX,
             features: features,
-            use_llvm_spirv_target: false,
+            use_llvm_spirv_target: use_llvm_spirv_target,
             allowed_spirv_extensions: spirv_extensions.as_ptr(),
             c_compatible: false,
             address_bits: address_bits,

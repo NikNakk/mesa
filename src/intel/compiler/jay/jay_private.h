@@ -32,19 +32,21 @@ bool jay_nir_lower_bool(nir_shader *nir);
 bool jay_nir_lower_algebraic(nir_shader *nir, unsigned verx10);
 bool jay_nir_lower_bfloat_math(nir_shader *nir);
 
-void jay_populate_prog_data(const struct intel_device_info *devinfo,
-                            nir_shader *nir,
-                            union brw_any_prog_data *prog_data,
-                            union brw_any_prog_key *key,
-                            struct jay_fs_perprim_data *fs_perprim);
+void jay_populate_shader_info(const struct intel_device_info *devinfo,
+                              nir_shader *nir,
+                              struct intel_shader_info *info,
+                              union brw_any_prog_key *key,
+                              struct jay_fs_perprim_data *fs_perprim);
 void jay_process_nir(const struct intel_device_info *devinfo,
                      const struct jay_compile_params *params,
-                     struct jay_fs_perprim_data *fs_perprim);
+                     struct jay_fs_perprim_data *fs_perprim,
+                     struct intel_shader_info *info);
 unsigned jay_select_simd(const struct intel_device_info *, nir_shader *nir);
 void jay_process_nir_for_simd(const struct intel_device_info *devinfo,
                               const struct jay_compile_params *params,
                               unsigned simd_width,
-                              bool *track_helpers);
+                              bool *track_helpers,
+                              struct intel_shader_info *info);
 
 void jay_compute_liveness(jay_function *f);
 void jay_calculate_last_use(jay_function *func);
@@ -117,6 +119,8 @@ void jay_lower_scoreboard_trivial(jay_shader *s);
 void
 jay_lower_post_sched(jay_shader *shader, uint32_t api, uint32_t float_sizes);
 
+bool jay_try_swap_src01(jay_inst *I);
+
 gen_pipe jay_inferred_sync_pipe(const struct intel_device_info *devinfo,
                                 const jay_inst *I);
 gen_pipe jay_inst_exec_pipe(const struct intel_device_info *devinfo,
@@ -125,10 +129,10 @@ gen_pipe jay_inst_exec_pipe(const struct intel_device_info *devinfo,
 unsigned jay_latency(jay_shader *s, jay_inst *I, bool bias_acc);
 unsigned jay_estimate_cycles(jay_function *f);
 
-struct jay_shader_bin *jay_to_binary(jay_shader *s,
-                                     void *const_data,
-                                     size_t const_data_size,
-                                     bool debug);
+intel_shader_bin *jay_to_binary(jay_shader *s,
+                                void *const_data,
+                                size_t const_data_size,
+                                bool debug);
 
 /*
  * Check whether the Early EOT feature is possibly enabled. This feature was

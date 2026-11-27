@@ -426,6 +426,7 @@ struct radeon_info {
    /* Shader cores. */
    uint16_t cu_mask[AMD_MAX_SE][AMD_MAX_SA_PER_SE];
    uint32_t r600_max_quad_pipes; /* wave size / 16 */
+   uint32_t max_good_cu_per_se;
    uint32_t max_good_cu_per_sa;
    uint32_t min_good_cu_per_sa; /* min != max if SAs have different # of CUs */
    uint32_t max_se;             /* number of shader engines incl. disabled ones */
@@ -529,8 +530,8 @@ void ac_get_raster_config(const struct radeon_info *info, uint32_t *raster_confi
 void ac_get_harvested_configs(const struct radeon_info *info, unsigned raster_config,
                               unsigned *cik_raster_config_1_p, unsigned *raster_config_se);
 unsigned ac_get_compute_resource_limits(const struct radeon_info *info,
-                                        unsigned waves_per_threadgroup, unsigned max_waves_per_sh,
-                                        unsigned threadgroups_per_cu);
+                                        unsigned waves_per_workgroup, unsigned max_waves_per_sh,
+                                        unsigned workgroups_per_cu);
 
 /* Task rings BO layout information.
  * This BO is shared between GFX and ACE queues so that the ACE and GFX

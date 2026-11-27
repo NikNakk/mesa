@@ -227,7 +227,9 @@ postprocess_gfx_sequences(struct anv_cmd_buffer *cmd_buffer,
 
       .data_prolog_size = layout->data_prolog_size,
 
-      .flags = gfx->att_states.offset,
+      .fs_color_offset = gfx->att_states.offset,
+      .fs_color_map = anv_get_fs_color_map(&cmd_buffer->vk.dynamic_graphics_state.cal,
+                                           gfx->color_att_count),
    };
 
    genX(emit_simple_shader_dispatch)(&simple_state,
@@ -638,21 +640,23 @@ preprocess_rt_sequences(struct anv_cmd_buffer *cmd_buffer,
       anv_cmd_buffer_alloc_temporary_state(
          cmd_buffer, cw_state_size, 8);
 
-   const struct brw_cs_prog_data *cs_prog_data =
-      brw_cs_prog_data_const(device->rt_trampoline->prog_data);
    struct intel_cs_dispatch_info dispatch =
-      brw_cs_get_dispatch_info(device->info, cs_prog_data, NULL);
+      brw_cs_get_dispatch_info(device->info,
+                               &device->rt_trampoline->bin->info, NULL);
+   UNUSED const bool uses_sampler =
+      device->rt_trampoline->bin->info.cs.uses_sampler;
 
    if (GFX_VERx10 >= 350 && device->physical->uses_efficient_64bit) {
 #if GFX_VERx10 >= 350
       uint8_t pixel_async_compute_thread_limit, z_pass_async_compute_thread_limit,
          np_z_async_throttle_settings;
-      const bool slm_or_barrier_enabled = cs_prog_data->base.total_shared != 0 ||
-                                          cs_prog_data->uses_barrier;
+      const bool slm_or_barrier_enabled =
+         device->rt_trampoline->bin->info.total_shared != 0 ||
+         device->rt_trampoline->bin->info.wg.uses_barrier;
 
       intel_compute_engine_async_threads_limit(device->info, dispatch.threads,
                                                slm_or_barrier_enabled,
-                                               cs_prog_data->uses_fence,
+                                               device->rt_trampoline->bin->info.cs.uses_fence,
                                                &pixel_async_compute_thread_limit,
                                                &z_pass_async_compute_thread_limit,
                                                &np_z_async_throttle_settings);
@@ -666,15 +670,15 @@ preprocess_rt_sequences(struct anv_cmd_buffer *cmd_buffer,
             .MessageSIMD                    = dispatch.simd_size / 16,
             .ExecutionMask                  = dispatch.right_mask,
             .EmitInlineParameter            = true,
-            .DispatchWalkOrder              = cs_prog_data->uses_sampler ? MortonWalk : LinearWalk,
-            .ThreadGroupBatchSize           = cs_prog_data->uses_sampler ? TG_BATCH_4 : TG_BATCH_1,
+            .DispatchWalkOrder              = uses_sampler ? MortonWalk : LinearWalk,
+            .ThreadGroupBatchSize           = uses_sampler ? TG_BATCH_4 : TG_BATCH_1,
             .Post_sync_opn0.MOCS            = anv_mocs(device, NULL, 0),
             .Post_sync_opn1.MOCS            = anv_mocs(device, NULL, 0),
             .Post_sync_opn2.MOCS            = anv_mocs(device, NULL, 0),
             .Post_sync_opn3.MOCS            = anv_mocs(device, NULL, 0),
             .InterfaceDescriptor            = (struct GENX(INTERFACE_DESCRIPTOR_DATA_2)) {
                .KernelStartPointer                = anv_shader_get_pointer(device, &device->rt_trampoline->kernel),
-               .RegistersPerThread                = intel_register_blocks(device->info, cs_prog_data->base.grf_used),
+               .RegistersPerThread                = intel_register_blocks(device->info, device->rt_trampoline->bin->info.grf_used),
                .NumberofThreadsinGPGPUThreadGroup = dispatch.threads,
                .ThreadGroupDispatchSize           = intel_compute_threads_group_dispatch_size_walker_2(dispatch.threads),
                .BTDmode                           = true,
@@ -698,8 +702,8 @@ preprocess_rt_sequences(struct anv_cmd_buffer *cmd_buffer,
             .EmitInlineParameter            = true,
 #if GFX_VER >= 30
             /* HSD 14016252163 */
-            .DispatchWalkOrder = cs_prog_data->uses_sampler ? MortonWalk : LinearWalk,
-            .ThreadGroupBatchSize = cs_prog_data->uses_sampler ? TG_BATCH_4 : TG_BATCH_1,
+            .DispatchWalkOrder = uses_sampler ? MortonWalk : LinearWalk,
+            .ThreadGroupBatchSize = uses_sampler ? TG_BATCH_4 : TG_BATCH_1,
 #endif
             .PostSync.MOCS                  = anv_mocs(device, NULL, 0),
             .InterfaceDescriptor            = (struct GENX(INTERFACE_DESCRIPTOR_DATA)) {
@@ -712,7 +716,7 @@ preprocess_rt_sequences(struct anv_cmd_buffer *cmd_buffer,
 #if GFX_VER >= 30
                .RegistersPerThread =
                intel_register_blocks(device->info,
-                                     cs_prog_data->base.grf_used),
+                                     device->rt_trampoline->bin->info.grf_used),
 #endif
             },
          },
@@ -923,9 +927,9 @@ void genX(CmdExecuteGeneratedCommandsEXT)(
             cmd_buffer, cmd_buffer, layout, pGeneratedCommandsInfo,
             ANV_INTERNAL_KERNEL_DGC_GFX_FRAGMENT);
       } else if (device->physical->uses_efficient_64bit) {
-         /* Efficient 64bit uses a push constant dword for the render target
-          * surface states. We only know the render targets at this point so
-          * we need a postprocess shader here.
+         /* Efficient 64bit uses push constants for the render target surface
+          * states and their mapping. These are known at execution time, so
+          * update the preprocessed constants here.
           */
          postprocess_gfx_sequences(cmd_buffer, layout, indirect_set,
                                    pGeneratedCommandsInfo);
@@ -967,6 +971,8 @@ void genX(CmdExecuteGeneratedCommandsEXT)(
       if (cmd_buffer->state.conditional_render_enabled)
          genX(cmd_emit_conditional_render_predicate)(cmd_buffer);
 
+      bool apply_pipe_flushes = false;
+
 #if GFX_VER == 9
       /* Gfx9 has a VF cache issues (only considers the bottom 32bit of the VF
        * buffer address), since we're likely to emit those in the DGC buffer,
@@ -979,7 +985,7 @@ void genX(CmdExecuteGeneratedCommandsEXT)(
                                 VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                                 ANV_PIPE_VF_CACHE_INVALIDATE_BIT,
                                 "Gfx9 VF cache inval pre dgc exec");
-      genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
+      apply_pipe_flushes = true;
 #endif
 
       /* If a shader runs, flush the data to make it visible to CS. */
@@ -991,7 +997,7 @@ void genX(CmdExecuteGeneratedCommandsEXT)(
                                    ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT |
                                    ANV_PIPE_CS_STALL_BIT,
                                    "after generated commands");
-         genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
+         apply_pipe_flushes = true;
       }
 
 #if GFX_VER >= 35
@@ -999,15 +1005,22 @@ void genX(CmdExecuteGeneratedCommandsEXT)(
          /* Unfortunately we need a TOP wait, the push constant data could
           * be gathered by prerasterization shader and cached at the point,
           * even if only used by a later fragment shader. We only need to
-          * invalidate the constant cache.
+          * invalidate the constant cache before executing generated commands.
+          * Use a CS stall to force a PIPE_CONTROL barrier before the generated
+          * commands read the updated data.
           */
          anv_add_pending_pipe_bits(cmd_buffer,
                                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR,
                                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-                                   ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT,
+                                   ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT |
+                                   ANV_PIPE_CS_STALL_BIT,
                                    "efficient 64bit postprocess");
+         apply_pipe_flushes = true;
       }
 #endif
+
+      if (apply_pipe_flushes)
+         genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
 
 #if GFX_VER >= 12
       /* Prior to Gfx12 we cannot disable the CS prefetch but it doesn't matter

@@ -1368,6 +1368,7 @@ tu_knl_drm_virtio_load(struct tu_instance *instance,
    device->ubwc_config.bank_swizzle_levels = bank_swizzle_levels;
    device->ubwc_config.macrotile_mode = macrotile_mode;
 
+   fd_dev_check_gmem_size(&device->dev_id, device->gmem_size);
    device->gmem_size = debug_get_num_option("TU_GMEM", device->gmem_size);
 
    device->has_cached_coherent_memory = caps.u.msm.has_cached_coherent;
@@ -1390,7 +1391,6 @@ tu_knl_drm_virtio_load(struct tu_instance *instance,
    device->sync_types[2] = NULL;
 
    device->heap.size = tu_get_system_heap_size(device);
-   device->heap.used = 0u;
    device->heap.flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
 
    instance->knl = &virtio_knl_funcs;

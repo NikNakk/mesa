@@ -637,6 +637,8 @@ fd_init_screen_caps(struct fd_screen *screen)
     */
    caps->gl_clamp = is_a2xx(screen);
 
+   caps->needs_split_planar_samplers = true;
+
    caps->clip_planes =
       /* Gens that support GS, have GS lowered into a quasi-VS which confuses
        * the frontend clip-plane lowering.  So we handle this in the backend
@@ -765,6 +767,7 @@ fd_init_screen_caps(struct fd_screen *screen)
             BITFIELD_MASK(MESA_SHADER_STAGES);
          caps->shader_subgroup_supported_features |=
             PIPE_SHADER_SUBGROUP_FEATURE_QUAD;
+         caps->shader_subgroup_quad_all_stages = true;
       }
 
       caps->shader_ballot = caps->shader_subgroup_size <= 64;
@@ -1014,6 +1017,7 @@ fd_screen_create(int fd,
       DBG("could not get GMEM size");
       goto fail;
    }
+   uint32_t kernel_gmem_size = val;
    screen->gmemsize_bytes = debug_get_num_option("FD_MESA_GMEM", val);
 
    if (fd_device_version(dev) >= FD_VERSION_GMEM_BASE) {
@@ -1034,6 +1038,7 @@ fd_screen_create(int fd,
       screen->has_timestamp = true;
 
    screen->dev_id = fd_pipe_dev_id(screen->pipe);
+   fd_dev_check_gmem_size(screen->dev_id, kernel_gmem_size);
 
    if (fd_pipe_get_param(screen->pipe, FD_GPU_ID, &val)) {
       DBG("could not get gpu-id");
@@ -1197,7 +1202,7 @@ fd_screen_create(int fd,
 
    pscreen->get_timestamp = fd_screen_get_timestamp;
 
-   if (is_a6xx(screen))
+   if (is_a5xx(screen) || is_a6xx(screen))
       pscreen->convert_timestamp = fd_screen_convert_timestamp;
 
    pscreen->fence_reference = _fd_fence_ref;

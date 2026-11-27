@@ -459,8 +459,14 @@ gpu_supports_multisampled_blitter_resolve(const struct etna_screen *screen,
    case PIPE_FORMAT_R16_FLOAT:
    case PIPE_FORMAT_R16G16_FLOAT:
    case PIPE_FORMAT_R11G11B10_FLOAT:
+   case PIPE_FORMAT_R32_FLOAT:
       /* handled by u_blitter */
       return true;
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+      /* handled by u_blitter, rendering needs 64 bit float MSAA in the PE */
+      return VIV_FEATURE(screen, ETNA_FEATURE_MSAA_FLOAT_64BIT);
    default:
       return !VIV_FEATURE(screen, ETNA_FEATURE_BLT_ENGINE) &&
              util_format_get_blocksize(format) <= 4 &&
@@ -477,11 +483,6 @@ gpu_supports_render_format(struct etna_screen *screen, enum pipe_format format,
       return false;
 
    if (util_format_is_srgb(format) && !VIV_FEATURE(screen, ETNA_FEATURE_HALTI3))
-      return false;
-
-   const uint32_t fmt = translate_pe_format(format, screen);
-
-   if (fmt == ETNA_NO_MATCH)
       return false;
 
    if (sample_count > 1) {
@@ -545,10 +546,7 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
    }
 
    if (usage & PIPE_BIND_SAMPLER_VIEW) {
-      uint32_t fmt = ETNA_NO_MATCH;
-
-      if (gpu_supports_texture_format(screen, format))
-         fmt = translate_texture_format(format, screen);
+      bool supported = gpu_supports_texture_format(screen, format);
 
       /* lower_txf_ms_dynamic(..) always fetches four samples, so 4x is the
        * only multisample layout that can be sampled.
@@ -556,9 +554,9 @@ etna_screen_is_format_supported(struct pipe_screen *pscreen,
       if (sample_count > 1 &&
           (sample_count != ETNA_MAX_SAMPLES ||
            !gpu_supports_texture_desc(screen)))
-         fmt = ETNA_NO_MATCH;
+         supported = false;
 
-      if (fmt != ETNA_NO_MATCH)
+      if (supported)
          allowed |= PIPE_BIND_SAMPLER_VIEW;
    }
 
@@ -837,23 +835,21 @@ etna_get_specs(struct etna_screen *screen)
    if (etna_core_has_feature(info, ETNA_FEATURE_CORE_GPU)) {
       instruction_count = info->gpu.max_instructions;
       screen->specs.pixel_pipes = info->gpu.pixel_pipes;
-
-      if (screen->npu)
-         info = etna_gpu_get_core_info(screen->npu);
    }
 
-   if (etna_core_has_feature(info, ETNA_FEATURE_CORE_NPU)) {
-      if (etna_core_has_feature(info, ETNA_FEATURE_NN_XYDP0))
+   if (screen->npu) {
+      const struct etna_core_info *npu_info = etna_gpu_get_core_info(screen->npu);
+
+      if (etna_core_has_feature(npu_info, ETNA_FEATURE_NN_XYDP0))
          screen->specs.nn_core_version = 8;
-      else if (etna_core_has_feature(info, ETNA_FEATURE_VIP_V7))
+      else if (etna_core_has_feature(npu_info, ETNA_FEATURE_VIP_V7))
          screen->specs.nn_core_version = 7;
       else
          screen->specs.nn_core_version = 6;
    }
 
-   screen->info->halti = info->halti;
-   if (screen->info->halti >= 0)
-      DBG("etnaviv: GPU arch: HALTI%d", screen->info->halti);
+   if (info->halti >= 0)
+      DBG("etnaviv: GPU arch: HALTI%d", info->halti);
    else
       DBG("etnaviv: GPU arch: pre-HALTI");
 

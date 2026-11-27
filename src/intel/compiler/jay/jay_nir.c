@@ -204,6 +204,12 @@ jay_nir_lower_simd(nir_builder *b, nir_intrinsic_instr *intr, void *simd_)
       return true;
    }
 
+   case nir_intrinsic_inverse_ballot:
+      /* Likewise for inverse ballots */
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[0], nir_u2uN(b, intr->src[0].ssa, flag_width));
+      return true;
+
    case nir_intrinsic_load_simd_width_intel:
       /* Just a constant */
       nir_def_replace(&intr->def, nir_imm_int(b, simd_width));
@@ -246,6 +252,17 @@ jay_nir_lower_simd(nir_builder *b, nir_intrinsic_instr *intr, void *simd_)
           * indirect register file access.
           */
          nir_def *index = nir_iand_imm(b, intr->src[1].ssa, simd_width - 1);
+         if (intr->intrinsic == nir_intrinsic_read_invocation) {
+            /* read_invocation allows the index to be dynamically uniform
+             * rather than statically convergent (results are undefined if
+             * the index differs across active invocations).  But the result
+             * is always treated as convergent.  Shuffles, on the other hand,
+             * produce a divergent value if their index is divergent.
+             *
+             * Uniformize the index so that our result remains convergent.
+             */
+            index = nir_as_uniform(b, index);
+         }
          nir_def *offset_B = nir_imul_imm(b, index, 4);
          nir_def_replace(&intr->def, nir_shuffle_intel(b, 1, data, offset_B));
       }
@@ -270,9 +287,9 @@ jay_nir_lower_simd(nir_builder *b, nir_intrinsic_instr *intr, void *simd_)
 }
 
 static unsigned int
-calc_control_data_bits_per_vertex(struct brw_gs_prog_data *progdata)
+calc_control_data_bits_per_vertex(struct intel_shader_info *info)
 {
-   unsigned format = progdata->control_data_format;
+   unsigned format = info->gs.control_data_format;
    assert(format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_CUT ||
           format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_SID);
    return format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_CUT ? 1 : 2;
@@ -301,7 +318,7 @@ store_urb_vec4(nir_builder *b,
 }
 
 static void
-emit_gs_control_data_bits(struct brw_gs_prog_data *progdata,
+emit_gs_control_data_bits(struct intel_shader_info *info,
                           const struct intel_device_info *devinfo,
                           nir_builder *b,
                           nir_variable *control_data_bits,
@@ -312,10 +329,10 @@ emit_gs_control_data_bits(struct brw_gs_prog_data *progdata,
 
    nir_def *dword_urb_offset =
       nir_ushr_imm(b, nir_iadd_imm(b, nir_imax_imm(b, vertex_count, 1), -1),
-                   6 - calc_control_data_bits_per_vertex(progdata));
+                   6 - calc_control_data_bits_per_vertex(info));
 
    store_urb_vec4(b, devinfo, curr_control_data_bits, dword_urb_offset,
-                  progdata->static_vertex_count == -1 ? 2 : 0);
+                  info->gs.static_vertex_count == -1 ? 2 : 0);
 }
 
 /* This function is responsible for the code that emits control data bits
@@ -334,14 +351,14 @@ emit_gs_control_data_bits(struct brw_gs_prog_data *progdata,
 static void
 emit_gs_vertex(nir_builder *b,
                const struct intel_device_info *devinfo,
-               struct brw_gs_prog_data *progdata,
+               struct intel_shader_info *info,
                nir_variable *control_data_bits,
                nir_intrinsic_instr *intr)
 {
    nir_src *vertex_count_src = &intr->src[0];
 
    uint32_t control_data_header_size_bits =
-      progdata->control_data_header_size_hwords * 32 * 8;
+      info->gs.control_data_header_size_hwords * 32 * 8;
 
    /* Haswell and later hardware ignores the "Render Stream Select" bits
     * from the 3DSTATE_STREAMOUT packet when the SOL stage is disabled,
@@ -368,15 +385,14 @@ emit_gs_vertex(nir_builder *b,
       nir_def *should_push_vertex = nir_ieq_imm(
          b,
          nir_iand_imm(b, vertex_count_src->ssa,
-                      (1 << (6 - calc_control_data_bits_per_vertex(progdata))) -
-                         1),
+                      (1 << (6 - calc_control_data_bits_per_vertex(info))) - 1),
          0);
       nir_push_if(b, should_push_vertex);
       {
          /* If the vertex index is 0, don't emit anything. */
          nir_push_if(b, nir_ine_imm(b, vertex_count_src->ssa, 0));
          {
-            emit_gs_control_data_bits(progdata, devinfo, b, control_data_bits,
+            emit_gs_control_data_bits(info, devinfo, b, control_data_bits,
                                       vertex_count_src->ssa);
          }
          nir_pop_if(b, NULL);
@@ -391,8 +407,8 @@ emit_gs_vertex(nir_builder *b,
     * stream control bits so it knows what stream
     * the vertex is going to.
     */
-   if (progdata->control_data_header_size_hwords > 0 &&
-       progdata->control_data_format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_SID) {
+   if (info->gs.control_data_header_size_hwords > 0 &&
+       info->gs.control_data_format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_SID) {
       unsigned sid = nir_intrinsic_stream_id(intr);
       assert(sid < 4);
 
@@ -412,7 +428,7 @@ emit_gs_vertex(nir_builder *b,
 
 static void
 set_vert_and_prim_count(nir_builder *b,
-                        struct brw_gs_prog_data *progdata,
+                        struct intel_shader_info *info,
                         nir_intrinsic_instr *intr,
                         nir_variable *final_gs_vertex_count)
 {
@@ -422,15 +438,15 @@ set_vert_and_prim_count(nir_builder *b,
 
 static void
 end_primitive(nir_builder *b,
-              struct brw_gs_prog_data *progdata,
+              struct intel_shader_info *info,
               nir_intrinsic_instr *intr,
               nir_variable *control_data_bits)
 {
    /* Store a control data bit representing the fact that this vertex is the
     * last one in its primitive.
     */
-   if (progdata->control_data_header_size_hwords &&
-       progdata->control_data_format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_CUT) {
+   if (info->gs.control_data_header_size_hwords &&
+       info->gs.control_data_format == GFX7_GS_CONTROL_DATA_FORMAT_GSCTL_CUT) {
 
       nir_def *prev_count = nir_iadd_imm(b, intr->src[0].ssa, -1);
       nir_def *mask =
@@ -456,7 +472,7 @@ remove_gs_outputs_cb(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 struct lower_gs_outputs_cb_data {
    nir_variable *control_data_bits;
    nir_variable *final_gs_vertex_count;
-   struct brw_gs_prog_data *progdata;
+   struct intel_shader_info *info;
    const struct intel_device_info *devinfo;
 };
 
@@ -467,12 +483,12 @@ lower_gs_outputs_cb(nir_builder *b, nir_intrinsic_instr *intr, void *_data)
    b->cursor = nir_before_instr(&intr->instr);
 
    if (intr->intrinsic == nir_intrinsic_emit_vertex_with_counter) {
-      emit_gs_vertex(b, data->devinfo, data->progdata, data->control_data_bits,
+      emit_gs_vertex(b, data->devinfo, data->info, data->control_data_bits,
                      intr);
    } else if (intr->intrinsic == nir_intrinsic_end_primitive_with_counter) {
-      end_primitive(b, data->progdata, intr, data->control_data_bits);
+      end_primitive(b, data->info, intr, data->control_data_bits);
    } else if (intr->intrinsic == nir_intrinsic_set_vertex_and_primitive_count) {
-      set_vert_and_prim_count(b, data->progdata, intr,
+      set_vert_and_prim_count(b, data->info, intr,
                               data->final_gs_vertex_count);
    } else {
       return false;
@@ -595,24 +611,48 @@ lower_demote_to_terminate(nir_builder *b, nir_intrinsic_instr *intr, void *_)
    }
 }
 
+static bool
+lower_fragment_outputs(nir_builder *b, nir_intrinsic_instr *intr, void *_)
+{
+   if (intr->intrinsic != nir_intrinsic_store_render_target_intel) {
+      return false;
+   }
+
+   /* Jay wants omask & stencil to be 16-bit, but intel_nir_lower_fragment_outputs
+    * makes it 32-bit because brw can't handle 16-bit.
+    *
+    * TODO: Delete this pass when we delete brw.
+    */
+   b->cursor = nir_before_instr(&intr->instr);
+   unsigned srcs[2] = { 4 /* omask */, 6 /* stencil */ };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(srcs); ++i) {
+      if (!nir_src_is_undef(intr->src[srcs[i]])) {
+         nir_src_rewrite(&intr->src[srcs[i]],
+                         nir_u2u16(b, intr->src[srcs[i]].ssa));
+      }
+   }
+
+   return true;
+}
+
 /**
  * Do NIR processing that can be shared across all SIMD width variants.
  */
 void
 jay_process_nir(const struct intel_device_info *devinfo,
                 const struct jay_compile_params *params,
-                struct jay_fs_perprim_data *fs_perprim)
+                struct jay_fs_perprim_data *fs_perprim,
+                struct intel_shader_info *info)
 {
    nir_shader *nir = params->nir;
-   union brw_any_prog_data *prog_data = params->prog_data;
    union brw_any_prog_key *key = params->key;
 
    enum mesa_shader_stage stage = nir->info.stage;
    struct brw_compiler compiler = { .devinfo = devinfo };
 
-   prog_data->base.ray_queries = nir->info.ray_queries;
-   prog_data->base.stage = stage;
-   prog_data->base.total_shared = nir->info.shared_size;
+   info->stage = stage;
+   info->total_shared = nir->info.shared_size;
 
    brw_pass_tracker pt_ = {
       .nir = nir,
@@ -643,18 +683,17 @@ jay_process_nir(const struct intel_device_info *devinfo,
       /* Only position is allowed to be per-view */
       assert(!(nir->info.per_view_outputs & ~VARYING_BIT_POS));
 
-      brw_compute_vue_map(devinfo, &prog_data->vue.vue_map,
+      brw_compute_vue_map(devinfo, &info->vue.vue_map,
                           nir->info.outputs_written, key->base.vue_layout,
                           pos_slots);
 
-      prog_data->vs.inputs_read = nir->info.inputs_read;
-      prog_data->vs.double_inputs_read = nir->info.vs.double_inputs;
-      prog_data->vs.no_vf_slot_compaction = key->vs.no_vf_slot_compaction;
+      info->vs.inputs_read = nir->info.inputs_read;
+      info->vs.double_inputs_read = nir->info.vs.double_inputs;
 
       unsigned nr_input_components;
-      brw_nir_lower_vs_inputs(nir, devinfo, &key->vs, &prog_data->vs,
-                              &nr_input_components,
-                              &prog_data->vue.urb_read_length);
+      brw_nir_lower_vs_inputs(nir, devinfo, &key->vs, &params->push_layout,
+                              info->vs.vf_component_packing, &nr_input_components,
+                              &info->vue.urb_read_length);
       brw_nir_lower_vue_outputs(nir);
       JAY_NIR_SNAPSHOT("after_lower_io");
 
@@ -665,7 +704,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
       JAY_NIR_PASS(nir_opt_constant_folding);
       JAY_NIR_PASS(intel_nir_lower_shading_rate_output);
       JAY_NIR_PASS(brw_nir_lower_deferred_urb_writes, devinfo,
-                   &prog_data->vue.vue_map, 0, 0);
+                   &info->vue.vue_map, 0, 0);
 
       /* Since vertex shaders reuse the same VUE entry for inputs and outputs
        * (overwriting the original contents), we need to make sure the size is
@@ -673,9 +712,9 @@ jay_process_nir(const struct intel_device_info *devinfo,
        */
       const unsigned vue_entries =
          MAX2(DIV_ROUND_UP(nr_input_components, 4),
-              (unsigned) prog_data->vue.vue_map.num_slots);
+              (unsigned) info->vue.vue_map.num_slots);
 
-      prog_data->vue.urb_entry_size = DIV_ROUND_UP(vue_entries, 4);
+      info->vue.urb_entry_size = DIV_ROUND_UP(vue_entries, 4);
    } else if (stage == MESA_SHADER_TESS_CTRL) {
       nir->info.outputs_written = key->tcs.outputs_written;
       nir->info.patch_outputs_written = key->tcs.patch_outputs_written;
@@ -683,13 +722,13 @@ jay_process_nir(const struct intel_device_info *devinfo,
       struct intel_vue_map input_vue_map;
       brw_compute_vue_map(devinfo, &input_vue_map, nir->info.inputs_read,
                           key->base.vue_layout, 1);
-      brw_compute_tess_vue_map(&prog_data->vue.vue_map,
+      brw_compute_tess_vue_map(&info->vue.vue_map,
                                nir->info.outputs_written,
                                nir->info.patch_outputs_written,
                                key->tcs.separate_tess_vue_layout);
 
       brw_nir_lower_tcs_inputs(nir, devinfo, &input_vue_map);
-      brw_nir_lower_tcs_outputs(nir, devinfo, &prog_data->vue.vue_map,
+      brw_nir_lower_tcs_outputs(nir, devinfo, &info->vue.vue_map,
                                 key->tcs._tes_primitive_mode);
       JAY_NIR_SNAPSHOT("after_lower_io");
 
@@ -708,10 +747,8 @@ jay_process_nir(const struct intel_device_info *devinfo,
        *
        *  15808 bytes left for varying packing overhead
        */
-      const int num_per_patch_slots =
-         prog_data->vue.vue_map.num_per_patch_slots;
-      const int num_per_vertex_slots =
-         prog_data->vue.vue_map.num_per_vertex_slots;
+      const int num_per_patch_slots = info->vue.vue_map.num_per_patch_slots;
+      const int num_per_vertex_slots = info->vue.vue_map.num_per_vertex_slots;
       unsigned output_size_bytes = 0;
       /* Note that the patch header is counted in num_per_patch_slots. */
       output_size_bytes += num_per_patch_slots * 16;
@@ -722,7 +759,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
       assert(output_size_bytes < GFX7_MAX_HS_URB_ENTRY_SIZE_BYTES);
 
       /* URB entry sizes are stored as a multiple of 64 bytes. */
-      prog_data->vue.urb_entry_size = align(output_size_bytes, 64) / 64;
+      info->vue.urb_entry_size = align(output_size_bytes, 64) / 64;
    } else if (stage == MESA_SHADER_GEOMETRY) {
       nir_variable *control_data_bits =
          nir_variable_create(nir, nir_var_shader_temp, glsl_uint_type(),
@@ -745,12 +782,12 @@ jay_process_nir(const struct intel_device_info *devinfo,
             MAX2(1, util_bitcount(key->base.view_mask)) :
             1;
 
-      brw_compute_vue_map(devinfo, &prog_data->vue.vue_map,
+      brw_compute_vue_map(devinfo, &info->vue.vue_map,
                           nir->info.outputs_written, key->base.vue_layout,
                           pos_slots);
 
       brw_nir_lower_gs_inputs(nir, compiler.devinfo, &input_vue_map,
-                              &prog_data->vue.urb_read_length);
+                              &info->vue.urb_read_length);
 
       brw_nir_lower_vue_outputs(nir);
       JAY_NIR_SNAPSHOT("after_lower_io");
@@ -758,7 +795,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
       brw_nir_opt_vectorize_urb(pt);
       nir_lower_gs_intrinsics(nir, 0);
 
-      jay_populate_prog_data(devinfo, nir, prog_data, key, NULL);
+      jay_populate_shader_info(devinfo, nir, info, key, NULL);
 
       /* Get constant offsets out of the way for proper clip/cull handling */
       JAY_NIR_PASS(nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
@@ -768,13 +805,13 @@ jay_process_nir(const struct intel_device_info *devinfo,
       JAY_NIR_PASS(intel_nir_lower_shading_rate_output);
 
       nir_gs_count_vertices_and_primitives(nir,
-                                           &prog_data->gs.static_vertex_count,
+                                           &info->gs.static_vertex_count,
                                            NULL, NULL, 1u);
 
       struct lower_gs_outputs_cb_data data = {
          .control_data_bits = control_data_bits,
          .final_gs_vertex_count = final_gs_vertex_count,
-         .progdata = &prog_data->gs,
+         .info = info,
          .devinfo = devinfo,
       };
       JAY_NIR_PASS(nir_shader_intrinsics_pass, lower_gs_outputs_cb,
@@ -784,28 +821,28 @@ jay_process_nir(const struct intel_device_info *devinfo,
          nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(nir)));
 
       nir_def *out_vert_count = nir_load_var(&at_end, final_gs_vertex_count);
-      if (prog_data->gs.control_data_header_size_hwords > 0) {
-         emit_gs_control_data_bits(&prog_data->gs, devinfo, &at_end,
+      if (info->gs.control_data_header_size_hwords > 0) {
+         emit_gs_control_data_bits(info, devinfo, &at_end,
                                    control_data_bits, out_vert_count);
       }
 
-      if (prog_data->gs.static_vertex_count <= 0) {
+      if (info->gs.static_vertex_count <= 0) {
          store_urb_vec4(&at_end, devinfo, out_vert_count,
                         nir_imm_int(&at_end, 0), 0);
       }
 
       uint32_t starting_urb_offset =
-         2 * prog_data->gs.control_data_header_size_hwords +
-         ((prog_data->gs.static_vertex_count == -1) ? 2 : 0);
+         2 * info->gs.control_data_header_size_hwords +
+         ((info->gs.static_vertex_count == -1) ? 2 : 0);
 
       JAY_NIR_PASS(brw_nir_lower_deferred_urb_writes, devinfo,
-                   &prog_data->vue.vue_map, starting_urb_offset,
-                   2 * prog_data->gs.output_vertex_size_hwords);
+                   &info->vue.vue_map, starting_urb_offset,
+                   2 * info->gs.output_vertex_size_hwords);
 
-      unsigned output_size_bytes = prog_data->gs.output_vertex_size_hwords *
+      unsigned output_size_bytes = info->gs.output_vertex_size_hwords *
                                    32 *
                                    nir->info.gs.vertices_out;
-      output_size_bytes += 32 * prog_data->gs.control_data_header_size_hwords;
+      output_size_bytes += 32 * info->gs.control_data_header_size_hwords;
 
       /* Broadwell stores "Vertex Count" as a full 8 DWord (32 byte) URB output,
        * which comes before the control header.
@@ -820,7 +857,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
          output_size_bytes = 1;
 
       /* URB entry sizes are stored as a multiple of 64 bytes in gfx7+. */
-      prog_data->vue.urb_entry_size = align(output_size_bytes, 64) / 64;
+      info->vue.urb_entry_size = align(output_size_bytes, 64) / 64;
 
       JAY_NIR_PASS(nir_lower_global_vars_to_local);
       JAY_NIR_PASS(nir_lower_vars_to_ssa);
@@ -833,7 +870,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
             MAX2(1, util_bitcount(key->base.view_mask)) :
             1;
 
-      brw_compute_vue_map(devinfo, &prog_data->vue.vue_map,
+      brw_compute_vue_map(devinfo, &info->vue.vue_map,
                           nir->info.outputs_written, key->base.vue_layout,
                           pos_slots);
 
@@ -844,7 +881,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
                                key->tes.separate_tess_vue_layout);
 
       brw_nir_lower_tes_inputs(nir, devinfo, &input_vue_map,
-                               &prog_data->vue.urb_read_length);
+                               &info->vue.urb_read_length);
       brw_nir_lower_vue_outputs(nir);
       BRW_NIR_SNAPSHOT("after_lower_io");
 
@@ -852,38 +889,34 @@ jay_process_nir(const struct intel_device_info *devinfo,
       BRW_NIR_PASS(intel_nir_lower_patch_vertices_tes);
 
       BRW_NIR_PASS(brw_nir_lower_deferred_urb_writes, devinfo,
-                   &prog_data->vue.vue_map, 0, 0);
+                   &info->vue.vue_map, 0, 0);
 
-      unsigned output_size_bytes = prog_data->vue.vue_map.num_slots * 4 * 4;
+      unsigned output_size_bytes = info->vue.vue_map.num_slots * 4 * 4;
 
       assert(output_size_bytes >= 1);
       assert(output_size_bytes <= GFX7_MAX_DS_URB_ENTRY_SIZE_BYTES);
 
-      prog_data->tes.include_primitive_id =
+      info->tes.include_primitive_id =
          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID);
 
       /* URB entry sizes are stored as a multiple of 64 bytes. */
-      prog_data->vue.urb_entry_size = align(output_size_bytes, 64) / 64;
+      info->vue.urb_entry_size = align(output_size_bytes, 64) / 64;
 
-      brw_fill_tess_info_from_shader_info(&prog_data->tes.tess_info,
+      brw_fill_tess_info_from_shader_info(&info->tes.tess_info,
                                           &nir->info);
    } else if (stage == MESA_SHADER_MESH) {
-      prog_data->mesh.base.local_size[0] = nir->info.workgroup_size[0];
-      prog_data->mesh.base.local_size[1] = nir->info.workgroup_size[1];
-      prog_data->mesh.base.local_size[2] = nir->info.workgroup_size[2];
-
-      prog_data->mesh.primitive_type = nir->info.mesh.primitive_type;
+      info->mesh.primitive_type = nir->info.mesh.primitive_type;
 
       struct index_packing_state index_packing_state = {};
       if (brw_can_pack_primitive_indices(nir, &index_packing_state)) {
          if (index_packing_state.original_prim_indices)
             NIR_PASS(_, nir, brw_pack_primitive_indices, &index_packing_state);
-         prog_data->mesh.index_format = BRW_INDEX_FORMAT_U888X;
+         info->mesh.index_format = BRW_INDEX_FORMAT_U888X;
       } else {
-         prog_data->mesh.index_format = BRW_INDEX_FORMAT_U32;
+         info->mesh.index_format = BRW_INDEX_FORMAT_U32;
       }
 
-      prog_data->mesh.uses_drawid =
+      info->mesh.uses_drawid =
          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
 
       brw_nir_lower_tue_inputs(pt, NULL);
@@ -892,27 +925,23 @@ jay_process_nir(const struct intel_device_info *devinfo,
       BRW_NIR_PASS(nir_opt_dce);
       BRW_NIR_PASS(nir_remove_dead_variables, nir_var_shader_out, NULL);
 
-      brw_compute_mue_map(&compiler, nir, &prog_data->mesh.map,
-                          prog_data->mesh.index_format, key->base.vue_layout,
+      brw_compute_mue_map(&compiler, nir, &info->mesh.map,
+                          info->mesh.index_format, key->base.vue_layout,
                           NULL);
-      brw_nir_lower_mesh_outputs(nir, &prog_data->mesh.map);
+      brw_nir_lower_mesh_outputs(nir, &info->mesh.map);
 
-      if (prog_data->mesh.map.has_per_primitive_header)
-         BRW_NIR_PASS(brw_nir_initialize_mue, &prog_data->mesh.map);
+      if (info->mesh.map.has_per_primitive_header)
+         BRW_NIR_PASS(brw_nir_initialize_mue, &info->mesh.map);
       NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics, devinfo, NULL);
 
-      prog_data->mesh.autostrip_enable =
-         brw_mesh_autostrip_enable(&compiler, nir, &prog_data->mesh.map);
+      info->mesh.autostrip_enable =
+         brw_mesh_autostrip_enable(&compiler, nir, &info->mesh.map);
 
    } else if (stage == MESA_SHADER_TASK) {
-      prog_data->task.base.local_size[0] = nir->info.workgroup_size[0];
-      prog_data->task.base.local_size[1] = nir->info.workgroup_size[1];
-      prog_data->task.base.local_size[2] = nir->info.workgroup_size[2];
-
-      prog_data->task.uses_drawid =
+      info->task.uses_drawid =
          BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
 
-      brw_nir_lower_tue_outputs(pt, &prog_data->task.map);
+      brw_nir_lower_tue_outputs(pt, &info->task.map);
 
       BRW_NIR_PASS(brw_nir_align_launch_mesh_workgroups);
 
@@ -926,7 +955,8 @@ jay_process_nir(const struct intel_device_info *devinfo,
       };
       BRW_NIR_PASS(nir_lower_task_shader, lower_ts_opt);
 
-      prog_data->base.total_shared = nir->info.shared_size;
+      /* Update since task lowering might use more shared memory. */
+      info->total_shared = nir->info.shared_size;
 
       BRW_NIR_PASS(brw_nir_lower_launch_mesh_workgroups);
       NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics, devinfo, NULL);
@@ -940,7 +970,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
       if (!brw_can_coherent_fb_fetch(devinfo))
          JAY_NIR_PASS(brw_nir_lower_fs_load_output, &key->fs, 0);
 
-      /* Do this lowering before jay_populate_prog_data(). */
+      /* Do this lowering before jay_populate_shader_info(). */
       JAY_NIR_PASS(nir_opt_frag_coord_to_pixel_coord);
       JAY_NIR_PASS(nir_lower_frag_coord_to_pixel_coord);
       JAY_NIR_PASS(nir_lower_alu_to_scalar, NULL, NULL);
@@ -956,9 +986,11 @@ jay_process_nir(const struct intel_device_info *devinfo,
                    (key->fs.nr_color_regions > 1 &&
                     alpha_to_coverage_enabled(nir, key->fs.alpha_to_coverage) &&
                     !(nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK))),
-                   NULL, NULL);
+                   info, NULL, NULL);
+      JAY_NIR_PASS(nir_shader_intrinsics_pass, lower_fragment_outputs,
+                   nir_metadata_control_flow, NULL);
 
-      brw_nir_cleanup_pre_fs_prog_data(pt);
+      brw_nir_cleanup_pre_fs_info(pt);
 
       // TODO
       // JAY_NIR_PASS(brw_nir_move_interpolation_to_top);
@@ -966,13 +998,13 @@ jay_process_nir(const struct intel_device_info *devinfo,
       /* Do this before lower_fs_config_intel so that the pass has the right
        * information.
        */
-      jay_populate_prog_data(devinfo, nir, prog_data, key, fs_perprim);
+      jay_populate_shader_info(devinfo, nir, info, key, fs_perprim);
 
       /* Although its not required by the spec, other vendors mask out helper
        * lanes entirely unless the shader uses derivatives. Some applications
        * depend on this behavior not to get stuck in infinite loops.
        */
-      if (!prog_data->fs.uses_vmask && !nir->info.maximally_reconverges) {
+      if (!info->fs.uses_vmask && !nir->info.maximally_reconverges) {
          JAY_NIR_PASS(nir_shader_intrinsics_pass, lower_demote_to_terminate,
                       nir_metadata_control_flow, NULL);
       }
@@ -988,13 +1020,13 @@ jay_process_nir(const struct intel_device_info *devinfo,
       JAY_NIR_PASS(nir_shader_intrinsics_pass, lower_load_barycentric_at_offset,
                    0, NULL);
 
-      if (prog_data->fs.coarse_pixel_dispatch)
+      if (info->fs.coarse_pixel_dispatch)
          JAY_NIR_PASS(brw_nir_lower_frag_coord_z, devinfo);
 
       JAY_NIR_PASS(nir_shader_intrinsics_pass, lower_frag_coord,
                    nir_metadata_control_flow, NULL);
 
-      JAY_NIR_PASS(brw_nir_lower_fs_config_intel, &key->fs, &prog_data->fs);
+      JAY_NIR_PASS(brw_nir_lower_fs_config_intel, &key->fs, info);
    }
 
    JAY_NIR_PASS(nir_opt_phi_to_bool);
@@ -1005,15 +1037,15 @@ jay_process_nir(const struct intel_device_info *devinfo,
 
       const struct brw_lower_urb_cb_data cb_data = {
          .devinfo = devinfo,
-         .varying_to_slot = prog_data->mesh.map.vue_map.varying_to_slot,
-         .per_vertex_stride = prog_data->mesh.map.per_vertex_stride,
-         .per_vertex_offset = prog_data->mesh.map.per_vertex_offset,
-         .per_primitive_offset = prog_data->mesh.map.per_primitive_offset,
-         .per_primitive_stride = prog_data->mesh.map.per_primitive_stride,
+         .varying_to_slot = info->mesh.map.vue_map.varying_to_slot,
+         .per_vertex_stride = info->mesh.map.per_vertex_stride,
+         .per_vertex_offset = info->mesh.map.per_vertex_offset,
+         .per_primitive_offset = info->mesh.map.per_primitive_offset,
+         .per_primitive_stride = info->mesh.map.per_primitive_stride,
          .per_primitive_indices_stride =
-            prog_data->mesh.map.per_primitive_indices_stride,
+            info->mesh.map.per_primitive_indices_stride,
          .per_primitive_byte_offsets =
-            prog_data->mesh.map.per_primitive_offsets,
+            info->mesh.map.per_primitive_offsets,
       };
       BRW_NIR_PASS(brw_nir_lower_outputs_to_urb_intrinsics, &cb_data);
       struct nir_opt_offsets_options offset_options = {};
@@ -1139,7 +1171,8 @@ void
 jay_process_nir_for_simd(const struct intel_device_info *devinfo,
                          const struct jay_compile_params *params,
                          unsigned simd_width,
-                         bool *track_helpers)
+                         bool *track_helpers,
+                         struct intel_shader_info *info)
 {
    nir_shader *nir = params->nir;
 
@@ -1237,12 +1270,12 @@ jay_process_nir_for_simd(const struct intel_device_info *devinfo,
       /* Certain features require tracking helpers for correctness */
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-      if (params->prog_data->fs.uses_vmask || nir->info.maximally_reconverges) {
+      if (info->fs.uses_vmask || nir->info.maximally_reconverges) {
          *track_helpers |= nir->info.fs.uses_discard | nir->info.writes_memory;
          *track_helpers |= BITSET_TEST(nir->info.system_values_read,
                                        SYSTEM_VALUE_HELPER_INVOCATION);
 
-         if (params->prog_data->fs.uses_vmask || nir->info.fs.uses_discard) {
+         if (info->fs.uses_vmask || nir->info.fs.uses_discard) {
             /* ...but this is more subtle. nir_opt_load_skip_helpers flags
              * texturing operations that we can skip for bandwidth savings.  We
              * need divergence info for this, so we run late. Of course, if we
@@ -1258,7 +1291,7 @@ jay_process_nir_for_simd(const struct intel_device_info *devinfo,
          }
       }
    } else {
-      jay_populate_prog_data(devinfo, nir, params->prog_data, params->key, NULL);
+      jay_populate_shader_info(devinfo, nir, info, params->key, NULL);
    }
 
    /* This must be the very last pass since nir_print itself will reindex! */

@@ -49,6 +49,8 @@ struct fd_dev_info {
    uint32_t highest_bank_bit;
    uint32_t ubwc_swizzle;
    uint32_t macrotile_mode;
+   /* For the drm-shim, which has no kernel to ask. */
+   uint32_t gmem_size;
 
    /* Information for private memory calculations */
    uint32_t fibers_per_sp;
@@ -503,6 +505,33 @@ struct fd_dev_info {
        */
       bool prefetch_sam_helpers_quirk;
 
+      /* How many descriptors of each kind (texture/SSBO, sampler/UBO) ir3 may
+       * prefetch in the preamble of a fragment shader, of a shader of any
+       * other stage, and of a binning VS (which runs without a FS, so it
+       * can prefetch more).
+       *
+       * How we think descriptor caching behaves (A7XX+):
+       *
+       *    sample(set, index):                  // in any shader stage
+       *       desc = l1_desc_cache[type].lookup(set.address, index)
+       *       if not found:
+       *          desc = l2_state_cache.lookup(...)    // A750+ only
+       *          if not found:
+       *             desc = memory.read(...)           // slow
+       *          l1_desc_cache[type].insert(desc)
+       *       return fetch_texels(desc)
+       *
+       * l1_desc_cache: 32 texture/SSBO, 32 sampler/UBO
+       *                (on A7XX gen1 it's probably 16 tex/SSBO, 16 sampler/UBO).
+       * l2_state_cache: shared by all descriptor types.
+       *
+       * The compiler doesn't know which shaders run together, so each stage
+       * gets a fixed limit.
+       */
+      uint32_t max_desc_prefetches_fs;
+      uint32_t max_desc_prefetches_non_fs;
+      uint32_t max_desc_prefetches_binning_vs;
+
       /* Whether resbase can be used. It doesn't exist on a6xx, and on
        * a7xx gen1 it hangs the GPU, even when its result is unused.
        */
@@ -553,6 +582,11 @@ struct fd_dev_info {
       bool QCTDD10497382_rt_workaround;
       /* Do not use a0 in early preamble. */
       bool QCTDD10789828_no_a0_ep : 1;
+      /* Hw calculates pvtmem address using wave128, so driver needs
+       * to account for this by doubling the pvtmem size in per-wave
+       * layout.
+       */
+      bool QCTDD10982019_double_pvtmem_size : 1;
       /* On a7xx alias.tex may hang when in between mova and (ul). */
       bool QCTDD11147232_alias_mova : 1;
       /* On some HW alias.tex may hang when predicated (i.e. between
@@ -592,8 +626,23 @@ fd_dev_gpu_id(const struct fd_dev_id *id)
    return id->gpu_id;
 }
 
+/**
+ * Table entry for a single GPU version
+ */
+struct fd_dev_rec {
+   struct fd_dev_id id;
+   const char *name;
+   const struct fd_dev_info *info;
+};
+
+const struct fd_dev_rec *fd_dev_rec_at(unsigned index);
+const struct fd_dev_rec *fd_dev_rec_find(const struct fd_dev_id *id);
+
 /* Unmodified dev info as defined in freedreno_devices.py */
 const struct fd_dev_info *fd_dev_info_raw(const struct fd_dev_id *id);
+
+/* Complain where the table disagrees with the kernel, which knows. */
+void fd_dev_check_gmem_size(const struct fd_dev_id *id, uint32_t gmem_size);
 
 /* Helper to check if GPU is known before going any further */
 static inline uint8_t

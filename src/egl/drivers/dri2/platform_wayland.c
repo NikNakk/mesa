@@ -289,7 +289,7 @@ dri2_wl_visual_idx_from_shm_format(uint32_t shm_format)
 bool
 dri2_wl_is_format_supported(void *user_data, uint32_t format)
 {
-   _EGLDisplay *disp = (_EGLDisplay *)user_data;
+   struct _egl_display *disp = (struct _egl_display *)user_data;
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    int j = dri2_wl_visual_idx_from_fourcc(format);
 
@@ -714,8 +714,8 @@ dri2_wl_modifiers_have_common(struct u_vector *modifiers1,
 /**
  * Called via eglCreateWindowSurface(), drv->CreateWindowSurface().
  */
-static _EGLSurface *
-dri2_wl_create_window_surface(_EGLDisplay *disp, _EGLConfig *conf,
+static struct _egl_surface *
+dri2_wl_create_window_surface(struct _egl_display *disp, struct _egl_config *conf,
                               void *native_window, const EGLint *attrib_list)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
@@ -896,8 +896,8 @@ cleanup_surf:
    return NULL;
 }
 
-static _EGLSurface *
-dri2_wl_create_pbuffer_surface(_EGLDisplay *disp, _EGLConfig *conf,
+static struct _egl_surface *
+dri2_wl_create_pbuffer_surface(struct _egl_display *disp, struct _egl_config *conf,
                                const EGLint *attrib_list)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
@@ -947,8 +947,8 @@ cleanup_surface:
    return NULL;
 }
 
-static _EGLSurface *
-dri2_wl_create_pixmap_surface(_EGLDisplay *disp, _EGLConfig *conf,
+static struct _egl_surface *
+dri2_wl_create_pixmap_surface(struct _egl_display *disp, struct _egl_config *conf,
                               void *native_window, const EGLint *attrib_list)
 {
    /* From the EGL_EXT_platform_wayland spec, version 3:
@@ -966,7 +966,7 @@ dri2_wl_create_pixmap_surface(_EGLDisplay *disp, _EGLConfig *conf,
  * Called via eglDestroySurface(), drv->DestroySurface().
  */
 static EGLBoolean
-dri2_wl_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
+dri2_wl_destroy_surface(struct _egl_display *disp, struct _egl_surface *surf)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(surf);
 
@@ -1022,7 +1022,7 @@ dri2_wl_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
 }
 
 static EGLBoolean
-dri2_wl_swap_interval(_EGLDisplay *disp, _EGLSurface *surf, EGLint interval)
+dri2_wl_swap_interval(struct _egl_display *disp, struct _egl_surface *surf, EGLint interval)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(surf);
 
@@ -1360,7 +1360,7 @@ get_back_bo(struct dri2_egl_surface *dri2_surf,
    if (dri2_surf->base.ProtectedContent) {
       /* Protected buffers can't be read from another GPU */
       if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu)
-         return -1;
+         goto fail;
       use_flags |= __DRI_IMAGE_USE_PROTECTED;
    }
 
@@ -1428,7 +1428,7 @@ get_back_bo(struct dri2_egl_surface *dri2_surf,
                         close(buffer_fds[i]);
                   } while (--i >= 0);
                   dri2_destroy_image(linear_copy_display_gpu_image);
-                  return -1;
+                  goto fail;
                }
             }
 
@@ -1441,7 +1441,7 @@ get_back_bo(struct dri2_egl_surface *dri2_surf,
                      close(buffer_fds[i]);
                } while (--i >= 0);
                dri2_destroy_image(linear_copy_display_gpu_image);
-               return -1;
+               goto fail;
             }
 
             /* The linear buffer was created in the display GPU's vram, so we
@@ -1475,7 +1475,7 @@ get_back_bo(struct dri2_egl_surface *dri2_surf,
       }
 
       if (dri2_surf->back->linear_copy == NULL)
-         return -1;
+         goto fail;
    }
 
    if (dri2_surf->back->dri_image == NULL) {
@@ -1495,12 +1495,16 @@ get_back_bo(struct dri2_egl_surface *dri2_surf,
    }
 
    if (dri2_surf->back->dri_image == NULL)
-      return -1;
+      goto fail;
 
    loader_wayland_buffer_set_flow(&dri2_surf->back->wayland_buffer, flow);
    dri2_surf->back->locked = true;
 
    return 0;
+
+fail:
+   dri2_surf->back = NULL;
+   return -1;
 }
 
 /* Value chosen empirically as a compromise between avoiding frequent
@@ -1852,7 +1856,7 @@ throttle(struct dri2_egl_display *dri2_dpy,
  * Called via eglSwapBuffers(), drv->SwapBuffers().
  */
 static EGLBoolean
-dri2_wl_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
+dri2_wl_swap_buffers(struct _egl_display *disp, struct _egl_surface *draw,
                      const EGLint *rects, EGLint n_rects)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
@@ -1945,7 +1949,7 @@ dri2_wl_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
                         INT32_MAX);
 
    if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu) {
-      _EGLContext *ctx = _eglGetCurrentContext();
+      struct _egl_context *ctx = _eglGetCurrentContext();
       struct dri2_egl_context *dri2_ctx = dri2_egl_context(ctx);
       struct dri_drawable *dri_drawable = dri2_surface_get_dri_drawable(draw);
       dri2_blit_image(
@@ -1978,7 +1982,7 @@ dri2_wl_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
 }
 
 static EGLint
-dri2_wl_query_buffer_age(_EGLDisplay *disp, _EGLSurface *surface)
+dri2_wl_query_buffer_age(struct _egl_display *disp, struct _egl_surface *surface)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(surface);
    struct mesa_trace_flow flow = { 0 };
@@ -1998,7 +2002,7 @@ dri2_wl_query_buffer_age(_EGLDisplay *disp, _EGLSurface *surface)
 
 #ifdef HAVE_BIND_WL_DISPLAY
 static struct wl_buffer *
-dri2_wl_create_wayland_buffer_from_image(_EGLDisplay *disp, _EGLImage *img)
+dri2_wl_create_wayland_buffer_from_image(struct _egl_display *disp, struct _egl_image *img)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    struct dri2_egl_image *dri2_img = dri2_egl_image(img);
@@ -2030,7 +2034,7 @@ bad_format:
 }
 
 static int
-dri2_wl_authenticate(_EGLDisplay *disp, uint32_t id)
+dri2_wl_authenticate(struct _egl_display *disp, uint32_t id)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    int ret = 0;
@@ -2393,7 +2397,7 @@ static const struct wl_registry_listener registry_listener_drm = {
 };
 
 static void
-dri2_wl_setup_swap_interval(_EGLDisplay *disp)
+dri2_wl_setup_swap_interval(struct _egl_display *disp)
 {
    /* We can't use values greater than 1 on Wayland because we are using the
     * frame callback to synchronise the frame and the only way we be sure to
@@ -2445,7 +2449,7 @@ dri2_wl_surface_throttle(struct dri2_egl_surface *dri2_surf)
 }
 
 static EGLBoolean
-dri2_wl_kopper_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
+dri2_wl_kopper_swap_buffers(struct _egl_display *disp, struct _egl_surface *draw,
                             const EGLint *rects, EGLint n_rects)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(draw);
@@ -2465,7 +2469,7 @@ dri2_wl_kopper_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
 }
 
 static EGLint
-dri2_wl_kopper_query_buffer_age(_EGLDisplay *disp, _EGLSurface *surface)
+dri2_wl_kopper_query_buffer_age(struct _egl_display *disp, struct _egl_surface *surface)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(surface);
 
@@ -2592,7 +2596,7 @@ static const struct dri_loader_funcs kopper_loader_funcs = {
 };
 
 static void
-dri2_wl_add_configs_for_visuals(_EGLDisplay *disp)
+dri2_wl_add_configs_for_visuals(struct _egl_display *disp)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    unsigned int format_count[ARRAY_SIZE(dri2_wl_visuals)] = {0};
@@ -2725,7 +2729,7 @@ dri2_initialize_wayland_drm_extensions(struct dri2_egl_display *dri2_dpy)
 }
 
 static EGLBoolean
-dri2_initialize_wayland_drm(_EGLDisplay *disp)
+dri2_initialize_wayland_drm(struct _egl_display *disp)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    drmDevicePtr render_dev, preferred_dev, tranche_dev;
@@ -3168,7 +3172,7 @@ dri2_wl_swrast_put_image(struct dri_drawable *draw, int op, int x, int y, int w,
 }
 
 static EGLBoolean
-dri2_wl_swrast_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
+dri2_wl_swrast_swap_buffers(struct _egl_display *disp, struct _egl_surface *draw,
                             const EGLint *rects, EGLint n_rects)
 {
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(draw);
@@ -3213,7 +3217,7 @@ dri2_wl_swrast_swap_buffers(_EGLDisplay *disp, _EGLSurface *draw,
 }
 
 static EGLint
-dri2_wl_swrast_query_buffer_age(_EGLDisplay *disp, _EGLSurface *surface)
+dri2_wl_swrast_query_buffer_age(struct _egl_display *disp, struct _egl_surface *surface)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    struct dri2_egl_surface *dri2_surf = dri2_egl_surface(surface);
@@ -3292,7 +3296,7 @@ static const struct dri_loader_funcs swrast_loader_funcs = {
 };
 
 static EGLBoolean
-dri2_initialize_wayland_swrast(_EGLDisplay *disp)
+dri2_initialize_wayland_swrast(struct _egl_display *disp)
 {
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
 
@@ -3375,7 +3379,7 @@ cleanup:
 }
 
 EGLBoolean
-dri2_initialize_wayland(_EGLDisplay *disp)
+dri2_initialize_wayland(struct _egl_display *disp)
 {
    if (disp->Options.ForceSoftware)
       return dri2_initialize_wayland_swrast(disp);

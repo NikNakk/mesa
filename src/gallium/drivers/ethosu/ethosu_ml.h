@@ -22,6 +22,7 @@
 #define SHRAM_LUT_BASE(lut)         ((SHRAM_TOTAL_BANKS - SHRAM_RESERVED_END_BANKS) * \
                                      SHRAM_BANK_SIZE_BYTES + (lut) * LUT8_SIZE)
 #define SOFTMAX_MAX_DEPTH           4095
+#define FEATURE_MAP_MAX_DIM         65536
 #define ACC_BITS                    32 /* Use for now always 32-bit accumulators */
 #define IFM_GRANULE                 8
 #define ACC_GRANULE                 16
@@ -283,6 +284,8 @@ struct ethosu_tensor {
    unsigned size;
    unsigned batches;
    uint8_t type_size;
+   uint8_t users;
+   bool is_external_output;
    struct ethosu_block shape;
    enum ethosu_layout layout;
 };
@@ -372,5 +375,17 @@ int ethosu_round_up_to_multiple(int a, int b);
 int ethosu_round_up_divide(int a, int b);
 
 int ethosu_quantize_scale(double scale, int32_t *shift, bool reduced);
+
+static inline bool
+ethosu_is_feature_map_in_io(const struct ethosu_feature_map *fm)
+{
+   if (fm->region != IO_REGION || !fm->tensor || fm->has_scalar)
+      return false;
+
+   if (fm->activation_storage == ETHOSU_ACTIVATION_STORAGE_CHAINED)
+      return false;
+
+   return true;
+}
 
 #endif /* ETHOSU_ML_H */

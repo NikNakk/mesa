@@ -262,7 +262,7 @@ jay_partition_grf(jay_shader *shader)
 
    if (shader->stage == MESA_SHADER_VERTEX) {
       payload_4[0] = 1;
-      payload_4[1] = shader->prog_data->vue.urb_read_length * 8;
+      payload_4[1] = shader->info.vue.urb_read_length * 8;
       payload_u[1] = shader->push_grfs;
       eot_4 = 16;
    } else if (shader->stage == MESA_SHADER_TASK ||
@@ -274,8 +274,8 @@ jay_partition_grf(jay_shader *shader)
    } else if (shader->stage == MESA_SHADER_TESS_CTRL) {
       payload_4[0] =
          1 +
-         shader->prog_data->tcs.include_primitive_id +
-         (shader->prog_data->tcs.input_vertices ?: BRW_MAX_TCS_INPUT_VERTICES);
+         shader->info.tcs.include_primitive_id +
+         (shader->info.tcs.input_vertices ?: BRW_MAX_TCS_INPUT_VERTICES);
       payload_u[1] = shader->push_grfs;
       eot_4 = 16;
    } else if (shader->stage == MESA_SHADER_GEOMETRY) {
@@ -292,21 +292,21 @@ jay_partition_grf(jay_shader *shader)
        * Note that even though ICP URB input handles are technically optional,
        * we always enable them anyway.
        */
-      unsigned urb_push_size = shader->prog_data->vue.urb_read_length *
+      unsigned urb_push_size = shader->info.vue.urb_read_length *
                                8 *
-                               shader->prog_data->gs.vertices_in;
+                               shader->info.gs.vertices_in;
 
       unsigned prim_id_size =
-         (shader->prog_data->gs.include_primitive_id ? 1 : 0);
+         (shader->info.gs.include_primitive_id ? 1 : 0);
 
-      if (shader->prog_data->gs.invocations == 1) {
-         unsigned urb_icp_size = shader->prog_data->gs.vertices_in;
+      if (shader->info.gs.invocations == 1) {
+         unsigned urb_icp_size = shader->info.gs.vertices_in;
          payload_4[0] = 1 + prim_id_size + urb_icp_size;
          payload_u[1] = shader->push_grfs;
          payload_4[1] = urb_push_size;
       } else {
          payload_4[0] = 1 + prim_id_size;
-         payload_u[1] = shader->prog_data->gs.vertices_in + shader->push_grfs;
+         payload_u[1] = shader->info.gs.vertices_in + shader->push_grfs;
          payload_4[1] = urb_push_size;
       }
       eot_4 = 16;
@@ -410,23 +410,19 @@ jay_partition_grf(jay_shader *shader)
       min_grf[JAY_STRIDE_2] +
       special_4;
 
-   unsigned mapped_accums =
-      shader->devinfo->ver >= 20 ? (reserve_acc01 ? 2 : 4) / grf_per_gpr : 0;
-
-   for (unsigned spilling = 0; spilling <= 2; spilling++) {
+   for (unsigned spilling = 0; spilling <= 1; spilling++) {
       /* There is an interdependence between partition choice and spilling,
        * because spilling requires reserved UGPRs for the lowered SENDs. The
-       * solution is to first try to build a partition that forbids spilling
-       * (spilling = 0), then try to build one that spills to accumulators
-       * (spilling = 1), and if all else fails, build one that spills to memory.
+       * solution is to first try to build a partition that forbids spilling,
+       * and if that fails, build one that spills to memory.
        */
-      spilling_grfs = spilling == 2 ? shader->dispatch_width / ugpr_per_grf : 0;
+      spilling_grfs = spilling == 1 ? shader->dispatch_width / ugpr_per_grf : 0;
       uniform_grfs = DIV_ROUND_UP(MAX2(demand[UGPR], min_ugprs), ugpr_per_grf) +
                      spilling_grfs;
 
       hw_grfs =
          intel_vrt_register_file_size(shader->devinfo,
-                                      shader->prog_data->base.source_hash,
+                                      shader->info.source_hash,
                                       MAX2(uniform_grfs + estimate_nonunif_grf,
                                            96));
 
@@ -455,16 +451,6 @@ jay_partition_grf(jay_shader *shader)
       if (demand[GPR] <=
           register_limit(shader, GPR, shader->num_regs[GPR], base_split)) {
          break;
-      }
-
-      /* Try mapping accumulators */
-      if (spilling == 0) {
-         jay_foreach_function(shader, f) {
-            if (f->demand[GPR] > shader->num_regs[GPR] && mapped_accums) {
-               jay_spill(f, GPR, ACCUM, f->demand[GPR] - mapped_accums);
-               jay_spill(f, ACCUM, GPR, mapped_accums);
-            }
-         }
       }
    }
 
@@ -558,18 +544,16 @@ jay_partition_grf(jay_shader *shader)
       { UGPR, 0, eot_u, JAY_BLOCK_EOT },
 
       /* Accumulator/flag blocks */
-      { ACCUM, 0, mapped_accums * grf_per_gpr },
       { FLAG, 0, flag_limit * jay_grf_per_gpr(shader) },
    };
 
-   shader->num_regs[ACCUM] = mapped_accums;
    shader->num_regs[FLAG] = hw_flags;
    shader->num_regs[J_ADDRESS] = 1;
 
    build_partition(shader, hw_grfs, reserve_acc01, blocks, ARRAY_SIZE(blocks));
 
    /* By construction of our partition, the entire GRF is used. */
-   shader->prog_data->base.grf_used = hw_grfs;
+   shader->info.grf_used = hw_grfs;
 
    /* Spill as needed to fit within the partition we picked. */
    jay_foreach_function(shader, f) {

@@ -155,12 +155,7 @@ panvk_per_arch(CreateDescriptorSetLayout)(
       binding_layout->type = binding->descriptorType;
       binding_layout->flags = sorted->flags[i];
 
-      if (binding_layout->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-         binding_layout->desc_count =
-            panvk_get_iub_desc_count(binding->descriptorCount);
-      } else {
-         binding_layout->desc_count = binding->descriptorCount;
-      }
+      binding_layout->desc_count = binding->descriptorCount;
 
       if (is_texture(binding_layout->type))
          binding_layout->textures_per_desc = 1;
@@ -185,8 +180,11 @@ panvk_per_arch(CreateDescriptorSetLayout)(
          dyn_buf_idx += binding_layout->desc_count;
       } else {
          binding_layout->desc_idx = desc_idx;
-         desc_idx += panvk_get_desc_stride(binding_layout) *
-                     binding_layout->desc_count;
+         if (binding_layout->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+            desc_idx += panvk_get_iub_desc_count(binding_layout->desc_count);
+         else
+            desc_idx += panvk_get_desc_stride(binding_layout) *
+                        binding_layout->desc_count;
       }
    }
 
@@ -222,10 +220,13 @@ panvk_per_arch(CreateDescriptorSetLayout)(
                layout->bindings[b].immutable_samplers[i];
 
             /* We zalloc the object, so it's safe to hash the whole thing */
-            if (sampler != NULL && sampler->vk.ycbcr_conversion != NULL)
+            if (sampler != NULL && sampler->vk.ycbcr_conversion != NULL) {
                _mesa_blake3_update(&hash_ctx,
                                    &sampler->vk.ycbcr_conversion->state,
                                    sizeof(sampler->vk.ycbcr_conversion->state));
+               _mesa_blake3_update(&hash_ctx, &sampler->desc_count,
+                                   sizeof(sampler->desc_count));
+            }
          }
       }
    }

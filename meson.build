@@ -14,6 +14,7 @@ project(
     'cpp_std=c++17',
     'rust_std=2021',
     'build.rust_std=2021',
+    'b_vscrt=mt',
   ],
 )
 
@@ -450,8 +451,10 @@ if host_machine.system() == 'darwin'
   #macOS seems to need beta extensions to build for now:
   with_vulkan_beta = true
 endif
+vulkan_gen_beta_arg = []
 if with_vulkan_beta
   pre_args += '-DVK_ENABLE_BETA_EXTENSIONS'
+  vulkan_gen_beta_arg = '--beta'
 endif
 
 _codecs = get_option('video-codecs')
@@ -1047,7 +1050,7 @@ with_llvm = with_llvm \
 
 with_poly = [
   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
-  with_kosmickrisp_vk,
+  with_kosmickrisp_vk, with_panfrost_vk
 ].contains(true)
 
 dep_clc = null_dep
@@ -1346,21 +1349,20 @@ elif host_machine.system() == 'windows'
   pre_args += [
     '-D_WIN32_WINNT=0x0A00',
     '-DWINVER=0x0A00',
+    '-D_USE_MATH_DEFINES',
+    '-D_CRT_NONSTDC_NO_DEPRECATE',
+    '-D_CRT_SECURE_NO_WARNINGS',
+    '-D_CRT_SECURE_NO_DEPRECATE',
+    '-D_SCL_SECURE_NO_WARNINGS',
+    '-D_SCL_SECURE_NO_DEPRECATE',
+    '-D_ALLOW_KEYWORD_MACROS',
+    '-D_HAS_EXCEPTIONS=0', # Tell C++ STL to not use exceptions
+    '-DNOMINMAX',
+    '-D_UCRT_NOISY_NAN', # https://developercommunity.visualstudio.com/t/NAN-is-no-longer-compile-time-constant-i/10688907?viewtype=all
+    '-DWIN32_LEAN_AND_MEAN', # http://msdn2.microsoft.com/en-us/library/6dwk3a1z.aspx
   ]
-  if cc.get_argument_syntax() == 'msvc'
-    pre_args += [
-      '-D_USE_MATH_DEFINES',
-      '-D_CRT_NONSTDC_NO_DEPRECATE',
-      '-D_CRT_SECURE_NO_WARNINGS',
-      '-D_CRT_SECURE_NO_DEPRECATE',
-      '-D_SCL_SECURE_NO_WARNINGS',
-      '-D_SCL_SECURE_NO_DEPRECATE',
-      '-D_ALLOW_KEYWORD_MACROS',
-      '-D_HAS_EXCEPTIONS=0', # Tell C++ STL to not use exceptions
-      '-DNOMINMAX',
-      '-D_UCRT_NOISY_NAN', # https://developercommunity.visualstudio.com/t/NAN-is-no-longer-compile-time-constant-i/10688907?viewtype=all
-    ]
-  else
+
+  if cc.get_argument_syntax() != 'msvc'
     # MINGW also accept _GNU_SOURCE
     pre_args += '-D_GNU_SOURCE'
 
@@ -1433,9 +1435,11 @@ else
     '-Qunused-arguments',
     '-fno-common',
     '-Wno-unknown-pragmas',
+    '-fzero-init-padding-bits=unions',
     # Clang
     '-Wno-microsoft-enum-value',
     '-Wno-unused-function',
+    '-fansi-escape-codes',
   ]
   _trial_cpp = [
     '-Werror=return-type',
@@ -1454,8 +1458,10 @@ else
     # For now we disable this optimization.
     '-flifetime-dse=1',
     '-Wno-unknown-pragmas',
+    '-fzero-init-padding-bits=unions',
     # Clang
     '-Wno-microsoft-enum-value',
+    '-fansi-escape-codes',
   ]
 
   # MinGW chokes on format specifiers and I can't get it all working
@@ -1955,10 +1961,6 @@ use_xmlconfig = get_option('xmlconfig') \
            error_message : 'requires expat') \
   .allowed()
 
-# Predefined macros for windows
-if host_machine.system() == 'windows'
-  pre_args += '-DWIN32_LEAN_AND_MEAN' # http://msdn2.microsoft.com/en-us/library/6dwk3a1z.aspx
-endif
 # this only exists on linux so either this is linux and it will be found, or
 # it's not linux and wont
 dep_m = cc.find_library('m', required : false)

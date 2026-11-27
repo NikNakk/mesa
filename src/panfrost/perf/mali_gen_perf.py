@@ -337,7 +337,7 @@ def main():
                     __VA_ARGS__,                                                    \\
                  };                                                                 \\
                                                                                     \\
-                 (double)backend->get_hw_counter_value(backend, id);                \\
+                 mali_perf_get_hw_counter_value(backend, id, constants);            \\
               })
 
       #define MALI_CONFIG_NEURAL_ACCELERATOR_COUNT (double)0
@@ -345,7 +345,7 @@ def main():
       #define MALI_CONFIG_L2_CACHE_COUNT (double)constants->l2_cache_count
       #define MALI_CONFIG_SHADER_CORE_COUNT (double)constants->shader_core_count
       #define MALI_CONFIG_TIME_SPAN                                                 \\
-              (double)(MIN2(dump_info->time_span.end_ns - dump_info->time_span.start_ns, 1))
+              ((double)(dump_info->time_span.end_ns - dump_info->time_span.start_ns) / 1000000000.0)
 
       /* We seem to have a few cases where the dividend is low and the divisor
        * is zero. Let's assume a divisor of zero means we just had an
@@ -429,7 +429,7 @@ def main():
          blk_type = "MALI_PERF_BLOCK_NONE"
 
       c.write("   {")
-      c.write("      .name = \"{}\",".format(counter.machine_name))
+      c.write("      .name = \"{}\",".format(counter.human_name))
       c.write("      .desc = \"{}\",".format(counter.short_desc))
       c.write("      .units = {},".format(TO_MALI_UNITS[counter.units]))
       c.write("      .block = {},".format(blk_type))

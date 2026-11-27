@@ -53,6 +53,11 @@ emit_load_state(struct tu_cs *cs, unsigned opcode, enum a6xx_state_type st,
    tu_cs_emit_qw(cs, offset | (base << 28));
 }
 
+/* Combined image samplers need two CP_LOAD_STATE6 packets per array element and stage, and each packet costs CP time,
+ * so we have to put some limit to reduce CP overhead. From tests preloading more than 16 is never beneficial.
+ */
+#define TU_MAX_PRELOAD_COMBINED_SAMPLERS_PER_STAGE 16
+
 static unsigned
 tu6_load_state_size(struct tu_pipeline *pipeline,
                     struct tu_pipeline_layout *layout)
@@ -98,7 +103,7 @@ tu6_load_state_size(struct tu_pipeline *pipeline,
             /* Because of how we pack combined images and samplers, we
              * currently can't use one packet for the whole array.
              */
-            count = stage_count * binding->array_size * 2;
+            count = stage_count * MIN2(binding->array_size, TU_MAX_PRELOAD_COMBINED_SAMPLERS_PER_STAGE) * 2;
             break;
          case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
          case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
@@ -124,6 +129,10 @@ tu6_emit_load_state(struct tu_device *device,
 
    struct tu_cs cs;
    tu_cs_begin_sub_stream(&pipeline->cs, size, &cs);
+
+   unsigned combined_samplers_budget[MESA_SHADER_STAGES];
+   for (unsigned s = 0; s < MESA_SHADER_STAGES; s++)
+      combined_samplers_budget[s] = TU_MAX_PRELOAD_COMBINED_SAMPLERS_PER_STAGE;
 
    for (unsigned i = 0; i < layout->num_sets; i++) {
       /* From 13.2.7. Descriptor Set Binding:
@@ -226,7 +235,9 @@ tu6_emit_load_state(struct tu_device *device,
                /* TODO: We could emit less CP_LOAD_STATE6 if we used
                 * struct-of-arrays instead of array-of-structs.
                 */
-               for (unsigned i = 0; i < count; i++) {
+               unsigned num = MIN2(count, combined_samplers_budget[stage]);
+               combined_samplers_budget[stage] -= num;
+               for (unsigned i = 0; i < num; i++) {
                   unsigned tex_offset = offset + 2 * i * FDL6_TEX_CONST_DWORDS;
                   unsigned sam_offset = offset + (2 * i + 1) * FDL6_TEX_CONST_DWORDS;
                   emit_load_state(&cs, tu6_stage2opcode(stage),
@@ -1844,14 +1855,14 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
          if (ial->depth_att == MESA_VK_ATTACHMENT_NO_INDEX)
             attachments_referenced |= 1;
          else
-            attachments_referenced |= 1u << (ial->depth_att + 1);
+            attachments_referenced |= 1u << (ial->depth_att + TU_DYN_INPUT_ATT_OFFSET);
       }
 
       if (ial->stencil_att != MESA_VK_ATTACHMENT_UNUSED) {
          if (ial->stencil_att == MESA_VK_ATTACHMENT_NO_INDEX)
             attachments_referenced |= 1;
          else
-            attachments_referenced |= 1u << (ial->stencil_att + 1);
+            attachments_referenced |= 1u << (ial->stencil_att + TU_DYN_INPUT_ATT_OFFSET);
       }
 
       keys[MESA_SHADER_FRAGMENT].read_only_input_attachments =
@@ -2857,7 +2868,7 @@ tu6_emit_viewport_fdm(struct tu_cs *cs, struct tu_cmd_buffer *cmd,
    tu_create_fdm_bin_patchpoint(cmd, cs, size, TU_FDM_NONE,
                                 fdm_apply_viewports, state);
    cmd->state.rp.shared_viewport |= !cmd->state.per_view_viewport &&
-      !cmd->state.program.per_layer_viewport;
+      !cmd->state.program->per_layer_viewport;
 }
 
 static const enum mesa_vk_dynamic_graphics_state tu_scissor_state[] = {
@@ -4349,8 +4360,8 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
                cmd->state.dirty & (TU_CMD_DIRTY_SUBPASS | TU_CMD_DIRTY_SHADING_RATE),
                &cmd->vk.dynamic_graphics_state.fsr,
                cmd->state.subpass->fsr_attachment != VK_ATTACHMENT_UNUSED,
-               cmd->state.program.writes_shading_rate,
-               cmd->state.program.reads_shading_rate);
+               cmd->state.program->writes_shading_rate,
+               cmd->state.program->reads_shading_rate);
    }
    /* For SW multiview (no HW multiview), don't enable HW multiview
     * registers -- the driver handles multiview via draw duplication.
@@ -4383,7 +4394,7 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
                    cmd->state.shaders[MESA_SHADER_VERTEX],
                    cmd->state.shaders[MESA_SHADER_TESS_CTRL],
                    cmd->state.shaders[MESA_SHADER_TESS_EVAL],
-                   &cmd->state.program,
+                   cmd->state.program,
                    cmd->vk.dynamic_graphics_state.ts.patch_control_points);
    if (!cmd->device->physical_device->info->props.has_coherent_ubwc_flag_caches) {
       DRAW_STATE_COND(prim_mode_sysmem,

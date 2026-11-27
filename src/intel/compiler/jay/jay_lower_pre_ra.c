@@ -18,12 +18,9 @@
 /**
  * Vectors need to be allocated to contiguous registers. This means that a value
  * cannot appear in multiple channels of an instruction, as register allocation
- * would need to assign the same value to locations <X+i> and <X+j>. Scalars
- * don't have this restriction, except for SENDs because the hardware bans
- * repeated sources.
+ * would need to assign the same value to locations <X+i> and <X+j>.
  *
- * If a value appears in multiple positions, we emit copies so that each
- * can be register allocated in the correct position.
+ * If a value appears in multiple positions, we emit copies to legalize.
  */
 static void
 lower_contiguous_sources(jay_builder *b, jay_inst *I)
@@ -33,6 +30,18 @@ lower_contiguous_sources(jay_builder *b, jay_inst *I)
 
    jay_foreach_src(I, s) {
       if (jay_num_values(I->src[s]) > 1 || I->op == JAY_OPCODE_SEND) {
+         bool duplicate_vector = false;
+         for (unsigned i = 0; i < s; ++i) {
+            duplicate_vector |= jay_defs_equivalent(I->src[s], I->src[i]);
+         }
+
+         /* If the whole vector is reused as-is, there's no RA implication.
+          * However, for SENDs the hardware bans repeated sources.
+          */
+         if (duplicate_vector && I->op != JAY_OPCODE_SEND) {
+            continue;
+         }
+
          jay_foreach_index(I->src[s], c, index) {
             /* Search for the index */
             unsigned i;
@@ -96,8 +105,8 @@ lower_imm_to_ugpr(jay_builder *b,
    return x;
 }
 
-static bool
-try_swap_src01(jay_inst *I)
+bool
+jay_try_swap_src01(jay_inst *I)
 {
    if (I->op == JAY_OPCODE_SEL) {
       /* sel(a, b, p) = sel(b, a, !p) */
@@ -143,7 +152,7 @@ lower_immediates(jay_builder *b, jay_inst *I, struct hash_table_u64 *constants)
    if ((other < I->num_srcs && jay_is_imm(I->src[other])) &&
        !_mesa_hash_table_u64_search(constants, jay_as_uint(I->src[other]))) {
 
-      try_swap_src01(I);
+      jay_try_swap_src01(I);
    }
 
    /* Immediates allowed only in certain cases, lower the rest */
@@ -165,10 +174,15 @@ lower_immediates(jay_builder *b, jay_inst *I, struct hash_table_u64 *constants)
                        I->op == JAY_OPCODE_DP4A_UU ||
                        (ver >= 12 && I->op == JAY_OPCODE_BFE);
 
+            uint32_t imm = jay_as_uint(I->src[s]);
+            bool is_int = !jay_type_is_any_float(I->type);
+
             /* Gen9 does not support 3-src immediates */
             allowed &= ver >= 11 &&
-                       !jay_type_is_any_float(I->type) &&
-                       jay_as_uint(I->src[s]) <= UINT16_MAX;
+                       (is_int || I->type == JAY_TYPE_F16) &&
+                       (imm == (uint16_t) imm ||
+                        (jay_base_type(jay_src_type(I, s)) == JAY_TYPE_S &&
+                         (int16_t) imm == (int32_t) imm));
 
             /* MAD/DP4A can have at most one immediate source on Gfx11 */
             allowed &= (ver >= 12 || s == 0 || !jay_is_imm(I->src[0])) ||
